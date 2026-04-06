@@ -460,8 +460,8 @@ def _get_session_history():
             dur_str = "—"
         else:
             h, r = divmod(secs, 3600)
-            m = r // 60
-            dur_str = f"{h}h{m:02d}m" if h else f"{m}m"
+            m, s = divmod(r, 60)
+            dur_str = f"{h}h{m:02d}m" if h else f"{m}m{s:02d}s"
 
         pct_str = "—"
         if session_date == today:
@@ -1093,15 +1093,16 @@ def make_active_calls_panel():
     entries = _load_ledger(last_n=200)
 
     t = Table(show_header=True, header_style="bold white", box=None, padding=(0, 1), expand=True)
+    t.add_column("Time", width=8, no_wrap=True)
     t.add_column("Session", width=10, no_wrap=True)
     t.add_column("Tool", width=20, no_wrap=True)
-    t.add_column("Ago", width=5, no_wrap=True)
+    t.add_column("Ago", width=7, no_wrap=True)
     t.add_column("5h%", width=5, no_wrap=True)
     t.add_column("Source", width=12, no_wrap=True)
     t.add_column("Directive", overflow="ellipsis", no_wrap=True, ratio=1)
 
     if not sessions:
-        t.add_row("[dim]—[/dim]", "", "", "", "[dim]no active sessions[/dim]")
+        t.add_row("", "[dim]—[/dim]", "", "", "", "[dim]no active sessions[/dim]")
         return Panel(t, title="[bold]Active Calls[/bold]", border_style="bright_white")
 
     now = datetime.now(timezone.utc)
@@ -1122,7 +1123,7 @@ def make_active_calls_panel():
         if not session_calls:
             src_color = "yellow" if ("/" in source or source == "paperclip") else ("green" if source == "cli" else ("cyan" if "atlas" in source else "dim"))
             t.add_row(
-                f"[cyan]{sid}[/cyan]", "[dim]—[/dim]", "", f"[{src_color}]{source}[/{src_color}]",
+                "", f"[cyan]{sid}[/cyan]", "[dim]—[/dim]", "", "", f"[{src_color}]{source}[/{src_color}]",
                 f"[dim]{directive[:30]}[/dim]",
             )
             continue
@@ -1131,15 +1132,15 @@ def make_active_calls_panel():
             tool = _shorten_tool(e.get("tool", "?"))
             try:
                 ts = datetime.fromisoformat(e["ts"].replace("Z", "+00:00"))
+                time_str = ts.astimezone().strftime("%H:%M:%S")
                 secs = int((now - ts).total_seconds())
-                ago = f"{secs}s" if secs < 60 else f"{secs//60}m"
+                m, s = divmod(secs, 60)
+                ago = f"{secs}s" if secs < 60 else f"{m}m{s:02d}s"
             except Exception:
-                ago = "?"
+                time_str, ago = "?", "?"
 
             if i == 0:
                 src_color = "yellow" if ("/" in source or source == "paperclip") else ("green" if source == "cli" else ("cyan" if "atlas" in source else "dim"))
-                # Show session's current 5h% from the latest call
-                call_pct = e.get("five_pct", "?")
                 delta = e.get("delta_from_start", 0)
                 snippet = e.get("tool_snippet", "")
                 tool_display = f"{tool}: {snippet[:28]}" if snippet else tool
@@ -1150,6 +1151,7 @@ def make_active_calls_panel():
                 except Exception:
                     pct_str = "[dim]?[/dim]"
                 t.add_row(
+                    f"[dim]{time_str}[/dim]",
                     f"[cyan]{sid}[/cyan]",
                     f"[bold green]{tool_display}[/bold green]" if secs < 45 else tool_display,
                     f"[dim]{ago}[/dim]",
@@ -1161,7 +1163,7 @@ def make_active_calls_panel():
                 snippet = e.get("tool_snippet", "")
                 tool_display = f"{tool}: {snippet[:28]}" if snippet else tool
                 t.add_row(
-                    "", f"[dim]{tool_display}[/dim]", f"[dim]{ago}[/dim]", "", "", "",
+                    "", "", f"[dim]{tool_display}[/dim]", f"[dim]{ago}[/dim]", "", "", "",
                 )
 
     return Panel(t, title="[bold]Active Calls[/bold]", border_style="bright_white")
