@@ -1031,15 +1031,15 @@ def _etime_to_secs(etime):
 def make_sessions_panel():
     sessions = _active_sessions()
     t = Table(show_header=True, header_style="bold cyan", box=None, padding=(0, 1), expand=True)
-    t.add_column("PID", min_width=6, no_wrap=True)
     t.add_column("Start", min_width=6, no_wrap=True)
     t.add_column("Dur", min_width=6, no_wrap=True)
+    t.add_column("PID", min_width=6, no_wrap=True)
     t.add_column("Used", min_width=6, no_wrap=True)
     t.add_column("Status", min_width=14, no_wrap=True, overflow="ellipsis")
     t.add_column("Source", width=10, no_wrap=True)
     t.add_column("Directive", overflow="ellipsis", no_wrap=True)
     if not sessions:
-        t.add_row("[dim]—[/dim]", "", "", "", "", "", "[dim]no active sessions[/dim]")
+        t.add_row("", "", "[dim]—[/dim]", "", "", "", "[dim]no active sessions[/dim]")
     else:
         now = datetime.now()
         for item in sessions:
@@ -1076,9 +1076,9 @@ def make_sessions_panel():
                 status = "[dim]· ?[/dim]"
             src_color = "yellow" if ("/" in source or source == "paperclip") else ("green" if source == "cli" else ("cyan" if "atlas" in source else "dim"))
             t.add_row(
-                f"[cyan]{pid}[/cyan]",
                 f"[dim]{start_str}[/dim]",
                 f"[dim]{age}[/dim]",
+                f"[cyan]{pid}[/cyan]",
                 f"[{color}]{delta}[/{color}]",
                 status,
                 f"[{src_color}]{source}[/{src_color}]",
