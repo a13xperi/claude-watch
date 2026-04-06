@@ -9,7 +9,7 @@ from datetime import datetime, timedelta, timezone
 from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import Horizontal, Vertical
+from textual.containers import Horizontal, ScrollableContainer, Vertical
 from textual.screen import Screen
 from textual.widgets import DataTable, Header, Static
 
@@ -461,17 +461,18 @@ class ClaudeWatchApp(App):
     ]
 
     def compose(self) -> ComposeResult:
-        yield TokenHeader(id="header")
-        yield UrgentAlerts(id="urgent")
-        yield ActiveSessions(id="active-sessions")
-        yield ActiveCalls(id="active-calls")
-        with Horizontal(id="history-row"):
-            yield CallHistoryTable(id="call-history")
-        with Horizontal(id="feed-row"):
-            yield ToolFrequency(id="tool-freq")
-            yield SkillsPanel(id="skills")
-        yield SessionHistoryTable(id="session-history")
-        yield DrainPanel(id="drain")
+        with ScrollableContainer(id="main-scroll"):
+            yield TokenHeader(id="header")
+            yield UrgentAlerts(id="urgent")
+            yield ActiveSessions(id="active-sessions")
+            yield ActiveCalls(id="active-calls")
+            with Horizontal(id="history-row"):
+                yield CallHistoryTable(id="call-history")
+            with Horizontal(id="feed-row"):
+                yield ToolFrequency(id="tool-freq")
+                yield SkillsPanel(id="skills")
+            yield SessionHistoryTable(id="session-history")
+            yield DrainPanel(id="drain")
 
     def on_mount(self):
         _load_index()

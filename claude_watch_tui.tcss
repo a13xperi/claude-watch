@@ -1,6 +1,9 @@
 Screen {
     layout: vertical;
-    overflow: hidden;
+}
+
+#main-scroll {
+    height: 1fr;
 }
 
 /* ── Urgent ── */
