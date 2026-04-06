@@ -79,8 +79,7 @@ class SessionHistoryTable(DataTable):
         self.zebra_stripes = True
         # Merged Time+Dur, matching Rich version layout
         self.add_column("Time    Dur", width=13)
-        self.add_column("Session", width=9)
-        self.add_column("Src", width=10)
+        self.add_column("Who", width=18)
         self.add_column("Mdl", width=7)
         self.add_column("~5h%", width=7)
         self.add_column("Out", width=6)
@@ -98,7 +97,7 @@ class SessionHistoryTable(DataTable):
 
         if not sessions:
             self.add_row(
-                "...", "", "", "", "", "",
+                "...", "", "", "", "",
                 Text("building index..." if _index_building else "no sessions", style="dim"),
             )
             return
@@ -118,7 +117,7 @@ class SessionHistoryTable(DataTable):
 
             if group != current_group:
                 sep = f"── {group} " + "─" * 30
-                self.add_row(Text(sep, style="dim"), "", "", "", "", "", "", key=f"sep-{group}")
+                self.add_row(Text(sep, style="dim"), "", "", "", "", "", key=f"sep-{group}")
                 current_group = group
 
             end_str = s["last_ts"].astimezone().strftime("%H:%M")
@@ -144,11 +143,10 @@ class SessionHistoryTable(DataTable):
 
             src = s.get("source", "?")
             src_style = "yellow" if src == "paperclip" else ("green" if src == "cli" else ("cyan" if "atlas" in src else "dim"))
-            short_id = s["session_id"][:8]
+            who = f"{src}/{(s['directive'] or '?')[:8]}"
             self.add_row(
                 Text(time_dur, style="dim"),
-                Text(short_id, style="dim"),
-                Text(src, style=src_style),
+                Text(who, style=src_style),
                 Text(mdl, style=mdl_style),
                 Text(pct, style=pct_style),
                 Text(out_str, style="dim", justify="right"),
@@ -170,7 +168,7 @@ class ToolCallFeed(DataTable):
         self.cursor_type = "row"
         self.zebra_stripes = True
         self.add_column("Time", width=9)
-        self.add_column("Session", width=9)
+        self.add_column("Who", width=14)
         self.add_column("Δ5h%", width=5)
         self.add_column("Tool", width=8)
         self.add_column("Src", width=10)
@@ -187,7 +185,7 @@ class ToolCallFeed(DataTable):
         self.clear()
 
         if not rows:
-            self.add_row("...", "", "", "", "", "", Text("no events yet", style="dim"))
+            self.add_row("...", "", "", "", "", Text("no events yet", style="dim"))
             return
 
         for r in rows:
