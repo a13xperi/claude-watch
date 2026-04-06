@@ -1009,21 +1009,49 @@ def make_urgent_panel():
     return Panel(t, title="[bold red]⚠ URGENT[/bold red]", border_style="red")
 
 
+def _etime_to_secs(etime):
+    """Parse ps etime string ([[DD-]HH:]MM:SS) to total seconds."""
+    try:
+        days = 0
+        if "-" in etime:
+            d, etime = etime.split("-", 1)
+            days = int(d)
+        parts = etime.split(":")
+        if len(parts) == 3:
+            h, m, s = int(parts[0]), int(parts[1]), int(parts[2])
+        elif len(parts) == 2:
+            h, m, s = 0, int(parts[0]), int(parts[1])
+        else:
+            return None
+        return days * 86400 + h * 3600 + m * 60 + s
+    except Exception:
+        return None
+
+
 def make_sessions_panel():
     sessions = _active_sessions()
     t = Table(show_header=True, header_style="bold cyan", box=None, padding=(0, 1), expand=True)
     t.add_column("PID", min_width=6, no_wrap=True)
-    t.add_column("Age", min_width=6, no_wrap=True)
+    t.add_column("Start", min_width=6, no_wrap=True)
+    t.add_column("Dur", min_width=6, no_wrap=True)
     t.add_column("Used", min_width=6, no_wrap=True)
     t.add_column("Status", min_width=14, no_wrap=True, overflow="ellipsis")
     t.add_column("Source", width=10, no_wrap=True)
     t.add_column("Directive", overflow="ellipsis", no_wrap=True)
     if not sessions:
-        t.add_row("[dim]—[/dim]", "", "", "", "", "[dim]no active sessions[/dim]")
+        t.add_row("[dim]—[/dim]", "", "", "", "", "", "[dim]no active sessions[/dim]")
     else:
+        now = datetime.now()
         for item in sessions:
             pid, age, directive, delta = item[0], item[1], item[2], item[3]
             source = item[4] if len(item) > 4 else "?"
+            # Compute start time from etime
+            elapsed = _etime_to_secs(age)
+            if elapsed is not None:
+                start_dt = now - timedelta(seconds=elapsed)
+                start_str = start_dt.strftime("%H:%M")
+            else:
+                start_str = "?"
             color = "green"
             if delta == "new":
                 color = "dim"
@@ -1048,9 +1076,13 @@ def make_sessions_panel():
                 status = "[dim]· ?[/dim]"
             src_color = "yellow" if ("/" in source or source == "paperclip") else ("green" if source == "cli" else ("cyan" if "atlas" in source else "dim"))
             t.add_row(
-                f"[cyan]{pid}[/cyan]", f"[dim]{age}[/dim]",
-                f"[{color}]{delta}[/{color}]", status,
-                f"[{src_color}]{source}[/{src_color}]", directive,
+                f"[cyan]{pid}[/cyan]",
+                f"[dim]{start_str}[/dim]",
+                f"[dim]{age}[/dim]",
+                f"[{color}]{delta}[/{color}]",
+                status,
+                f"[{src_color}]{source}[/{src_color}]",
+                directive,
             )
     return Panel(t, title="[bold]Active Sessions[/bold]", border_style="cyan")
 
