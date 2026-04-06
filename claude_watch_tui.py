@@ -268,7 +268,7 @@ class SessionHistoryTable(DataTable):
                 group = date.strftime("%b %-d")
 
             if group != current_group:
-                sep = f"── {group} " + "─" * 30
+                sep = f"— {group} —"
                 self.add_row(Text(sep, style="dim"), "", "", "", "", "", key=f"sep-{group}")
                 current_group = group
 
@@ -414,7 +414,7 @@ class CallHistoryTable(DataTable):
                 group = "Unknown"
 
             if group != current_group:
-                sep = f"── {group} " + "─" * 30
+                sep = f"— {group} —"
                 self.add_row(Text(sep, style="dim"), "", "", "", "", "", "", key=f"ch-sep-{group}")
                 current_group = group
 
