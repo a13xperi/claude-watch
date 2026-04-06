@@ -127,7 +127,9 @@ def _active_sessions():
                     # Fix ghost session: if session just started and shows huge delta,
                     # it's measuring global drift, not actual consumption
                     age_secs = time.time() - start_epoch if start_epoch else 999
-                    if age_secs < 120 and raw_delta > 5:
+                    if raw_delta < 0:
+                        delta = "reset"  # 5h window reset during session
+                    elif age_secs < 120 and raw_delta > 5:
                         delta = "new"
                     else:
                         delta = f"+{raw_delta}%"
@@ -421,7 +423,10 @@ def _get_session_history():
             if ps is not None and pe is not None:
                 try:
                     d_pct = round(float(pe) - float(ps), 1)
-                    pct_str = f"+{d_pct}%" if d_pct >= 0 else f"{d_pct}%"
+                    if d_pct < -5:
+                        pct_str = "reset"  # 5h window reset during session
+                    else:
+                        pct_str = f"+{d_pct}%" if d_pct >= 0 else f"{d_pct}%"
                 except Exception:
                     pass
 
