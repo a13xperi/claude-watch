@@ -379,7 +379,7 @@ class CallHistoryTable(DataTable):
     def on_mount(self):
         self.cursor_type = "row"
         self.zebra_stripes = True
-        self.add_column("When", width=6)
+        self.add_column("When", width=11)
         self.add_column("Session", width=12)
         self.add_column("Src", width=10)
         self.add_column("Calls", width=5)
