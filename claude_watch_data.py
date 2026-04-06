@@ -231,28 +231,32 @@ _ledger_cache_time = 0.0
 _ledger_cache = []
 
 
-def _load_ledger(last_n=500):
+def _load_ledger(last_n=None):
+    """Load ledger entries. Always loads all entries, caches by mtime."""
     global _ledger_cache_time, _ledger_cache
     if not LEDGER.exists():
         return []
     mtime = LEDGER.stat().st_mtime
-    if mtime == _ledger_cache_time:
-        return _ledger_cache
-    entries = []
-    try:
-        with open(LEDGER) as f:
-            for line in f:
-                line = line.strip()
-                if line:
-                    try:
-                        entries.append(json.loads(line))
-                    except Exception:
-                        pass
-    except Exception:
-        pass
-    _ledger_cache = entries[-last_n:]
-    _ledger_cache_time = mtime
-    return _ledger_cache
+    if mtime == _ledger_cache_time and _ledger_cache is not None:
+        entries = _ledger_cache
+    else:
+        entries = []
+        try:
+            with open(LEDGER) as f:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        try:
+                            entries.append(json.loads(line))
+                        except Exception:
+                            pass
+        except Exception:
+            pass
+        _ledger_cache = entries
+        _ledger_cache_time = mtime
+    if last_n is not None:
+        return entries[-last_n:]
+    return entries
 
 
 def _interpolate_five_pct(target_ts):
@@ -1034,13 +1038,22 @@ def make_sessions_panel():
     t.add_column("Start", min_width=6, no_wrap=True)
     t.add_column("Dur", min_width=6, no_wrap=True)
     t.add_column("PID", min_width=9, no_wrap=True)
+    t.add_column("Mdl", min_width=7, no_wrap=True)
     t.add_column("Used", min_width=6, no_wrap=True)
     t.add_column("Status", min_width=14, no_wrap=True, overflow="ellipsis")
     t.add_column("Source", width=10, no_wrap=True)
     t.add_column("Directive", overflow="ellipsis", no_wrap=True)
     if not sessions:
-        t.add_row("", "", "[dim]—[/dim]", "", "", "", "[dim]no active sessions[/dim]")
+        t.add_row("", "", "[dim]—[/dim]", "", "", "", "", "[dim]no active sessions[/dim]")
     else:
+        # Build model lookup from ledger
+        entries = _load_ledger()
+        model_map = {}
+        for e in entries:
+            sid = e.get("session", "")
+            mdl = e.get("model")
+            if sid and mdl:
+                model_map[sid] = mdl
         now = datetime.now()
         for item in sessions:
             pid, age, directive, delta = item[0], item[1], item[2], item[3]
@@ -1075,10 +1088,13 @@ def make_sessions_panel():
             else:
                 status = "[dim]· ?[/dim]"
             src_color = "yellow" if ("/" in source or source == "paperclip") else ("green" if source == "cli" else ("cyan" if "atlas" in source else "dim"))
+            mdl = model_map.get(f"cc-{pid}", "?")
+            mdl_style = "magenta" if mdl == "opus" else ("cyan" if mdl == "sonnet" else "dim")
             t.add_row(
                 f"[dim]{start_str}[/dim]",
                 f"[dim]{age}[/dim]",
                 f"[cyan]cc-{pid}[/cyan]",
+                f"[{mdl_style}]{mdl}[/{mdl_style}]",
                 f"[{color}]{delta}[/{color}]",
                 status,
                 f"[{src_color}]{source}[/{src_color}]",
