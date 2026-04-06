@@ -12,24 +12,42 @@ Screen {
 /* ── Header ── */
 #header {
     height: auto;
-    max-height: 5;
+    max-height: 7;
 }
 
-/* ── Active Sessions ── */
-#active-calls {
-    height: auto;
-    max-height: 10;
-}
-
+/* ── Active Sessions (shrunk — scrollable panels need the space) ── */
 #active-sessions {
+    height: auto;
+    max-height: 6;
+}
+
+#active-calls {
     height: auto;
     max-height: 8;
 }
 
-/* ── Session History (scrollable DataTable) ── */
+/* ── History row: Call History + Session History side-by-side ── */
+#history-row {
+    layout: horizontal;
+    height: 2fr;
+    min-height: 8;
+}
+
+#call-history {
+    width: 1fr;
+    height: 100%;
+    border: solid green;
+    border-title-color: white;
+    border-title-style: bold;
+}
+
+#call-history:focus {
+    border: tall $accent;
+}
+
 #session-history {
-    height: 1fr;
-    min-height: 6;
+    width: 1fr;
+    height: 100%;
     border: solid dodgerblue;
     border-title-color: white;
     border-title-style: bold;
@@ -58,17 +76,38 @@ Screen {
     border: tall $accent;
 }
 
-/* ── Tool Frequency ── */
-#tool-freq {
+/* ── Stats column (Tool Frequency + Skills) ── */
+#stats-col {
     width: 1fr;
     height: auto;
-    max-height: 20;
 }
 
-/* ── Passive Drain ── */
-#drain {
+#tool-freq {
+    height: auto;
+    max-height: 16;
+}
+
+#skills {
     height: auto;
     max-height: 12;
+}
+
+/* ── Passive Drain (shrunk) ── */
+#drain {
+    height: auto;
+    max-height: 10;
+}
+
+/* ── Drill-down screen ── */
+#drilldown-header {
+    height: auto;
+    max-height: 2;
+    padding: 0 1;
+}
+
+#drilldown-table {
+    height: 1fr;
+    border: solid dodgerblue;
 }
 
 /* ── DataTable styling ── */

@@ -3,9 +3,9 @@
 ## What This Is
 Real-time terminal dashboard for monitoring Claude Code token usage. GitHub: a13xperi/claude-watch
 
-## Current State (v0.3 — partially shipped)
+## Current State (v0.3 — nearly complete)
 
-**Shipped this session:**
+**Shipped previously:**
 - Account awareness in header (A/B/C + name + lane)
 - Tool input capture in hook (80-char snippet of commands/file paths/skill names)
 - Token pacing prediction in header ("100% in ~18m at 0.6%/min")
@@ -15,34 +15,37 @@ Real-time terminal dashboard for monitoring Claude Code token usage. GitHub: a13
 - 5h% column in Active Calls
 - 911 sessions indexed across all project dirs
 
+**Shipped this session:**
+- Skills frequency panel (under Tool Frequency, shows /skill calls + count + last used)
+- Call History panel (scrollable DataTable, all sessions from ledger with aggregated tools)
+- Session drill-down (Enter on Session History → per-turn token breakdown screen)
+- Bug fix: idle label shows `· 19m` not `● idle`
+- Bug fix: session index dedup (rewrite instead of append)
+- Bug fix: header max-height 7 (was 5, now fits pacing row)
+- `project_dir` stored in session index for transcript lookup
+
 **Two versions:**
 - `claude-watch` → Textual TUI (symlink: `~/bin/claude-watch` → `~/projects/claude-watch/claude_watch_tui.py`)
 - `claude-watch-rich` → Rich Live fallback
 - Shared data layer: `claude_watch_data.py`
 - Also symlinked: `~/bin/claude_watch_data.py`, `~/bin/claude_watch_tui.tcss`
 
-**Hook:** `~/.claude/hooks/token-tracker.sh` — now captures `tool_snippet` field
+**Hook:** `~/.claude/hooks/token-tracker.sh` — captures `tool_snippet` field
 
 ## What To Build Next (v0.3 remaining)
 
 Full plan: `~/.claude/plans/temporal-stargazing-raven.md`
 
-### Remaining features (in priority order):
-
-**4. Skills frequency panel** — new panel under Tool Frequency showing which Claude Code skills (/claim-task, /paperclip, etc.) are called, how often, when. Data from ledger where tool=="Skill" + tool_snippet has skill name.
-
-**5. Call History panel** — scrollable DataTable showing ALL historical sessions with aggregated tool calls. Columns: Session | Source | When | Calls | Tools Used | 5h% Used | Directive. Purpose: see which sessions consumed what.
-
-**6. Session drill-down** — Enter on a session in Session History → new Screen with per-turn token breakdown. Needs `_get_session_turns(session_id)` function + `SessionDrillDown(Screen)` in Textual. Need to store `project_dir` in session index.
+### Remaining features:
 
 **7. Granular Paperclip source** — parse project_id + agent_id from directory path, mapping file `paperclip_agents.json`. Display "KAA/DevOps" not just "paperclip".
 
 **8. Usage metrics dashboard** — aggregate tokens by source/company/agent, show % of 7d budget.
 
-### Bugs to fix:
-- Idle label: show `· 19m` not `● idle`
-- Session index duplicates (append-only JSONL, no dedup on rebuild)
-- Textual header may need `max-height: 7` in CSS (was 5, now has 4 rows)
+### Nice-to-haves:
+- Drill-down from Call History table (currently only Session History supports Enter)
+- Rich version parity for new panels (skills, call history)
+- Hot reload without restart
 
 ## Key Context
 - Python 3.9.6 (no `X | None` type hints)
@@ -51,6 +54,7 @@ Full plan: `~/.claude/plans/temporal-stargazing-raven.md`
 - All project dirs scanned under `~/.claude/projects/`
 - 1% of 5h window ≈ 5,500 output tokens
 - Tool snippets only appear on NEW tool calls (old ledger entries lack the field)
+- Session drill-down parses transcripts directly via `_get_session_turns(session_id)`
 
 ## How To Verify
 ```bash
@@ -58,4 +62,6 @@ cd ~/projects/claude-watch
 python3 claude_watch_tui.py    # Textual version
 python3 claude_watch.py         # Rich version
 python3 -c "from claude_watch_data import _get_session_history; print(len(_get_session_history()), 'sessions')"
+python3 -c "from claude_watch_data import _get_call_history; h=_get_call_history(); print(f'{len(h)} sessions in call history')"
+python3 -c "from claude_watch_data import _get_session_turns, _load_index; _load_index(); turns=_get_session_turns(list(__import__('claude_watch_data')._index_cache.keys())[0]); print(f'{len(turns)} turns')"
 ```

@@ -4,6 +4,7 @@ All data fetching, caching, and computation lives here.
 """
 
 import json
+import re
 import subprocess
 import threading
 import time
@@ -22,6 +23,37 @@ BUDGET_FILE = Path.home() / ".claude/token-budget.json"
 TRANSCRIPTS_DIR = Path.home() / ".claude/projects/-Users-a13xperi"
 ALL_PROJECT_DIRS = Path.home() / ".claude/projects"
 SESSION_INDEX = Path.home() / ".claude/logs/session-index.jsonl"
+PAPERCLIP_AGENTS_FILE = Path(__file__).parent / "paperclip_agents.json"
+
+_PAPERCLIP_RE = re.compile(
+    r"paperclip-instances-default-(?:projects|workspaces)-"
+    r"([a-f0-9-]{36})-([a-f0-9-]{36})--default"
+)
+_PAPERCLIP_WS_RE = re.compile(
+    r"paperclip-instances-default-workspaces-([a-f0-9-]{36})$"
+)
+
+_paperclip_map = {}   # type: Dict[str, Dict]
+_paperclip_agents_flat = {}  # agent_uuid -> (company, name)
+
+
+def _load_paperclip_map():
+    global _paperclip_map, _paperclip_agents_flat
+    try:
+        data = json.loads(PAPERCLIP_AGENTS_FILE.read_text())
+        _paperclip_map = data.get("projects", {})
+        # Build flat agent UUID → (company, name) for workspace lookups
+        for proj_info in _paperclip_map.values():
+            company = proj_info.get("company", "?")
+            for agent_uuid, name in proj_info.get("agents", {}).items():
+                _paperclip_agents_flat[agent_uuid] = (company, name)
+    except Exception:
+        _paperclip_map = {}
+        _paperclip_agents_flat = {}
+
+
+_load_paperclip_map()
+
 
 # ── helpers ──────────────────────────────────────────────────────────────────
 
@@ -320,8 +352,21 @@ def _parse_transcript(f):
     dominant_model = max(model_counts, key=model_counts.get) if model_counts else ""
     # Derive source from project directory name
     parent = f.parent.name
-    if "paperclip" in parent:
-        source = "paperclip"
+    m = _PAPERCLIP_RE.search(parent)
+    mws = _PAPERCLIP_WS_RE.search(parent)
+    if m:
+        proj_uuid, agent_uuid = m.group(1), m.group(2)
+        proj_info = _paperclip_map.get(proj_uuid, {})
+        company = proj_info.get("company", proj_uuid[:6])
+        agent_name = proj_info.get("agents", {}).get(agent_uuid, agent_uuid[:6])
+        source = f"{company}/{agent_name}"
+    elif mws:
+        agent_uuid = mws.group(1)
+        pair = _paperclip_agents_flat.get(agent_uuid)
+        if pair:
+            source = f"{pair[0]}/{pair[1]}"
+        else:
+            source = f"pp/{agent_uuid[:6]}"
     elif "atlas-backend" in parent:
         source = "atlas-be"
     elif "atlas-portal" in parent:
@@ -344,6 +389,7 @@ def _parse_transcript(f):
         "directive": directive,
         "model": dominant_model,
         "source": source,
+        "project_dir": str(f.parent),
         "file_mtime": f.stat().st_mtime,
     }
 
@@ -369,10 +415,11 @@ def _build_or_update_index():
                     new_entries.append(result)
                     known[sid] = result
         if new_entries:
-            with open(SESSION_INDEX, "a") as fh:
-                for entry in new_entries:
+            # Rewrite full index (deduped by session_id) instead of appending
+            with open(SESSION_INDEX, "w") as fh:
+                for entry in known.values():
                     fh.write(json.dumps(entry) + "\n")
-            _index_cache.update({e["session_id"]: e for e in new_entries})
+            _index_cache = dict(known)
     except Exception:
         pass
     finally:
@@ -448,6 +495,219 @@ def _get_session_history():
     return sessions
 
 
+# ── session drill-down ───────────────────────────────────────────────────────
+
+def _find_transcript(session_id):
+    """Find transcript file for a session_id, checking index first then scanning."""
+    entry = _index_cache.get(session_id)
+    if entry and entry.get("project_dir"):
+        p = Path(entry["project_dir"]) / f"{session_id}.jsonl"
+        if p.exists():
+            return p
+    # Fallback: scan all project dirs
+    for proj_dir in ALL_PROJECT_DIRS.iterdir():
+        if not proj_dir.is_dir():
+            continue
+        p = proj_dir / f"{session_id}.jsonl"
+        if p.exists():
+            return p
+    return None
+
+
+def _get_session_turns(session_id):
+    """Parse transcript into per-turn breakdown.
+    Returns list of dicts: turn_num, tokens_in, tokens_out, model, tools, prompt_preview
+    """
+    f = _find_transcript(session_id)
+    if not f:
+        return []
+
+    turns = []
+    turn_num = 0
+    current_tools = []
+    last_prompt = ""
+
+    try:
+        with open(f) as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except Exception:
+                    continue
+
+                t = obj.get("type", "")
+
+                if t == "human":
+                    # Start of a new turn — save previous if any
+                    last_prompt = ""
+                    msg = obj.get("message", {})
+                    if isinstance(msg, dict):
+                        content = msg.get("content", "")
+                        if isinstance(content, str):
+                            last_prompt = content[:60]
+                        elif isinstance(content, list):
+                            for c in content:
+                                if isinstance(c, dict) and c.get("type") == "text":
+                                    last_prompt = c.get("text", "")[:60]
+                                    break
+
+                elif t == "assistant":
+                    turn_num += 1
+                    msg = obj.get("message", {})
+                    usage = msg.get("usage", {})
+                    tokens_in = usage.get("input_tokens", 0)
+                    tokens_out = usage.get("output_tokens", 0)
+                    model = _abbrev_model(msg.get("model", ""))
+
+                    # Extract tool names from content blocks
+                    content = msg.get("content", [])
+                    tools = []
+                    if isinstance(content, list):
+                        for block in content:
+                            if isinstance(block, dict) and block.get("type") == "tool_use":
+                                tools.append(_shorten_tool(block.get("name", "?")))
+
+                    # Estimate 5h% contribution (~5500 output tokens = 1%)
+                    pct_est = tokens_out / 5500.0 if tokens_out else 0
+
+                    turns.append({
+                        "turn": turn_num,
+                        "tokens_in": tokens_in,
+                        "tokens_out": tokens_out,
+                        "pct_est": round(pct_est, 2),
+                        "model": model,
+                        "tools": ", ".join(tools) if tools else "—",
+                        "prompt": last_prompt or "—",
+                    })
+
+    except Exception:
+        pass
+
+    return turns
+
+
+# ── skill stats ──────────────────────────────────────────────────────────────
+
+def _get_skill_stats():
+    """Return list of (skill_name, count, last_used_str) from ledger."""
+    entries = _load_ledger(last_n=500)
+    skill_counts = defaultdict(int)
+    skill_last = {}  # type: Dict[str, str]
+    for e in entries:
+        if e.get("type") != "tool_use":
+            continue
+        tool = e.get("tool", "")
+        snippet = e.get("tool_snippet", "")
+        if tool == "Skill" and snippet:
+            # snippet is the skill name (e.g. "claim-task", "paperclip")
+            name = "/" + snippet.strip().split()[0].lstrip("/")
+            skill_counts[name] += 1
+            ts = e.get("ts", "")
+            try:
+                skill_last[name] = datetime.fromisoformat(
+                    ts.replace("Z", "+00:00")
+                ).astimezone().strftime("%H:%M")
+            except Exception:
+                skill_last[name] = "?"
+    result = []
+    for name, count in sorted(skill_counts.items(), key=lambda x: x[1], reverse=True):
+        result.append((name, count, skill_last.get(name, "?")))
+    return result
+
+
+def make_skills_panel():
+    stats = _get_skill_stats()
+    t = Table(show_header=True, header_style="bold magenta", box=None, padding=(0, 1), expand=True)
+    t.add_column("Skill", overflow="ellipsis", no_wrap=True, ratio=3)
+    t.add_column("Calls", min_width=5, justify="right", no_wrap=True)
+    t.add_column("Last", min_width=6, no_wrap=True)
+    if not stats:
+        t.add_row("[dim]no skill calls yet[/dim]", "", "")
+    else:
+        for name, count, last in stats[:10]:
+            t.add_row(name, str(count), f"[dim]{last}[/dim]")
+    return Panel(t, title="[bold]Skills[/bold]  [dim](from ledger)[/dim]", border_style="magenta")
+
+
+# ── call history (aggregated per session from ledger) ────────────────────────
+
+def _get_call_history():
+    """Aggregate tool calls per session from ledger. Returns list of dicts sorted by last activity."""
+    entries = _load_ledger(last_n=5000)
+    tool_events = [e for e in entries if e.get("type") == "tool_use"]
+    if not tool_events:
+        return []
+
+    sessions = {}  # type: Dict[str, Dict]
+    for e in tool_events:
+        sid = e.get("session", "?")
+        if sid not in sessions:
+            sessions[sid] = {
+                "session": sid,
+                "calls": 0,
+                "tools": defaultdict(int),
+                "first_ts": e.get("ts", ""),
+                "last_ts": e.get("ts", ""),
+                "directive": e.get("directive", "—"),
+                "five_pct_start": e.get("five_pct"),
+                "five_pct_end": e.get("five_pct"),
+            }
+        s = sessions[sid]
+        s["calls"] += 1
+        tool = _shorten_tool(e.get("tool", "?"))
+        s["tools"][tool] += 1
+        s["last_ts"] = e.get("ts", s["last_ts"])
+        pct = e.get("five_pct")
+        if pct is not None:
+            s["five_pct_end"] = pct
+
+    result = []
+    for sid, s in sessions.items():
+        # Top 3 tools by count
+        top_tools = sorted(s["tools"].items(), key=lambda x: x[1], reverse=True)[:3]
+        tools_str = ", ".join(f"{t}({c})" for t, c in top_tools)
+
+        # 5h% used
+        try:
+            delta = float(s["five_pct_end"]) - float(s["five_pct_start"])
+            if delta < -5:
+                pct_str = "reset"
+            else:
+                pct_str = f"+{delta:.1f}%" if delta >= 0 else f"{delta:.1f}%"
+        except Exception:
+            pct_str = "?"
+
+        # When (last activity)
+        try:
+            last = datetime.fromisoformat(s["last_ts"].replace("Z", "+00:00"))
+            when_str = last.astimezone().strftime("%H:%M")
+            when_date = last.astimezone().date()
+        except Exception:
+            when_str = "?"
+            when_date = None
+
+        # Source from index cache (accurate) with fallback to session ID lookup
+        source = _index_cache.get(sid, {}).get("source", "cli")
+
+        result.append({
+            "session": sid,
+            "source": source,
+            "when": when_str,
+            "when_date": when_date,
+            "calls": s["calls"],
+            "tools_str": tools_str,
+            "pct_str": pct_str,
+            "directive": s["directive"] or "—",
+            "last_ts_raw": s["last_ts"],
+        })
+
+    result.sort(key=lambda x: x["last_ts_raw"], reverse=True)
+    return result
+
+
 # ── tool feed rows ───────────────────────────────────────────────────────────
 
 def _shorten_tool(tool):
@@ -520,6 +780,9 @@ def _compute_tool_feed_rows(last_n=200):
             delta_style = "dim"
 
         snippet = e.get("tool_snippet", "")
+        # Strip cc- prefix from session for index lookup
+        index_sid = session[3:] if session.startswith("cc-") else session
+        source = _index_cache.get(index_sid, {}).get("source", "cli")
         rows.append({
             "ts_str": ts_str,
             "session": session,
@@ -527,6 +790,7 @@ def _compute_tool_feed_rows(last_n=200):
             "directive": directive,
             "delta_str": delta_str,
             "delta_style": delta_style,
+            "source": source,
         })
 
     return rows
@@ -616,7 +880,8 @@ def make_header(five, seven, five_reset_ts, seven_reset_ts):
             color = "green" if pct_f < 50 else ("yellow" if pct_f < 75 else "red")
         except Exception:
             filled, color = 0, "dim"
-        return f"[{color}]{'█' * filled}{'░' * (width - filled)}[/{color}] {pct}%"
+        pct_display = f"{pct_f:.1f}" if pct_f != int(pct_f) else str(int(pct_f))
+        return f"[{color}]{'█' * filled}{'░' * (width - filled)}[/{color}] {pct_display}%"
 
     t = Table.grid(padding=(0, 2))
     t.add_column(justify="left")
@@ -632,8 +897,8 @@ def make_header(five, seven, five_reset_ts, seven_reset_ts):
     label, name, lane = _get_active_account()
     acct_color = "cyan" if label == "A" else ("magenta" if label == "B" else "yellow")
     t.add_row(
-        f"[{acct_color}]Account {label}[/{acct_color}]: {name} [dim]({lane})[/dim]",
         f"[dim]Updated: {datetime.now().strftime('%H:%M:%S')}[/dim]",
+        f"[{acct_color}]Account {label}[/{acct_color}]: {name} [dim]({lane})[/dim]",
     )
     # Token pacing prediction
     pacing = _token_pacing()
@@ -732,9 +997,12 @@ def make_sessions_panel():
                 s = secs_ago % 60
                 ago = f"{m}m{s:02d}s" if m else f"{s}s"
                 status = f"[dim]↺ {last_tool[:8]} {ago}[/dim]"
+            elif secs_ago is not None:
+                m = secs_ago // 60
+                status = f"[dim]· {m}m[/dim]"
             else:
-                status = "[dim]● idle[/dim]"
-            src_color = "yellow" if source == "paperclip" else ("green" if source == "cli" else "dim")
+                status = "[dim]· ?[/dim]"
+            src_color = "yellow" if ("/" in source or source == "paperclip") else ("green" if source == "cli" else ("cyan" if "atlas" in source else "dim"))
             t.add_row(
                 f"[cyan]{pid}[/cyan]", f"[dim]{age}[/dim]",
                 f"[{color}]{delta}[/{color}]", status,
@@ -750,10 +1018,10 @@ def make_active_calls_panel():
 
     t = Table(show_header=True, header_style="bold white", box=None, padding=(0, 1), expand=True)
     t.add_column("Session", width=10, no_wrap=True)
-    t.add_column("Tool", width=10, no_wrap=True)
+    t.add_column("Tool", width=20, no_wrap=True)
     t.add_column("Ago", width=5, no_wrap=True)
     t.add_column("5h%", width=5, no_wrap=True)
-    t.add_column("Source", width=10, no_wrap=True)
+    t.add_column("Source", width=12, no_wrap=True)
     t.add_column("Directive", overflow="ellipsis", no_wrap=True, ratio=1)
 
     if not sessions:
@@ -776,7 +1044,7 @@ def make_active_calls_panel():
         ][:3]
 
         if not session_calls:
-            src_color = "yellow" if source == "paperclip" else ("green" if source == "cli" else "dim")
+            src_color = "yellow" if ("/" in source or source == "paperclip") else ("green" if source == "cli" else ("cyan" if "atlas" in source else "dim"))
             t.add_row(
                 f"[cyan]{sid}[/cyan]", "[dim]—[/dim]", "", f"[{src_color}]{source}[/{src_color}]",
                 f"[dim]{directive[:30]}[/dim]",
@@ -793,12 +1061,12 @@ def make_active_calls_panel():
                 ago = "?"
 
             if i == 0:
-                src_color = "yellow" if source == "paperclip" else ("green" if source == "cli" else "dim")
+                src_color = "yellow" if ("/" in source or source == "paperclip") else ("green" if source == "cli" else ("cyan" if "atlas" in source else "dim"))
                 # Show session's current 5h% from the latest call
                 call_pct = e.get("five_pct", "?")
                 delta = e.get("delta_from_start", 0)
                 snippet = e.get("tool_snippet", "")
-                tool_display = f"{tool}: {snippet[:18]}" if snippet else tool
+                tool_display = f"{tool}: {snippet[:28]}" if snippet else tool
                 try:
                     d = float(delta)
                     pct_color = "red" if d > 5 else ("yellow" if d > 2 else "green")
@@ -815,7 +1083,7 @@ def make_active_calls_panel():
                 )
             else:
                 snippet = e.get("tool_snippet", "")
-                tool_display = f"{tool}: {snippet[:18]}" if snippet else tool
+                tool_display = f"{tool}: {snippet[:28]}" if snippet else tool
                 t.add_row(
                     "", f"[dim]{tool_display}[/dim]", f"[dim]{ago}[/dim]", "", "", "",
                 )

@@ -1,0 +1,54 @@
+{
+  "projects": {
+    "790f4e78-9f4f-4c80-83cb-f665e6c7dd1d": {
+      "company": "KAA",
+      "agents": {
+        "518f66a3-1ca7-4973-845b-aacfdaa6e583": "Design Archivist",
+        "e805cd0b-419c-43fd-9862-f7d039c6374b": "Client Comms",
+        "75b6a383-5da9-41db-ba3e-a8a2eaf407bf": "QA Reviewer",
+        "6f98ab6a-9c8b-4b8c-bbed-923d0be755b9": "CEO"
+      }
+    },
+    "f5f3b965-cbda-44b0-9580-18fca61bb2cb": {
+      "company": "Delphi",
+      "agents": {
+        "6e72d178-7edb-4380-84b3-7673628ed1b0": "Researcher",
+        "96f99fec-ec90-44de-8105-de92642f52f6": "Writer",
+        "82dce821-a165-4adb-8c66-c43e9c3c0629": "Trend Scanner",
+        "5e806760-d0dc-4fbb-9abc-a3e94620b2d2": "Editor"
+      }
+    },
+    "e0c9db01-d962-4c84-ba5a-b37722436666": {
+      "company": "SAGE",
+      "agents": {
+        "fc5b4860-623f-4ce7-8ab4-44c54b7fd205": "DevOps Monitor",
+        "6851cc70-3222-4901-94a5-f1e92f72798c": "Ops Director",
+        "daed9988-81e2-4f54-ab9c-4ead91408a96": "Project Manager",
+        "d32c7f39-d6bb-4b61-b44c-6d766c78d1d1": "Process Auditor"
+      }
+    },
+    "eda3082d-bde3-4fd2-bd9e-ff0bd706ada5": {
+      "company": "Personal",
+      "agents": {
+        "75170c0b-e0ee-4174-b028-26803c8c6dac": "ClawPT",
+        "1f673df1-6d13-4f17-aac6-1b385d67afcb": "Rhythm Keeper",
+        "d23743f0-1706-42e6-91c4-5e76c8660840": "Family Logistics",
+        "8e65616b-76a8-4e98-a943-9da3d5a875ff": "Wellness",
+        "ce8216a5-e8ce-4980-91e0-f7495aa94121": "Growth",
+        "9a47c71c-aaca-464a-b4a2-5ba214c5d99e": "Life Pilot",
+        "a779e936-861b-4f3b-aeb9-27cf5c69afa4": "Deep Thinker",
+        "07123ba3-eb06-4341-a2e5-7408865a9d8a": "Finance"
+      }
+    },
+    "acd58600-1f19-4349-bf76-aa1a0cbb671d": {
+      "company": "Adinkra",
+      "agents": {
+        "b464c1b2-1368-4ca8-ab1a-db9d2e3d6276": "Venture Scout",
+        "4f27720a-e0dc-4ef2-a1bb-7fa524b7164e": "Build Lead",
+        "3bcbcc38-76fa-4bd3-ae61-d745b92e6cfe": "Research Analyst",
+        "c878ad7b-994a-4c19-9a85-e78e0dee90fe": "Client Success",
+        "8425ee7f-e98b-4a58-8c0d-5b99a62acd29": "Chief of Staff"
+      }
+    }
+  }
+}

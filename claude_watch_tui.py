@@ -9,8 +9,9 @@ from datetime import datetime, timedelta, timezone
 from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import Horizontal
-from textual.widgets import DataTable, Static
+from textual.containers import Horizontal, Vertical
+from textual.screen import Screen
+from textual.widgets import DataTable, Header, Static
 
 from claude_watch_data import (
     make_active_calls_panel,
@@ -19,12 +20,16 @@ from claude_watch_data import (
     _build_or_update_index,
     _compute_tool_feed_rows,
     _current_pct,
+    _get_call_history,
     _get_session_history,
+    _get_session_turns,
     _index_building,
     _load_index,
     make_drain_panel,
     make_header,
     make_sessions_panel,
+    _get_call_history,
+    make_skills_panel,
     make_tool_stats,
 )
 
@@ -62,9 +67,94 @@ class ActiveCalls(Static):
         self.update(make_active_calls_panel())
 
 
+class SkillsPanel(Static):
+    def update_content(self):
+        self.update(make_skills_panel())
+
+
 class DrainPanel(Static):
     def update_content(self):
         self.update(make_drain_panel())
+
+
+# ── Drill-down screen ────────────────────────────────────────────────────────
+
+
+class SessionDrillDown(Screen):
+    BINDINGS = [
+        Binding("escape", "pop_screen", "Back"),
+        Binding("q", "pop_screen", "Back"),
+    ]
+
+    def __init__(self, session_id, directive=""):
+        super().__init__()
+        self.session_id = session_id
+        self.session_directive = directive
+
+    def compose(self) -> ComposeResult:
+        yield Static(
+            f"[bold]Session:[/bold] {self.session_id}  "
+            f"[bold]Directive:[/bold] {self.session_directive}  "
+            "[dim](Escape to go back)[/dim]",
+            id="drilldown-header",
+        )
+        yield DataTable(id="drilldown-table")
+
+    def on_mount(self):
+        table = self.query_one("#drilldown-table", DataTable)
+        table.cursor_type = "row"
+        table.zebra_stripes = True
+        table.add_column("#", width=4)
+        table.add_column("In", width=8)
+        table.add_column("Out", width=8)
+        table.add_column("~5h%", width=6)
+        table.add_column("Model", width=7)
+        table.add_column("Tools", width=25)
+        table.add_column("Prompt")
+
+        turns = _get_session_turns(self.session_id)
+        if not turns:
+            table.add_row("—", "", "", "", "", "", Text("no turns found", style="dim"))
+            return
+
+        total_in = total_out = total_pct = 0
+        for t in turns:
+            tokens_in = t["tokens_in"]
+            tokens_out = t["tokens_out"]
+            total_in += tokens_in
+            total_out += tokens_out
+            total_pct += t["pct_est"]
+
+            in_str = f"{tokens_in/1000:.1f}k" if tokens_in >= 1000 else str(tokens_in)
+            out_str = f"{tokens_out/1000:.1f}k" if tokens_out >= 1000 else str(tokens_out)
+
+            pct = t["pct_est"]
+            pct_style = "red" if pct > 1 else ("yellow" if pct > 0.3 else "dim")
+            mdl_style = "magenta" if t["model"] == "opus" else ("cyan" if t["model"] == "sonnet" else "dim")
+
+            table.add_row(
+                str(t["turn"]),
+                Text(in_str, style="dim"),
+                Text(out_str),
+                Text(f"{pct:.1f}%", style=pct_style),
+                Text(t["model"], style=mdl_style),
+                Text(t["tools"][:25], style="dim"),
+                Text(t["prompt"][:50]),
+            )
+
+        # Summary row
+        table.add_row(
+            Text("Σ", style="bold"),
+            Text(f"{total_in/1000:.0f}k", style="bold"),
+            Text(f"{total_out/1000:.0f}k", style="bold"),
+            Text(f"{total_pct:.1f}%", style="bold yellow"),
+            "",
+            "",
+            Text(f"{len(turns)} turns", style="bold"),
+        )
+
+    def action_pop_screen(self):
+        self.app.pop_screen()
 
 
 # ── DataTable widgets (scrollable) ───────────────────────────────────────────
@@ -72,7 +162,7 @@ class DrainPanel(Static):
 
 class SessionHistoryTable(DataTable):
     BORDER_TITLE = "Session History"
-    BORDER_SUBTITLE = "Tab to focus · arrows to scroll"
+    BORDER_SUBTITLE = "Tab to focus · Enter to drill down · arrows to scroll"
 
     def on_mount(self):
         self.cursor_type = "row"
@@ -142,7 +232,7 @@ class SessionHistoryTable(DataTable):
             directive = (s["directive"] or "—")[:60]
 
             src = s.get("source", "?")
-            src_style = "yellow" if src == "paperclip" else ("green" if src == "cli" else ("cyan" if "atlas" in src else "dim"))
+            src_style = "yellow" if ("/" in src or src == "paperclip") else ("green" if src == "cli" else ("cyan" if "atlas" in src else "dim"))
             who = f"{src}/{(s['directive'] or '?')[:8]}"
             self.add_row(
                 Text(time_dur, style="dim"),
@@ -159,6 +249,19 @@ class SessionHistoryTable(DataTable):
                 self.move_cursor(row=cur_row)
         except Exception:
             pass
+
+    def on_data_table_row_selected(self, event):
+        key = event.row_key
+        if key and key.value and not key.value.startswith("sep-"):
+            session_id = key.value
+            # Find directive from index
+            sessions = _get_session_history()
+            directive = "—"
+            for s in sessions:
+                if s["session_id"] == session_id:
+                    directive = s.get("directive", "—")
+                    break
+            self.app.push_screen(SessionDrillDown(session_id, directive))
 
 
 class ToolCallFeed(DataTable):
@@ -189,14 +292,8 @@ class ToolCallFeed(DataTable):
             return
 
         for r in rows:
-            # Derive source from directive heuristic
-            d = r["directive"].lower()
-            if "morning" in d or "brief" in d or "monitor" in d or "health" in d:
-                src, sc = "paperclip", "yellow"
-            elif "unnamed" in d:
-                src, sc = "?", "dim"
-            else:
-                src, sc = "cli", "green"
+            src = r.get("source", "cli")
+            sc = "yellow" if ("/" in src or src == "paperclip") else ("green" if src == "cli" else "dim")
             self.add_row(
                 Text(r["ts_str"], style="dim"),
                 Text(r["session"], style="cyan"),
@@ -204,6 +301,80 @@ class ToolCallFeed(DataTable):
                 r["tool"],
                 Text(src, style=sc),
                 Text(r["directive"][:30], style="dim"),
+            )
+
+        try:
+            if cur_row < self.row_count:
+                self.move_cursor(row=cur_row)
+        except Exception:
+            pass
+
+
+class CallHistoryTable(DataTable):
+    BORDER_TITLE = "Call History (all sessions from ledger)"
+    BORDER_SUBTITLE = "Tab to focus"
+
+    def on_mount(self):
+        self.cursor_type = "row"
+        self.zebra_stripes = True
+        self.add_column("When", width=6)
+        self.add_column("Session", width=12)
+        self.add_column("Src", width=10)
+        self.add_column("Calls", width=5)
+        self.add_column("Tools Used", width=28)
+        self.add_column("5h%", width=7)
+        self.add_column("Directive")
+
+    def refresh_rows(self):
+        history = _get_call_history()
+
+        try:
+            cur_row = self.cursor_row
+        except Exception:
+            cur_row = 0
+
+        self.clear()
+
+        if not history:
+            self.add_row("...", "", "", "", "", "", Text("no data", style="dim"))
+            return
+
+        today = datetime.now(timezone.utc).astimezone().date()
+        current_group = None
+
+        for h in history:
+            date = h.get("when_date")
+            if date == today:
+                group = "Today"
+            elif date:
+                group = date.strftime("%b %-d")
+            else:
+                group = "Unknown"
+
+            if group != current_group:
+                sep = f"── {group} " + "─" * 30
+                self.add_row(Text(sep, style="dim"), "", "", "", "", "", "", key=f"ch-sep-{group}")
+                current_group = group
+
+            src = h["source"]
+            src_style = "yellow" if ("/" in src or src == "paperclip") else ("green" if src == "cli" else "dim")
+
+            pct = h["pct_str"]
+            try:
+                v = float(pct.strip("+%"))
+                pct_style = "red" if v > 5 else ("yellow" if v > 2 else "green")
+            except Exception:
+                pct_style = "dim"
+
+            self.add_row(
+                Text(h["when"], style="dim"),
+                Text(h["session"][:12], style="cyan"),
+                Text(src, style=src_style),
+                Text(str(h["calls"]), justify="right"),
+                Text(h["tools_str"][:28], style="dim"),
+                Text(pct, style=pct_style),
+                Text((h["directive"] or "—")[:40]),
+                key=f"ch-{h['session']}",
             )
 
         try:
@@ -232,10 +403,14 @@ class ClaudeWatchApp(App):
         yield UrgentAlerts(id="urgent")
         yield ActiveSessions(id="active-sessions")
         yield ActiveCalls(id="active-calls")
-        yield SessionHistoryTable(id="session-history")
+        with Horizontal(id="history-row"):
+            yield CallHistoryTable(id="call-history")
+            yield SessionHistoryTable(id="session-history")
         with Horizontal(id="feed-row"):
             yield ToolCallFeed(id="tool-feed")
-            yield ToolFrequency(id="tool-freq")
+            with Vertical(id="stats-col"):
+                yield ToolFrequency(id="tool-freq")
+                yield SkillsPanel(id="skills")
         yield DrainPanel(id="drain")
 
     def on_mount(self):
@@ -258,6 +433,8 @@ class ClaudeWatchApp(App):
         self.query_one("#session-history", SessionHistoryTable).refresh_rows()
         self.query_one("#tool-feed", ToolCallFeed).refresh_rows()
         self.query_one("#tool-freq", ToolFrequency).update_content()
+        self.query_one("#skills", SkillsPanel).update_content()
+        self.query_one("#call-history", CallHistoryTable).refresh_rows()
         self.query_one("#drain", DrainPanel).update_content()
 
     def action_force_refresh(self):
