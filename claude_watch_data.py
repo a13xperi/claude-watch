@@ -922,9 +922,9 @@ def make_header(five, seven, five_reset_ts, seven_reset_ts):
             pct_f = float(pct)
             filled = int(pct_f * width / 100)
             color = "green" if pct_f < 50 else ("yellow" if pct_f < 75 else "red")
+            pct_display = f"{pct_f:.1f}" if pct_f != int(pct_f) else str(int(pct_f))
         except Exception:
-            filled, color = 0, "dim"
-        pct_display = f"{pct_f:.1f}" if pct_f != int(pct_f) else str(int(pct_f))
+            filled, color, pct_display = 0, "dim", "?"
         return f"[{color}]{'█' * filled}{'░' * (width - filled)}[/{color}] {pct_display}%"
 
     t = Table.grid(padding=(0, 2))
