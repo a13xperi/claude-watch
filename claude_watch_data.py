@@ -653,7 +653,7 @@ def _get_skill_stats():
             try:
                 skill_last[name] = datetime.fromisoformat(
                     ts.replace("Z", "+00:00")
-                ).astimezone().strftime("%H:%M")
+                ).astimezone().strftime("%H:%M:%S")
             except Exception:
                 skill_last[name] = "?"
     result = []
@@ -727,7 +727,7 @@ def _get_call_history():
         # When (last activity)
         try:
             last = datetime.fromisoformat(s["last_ts"].replace("Z", "+00:00"))
-            when_str = last.astimezone().strftime("%H:%M")
+            when_str = last.astimezone().strftime("%H:%M:%S")
             when_date = last.astimezone().date()
         except Exception:
             when_str = "?"
@@ -1049,7 +1049,7 @@ def make_sessions_panel():
             elapsed = _etime_to_secs(age)
             if elapsed is not None:
                 start_dt = now - timedelta(seconds=elapsed)
-                start_str = start_dt.strftime("%H:%M")
+                start_str = start_dt.strftime("%H:%M:%S")
             else:
                 start_str = "?"
             color = "green"

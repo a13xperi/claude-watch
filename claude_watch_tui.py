@@ -271,7 +271,7 @@ class SessionHistoryTable(DataTable):
                 self.add_row(Text(sep, style="dim"), "", "", "", "", "", key=f"sep-{group}")
                 current_group = group
 
-            end_str = s["last_ts"].astimezone().strftime("%H:%M")
+            end_str = s["last_ts"].astimezone().strftime("%H:%M:%S")
             time_dur = f"{end_str} {s['dur_str']:>6}"
 
             mdl = _abbrev_model(s.get("model", ""))
