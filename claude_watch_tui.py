@@ -9,15 +9,16 @@ from datetime import datetime, timedelta, timezone
 from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import Horizontal, ScrollableContainer, Vertical
+from textual.containers import Horizontal, ScrollableContainer
 from textual.screen import Screen
-from textual.widgets import DataTable, Header, Static
+from textual.widgets import DataTable, Static
 
 from claude_watch_data import (
-    make_active_calls_panel,
     make_urgent_panel,
     _abbrev_model,
+    _active_pids,
     _build_or_update_index,
+    _build_pid_map,
     _current_pct,
     _get_call_history,
     _get_session_history,
@@ -59,11 +60,6 @@ class ActiveSessions(Static):
 class ToolFrequency(Static):
     def update_content(self):
         self.update(make_tool_stats())
-
-
-class ActiveCalls(Static):
-    def update_content(self):
-        self.update(make_active_calls_panel())
 
 
 class SkillsPanel(Static):
@@ -228,16 +224,19 @@ class SessionHistoryTable(DataTable):
     def on_mount(self):
         self.cursor_type = "row"
         self.zebra_stripes = True
-        # Merged Time+Dur, matching Rich version layout
-        self.add_column("Time    Dur", width=13)
-        self.add_column("Who", width=18)
-        self.add_column("Mdl", width=7)
+        self.add_column("When", width=9)
+        self.add_column("Session", width=10)
+        self.add_column("Src", width=10)
+        self.add_column("Mdl", width=10)
+        self.add_column("Dur", width=7)
         self.add_column("~5h%", width=7)
         self.add_column("Out", width=6)
         self.add_column("Directive")
 
     def refresh_rows(self):
         sessions = _get_session_history()
+        pid_map = _build_pid_map()
+        active = _active_pids()
 
         try:
             cur_row = self.cursor_row
@@ -248,7 +247,7 @@ class SessionHistoryTable(DataTable):
 
         if not sessions:
             self.add_row(
-                "...", "", "", "", "",
+                "...", "", "", "", "", "", "",
                 Text("building index..." if _index_building else "no sessions", style="dim"),
             )
             return
@@ -268,11 +267,14 @@ class SessionHistoryTable(DataTable):
 
             if group != current_group:
                 sep = f"— {group} —"
-                self.add_row(Text(sep, style="dim"), "", "", "", "", "", key=f"sep-{group}")
+                self.add_row(Text(sep, style="dim"), "", "", "", "", "", "", "", key=f"sep-{group}")
                 current_group = group
 
-            end_str = s["last_ts"].astimezone().strftime("%H:%M:%S")
-            time_dur = f"{end_str} {s['dur_str']:>6}"
+            when_str = s["last_ts"].astimezone().strftime("%H:%M:%S")
+
+            # Show cc-PID if we can match, otherwise short UUID
+            session_display = pid_map.get(s["session_id"], s["session_id"][:10])
+            is_active = session_display in active
 
             mdl = _abbrev_model(s.get("model", ""))
             mdl_style = "magenta" if mdl == "opus" else ("cyan" if mdl == "sonnet" else "dim")
@@ -294,11 +296,14 @@ class SessionHistoryTable(DataTable):
 
             src = s.get("source", "?")
             src_style = "yellow" if ("/" in src or src == "paperclip") else ("green" if src == "cli" else ("cyan" if "atlas" in src else "dim"))
-            who = f"{src}/{(s['directive'] or '?')[:8]}"
+
+            dot = "[bold green]● [/bold green]" if is_active else "  "
             self.add_row(
-                Text(time_dur, style="dim"),
-                Text(who, style=src_style),
+                Text(when_str, style="dim"),
+                Text.from_markup(f"{dot}[cyan]{session_display}[/cyan]"),
+                Text(src, style=src_style),
                 Text(mdl, style=mdl_style),
+                Text(s["dur_str"], style="dim"),
                 Text(pct, style=pct_style),
                 Text(out_str, style="dim", justify="right"),
                 directive,
@@ -325,69 +330,26 @@ class SessionHistoryTable(DataTable):
             self.app.push_screen(SessionDrillDown(session_id, directive))
 
 
-class ToolCallFeed(DataTable):
-    BORDER_TITLE = "Tool Call Feed (newest first)"
-
-    def on_mount(self):
-        self.cursor_type = "row"
-        self.zebra_stripes = True
-        self.add_column("Time", width=9)
-        self.add_column("Who", width=14)
-        self.add_column("Δ5h%", width=5)
-        self.add_column("Tool", width=8)
-        self.add_column("Src", width=10)
-        self.add_column("Directive")
-
-    def refresh_rows(self):
-        rows = _compute_tool_feed_rows(last_n=200)
-
-        try:
-            cur_row = self.cursor_row
-        except Exception:
-            cur_row = 0
-
-        self.clear()
-
-        if not rows:
-            self.add_row("...", "", "", "", "", Text("no events yet", style="dim"))
-            return
-
-        for r in rows:
-            src = r.get("source", "cli")
-            sc = "yellow" if ("/" in src or src == "paperclip") else ("green" if src == "cli" else "dim")
-            self.add_row(
-                Text(r["ts_str"], style="dim"),
-                Text(r["session"], style="cyan"),
-                Text(r["delta_str"], style=r["delta_style"]),
-                r["tool"],
-                Text(src, style=sc),
-                Text(r["directive"][:30], style="dim"),
-            )
-
-        try:
-            if cur_row < self.row_count:
-                self.move_cursor(row=cur_row)
-        except Exception:
-            pass
-
-
 class CallHistoryTable(DataTable):
-    BORDER_TITLE = "Call History (all sessions from ledger)"
+    BORDER_TITLE = "Call History"
     BORDER_SUBTITLE = "Tab to focus"
 
     def on_mount(self):
         self.cursor_type = "row"
         self.zebra_stripes = True
-        self.add_column("When", width=11)
-        self.add_column("Session", width=12)
+        self.add_column("When", width=9)
+        self.add_column("Session", width=10)
         self.add_column("Src", width=10)
-        self.add_column("Calls", width=5)
-        self.add_column("Tools Used", width=28)
+        self.add_column("Mdl", width=10)
+        self.add_column("#", width=4)
+        self.add_column("Tools", width=20)
+        self.add_column("Last Tool", width=22)
         self.add_column("5h%", width=7)
         self.add_column("Directive")
 
     def refresh_rows(self):
         history = _get_call_history()
+        active = _active_pids()
 
         try:
             cur_row = self.cursor_row
@@ -397,7 +359,7 @@ class CallHistoryTable(DataTable):
         self.clear()
 
         if not history:
-            self.add_row("...", "", "", "", "", "", Text("no data", style="dim"))
+            self.add_row("...", "", "", "", "", "", "", "", Text("no data", style="dim"))
             return
 
         today = datetime.now(timezone.utc).astimezone().date()
@@ -414,11 +376,14 @@ class CallHistoryTable(DataTable):
 
             if group != current_group:
                 sep = f"— {group} —"
-                self.add_row(Text(sep, style="dim"), "", "", "", "", "", "", key=f"ch-sep-{group}")
+                self.add_row(Text(sep, style="dim"), "", "", "", "", "", "", "", "", key=f"ch-sep-{group}")
                 current_group = group
 
             src = h["source"]
             src_style = "yellow" if ("/" in src or src == "paperclip") else ("green" if src == "cli" else "dim")
+
+            mdl = h.get("model", "?")
+            mdl_style = "magenta" if "opus" in mdl else ("cyan" if "sonnet" in mdl else "dim")
 
             pct = h["pct_str"]
             try:
@@ -427,12 +392,18 @@ class CallHistoryTable(DataTable):
             except Exception:
                 pct_style = "dim"
 
+            # Green dot for active sessions
+            sid = h["session"]
+            dot = "[bold green]● [/bold green]" if sid in active else "  "
+
             self.add_row(
                 Text(h["when"], style="dim"),
-                Text(h["session"][:12], style="cyan"),
+                Text.from_markup(f"{dot}[cyan]{sid[:10]}[/cyan]"),
                 Text(src, style=src_style),
+                Text(mdl, style=mdl_style),
                 Text(str(h["calls"]), justify="right"),
-                Text(h["tools_str"][:28], style="dim"),
+                Text(h["tools_str"][:20], style="dim"),
+                Text(h.get("recent_str", "—")[:22]),
                 Text(pct, style=pct_style),
                 Text((h["directive"] or "—")[:40]),
                 key=f"ch-{h['session']}",
@@ -465,7 +436,6 @@ class ClaudeWatchApp(App):
             yield TokenHeader(id="header")
             yield UrgentAlerts(id="urgent")
             yield ActiveSessions(id="active-sessions")
-            yield ActiveCalls(id="active-calls")
             with Horizontal(id="history-row"):
                 yield CallHistoryTable(id="call-history")
             yield SessionHistoryTable(id="session-history")
@@ -490,7 +460,6 @@ class ClaudeWatchApp(App):
         self.query_one("#header", TokenHeader).update_content(five, seven, fr, sr)
         self.query_one("#urgent", UrgentAlerts).update_content()
         self.query_one("#active-sessions", ActiveSessions).update_content()
-        self.query_one("#active-calls", ActiveCalls).update_content()
         self.query_one("#session-history", SessionHistoryTable).refresh_rows()
         self.query_one("#tool-freq", ToolFrequency).update_content()
         self.query_one("#skills", SkillsPanel).update_content()

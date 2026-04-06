@@ -21,12 +21,7 @@ Screen {
 /* ── Active Sessions (shrunk — scrollable panels need the space) ── */
 #active-sessions {
     height: auto;
-    max-height: 6;
-}
-
-#active-calls {
-    height: auto;
-    max-height: 8;
+    max-height: 14;
 }
 
 /* ── History row: Call History + Session History side-by-side ── */

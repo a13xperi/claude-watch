@@ -112,13 +112,17 @@ def _abbrev_model(model):
     if not model:
         return "?"
     m = model.lower()
+    # Extract context tier if present (e.g. opus[1m] → opus:1m)
+    tier = ""
+    if "[" in m and "]" in m:
+        tier = ":" + m[m.index("[") + 1:m.index("]")]
     if "opus" in m:
-        return "opus"
+        return "opus" + tier
     if "sonnet" in m:
-        return "sonnet"
+        return "sonnet" + tier
     if "haiku" in m:
-        return "haiku"
-    return model[:8]
+        return "haiku" + tier
+    return model[:10]
 
 
 def _budget():
@@ -172,6 +176,11 @@ def _active_sessions():
     except Exception:
         pass
     return sessions
+
+
+def _active_pids():
+    """Return set of active cc-{PID} session IDs."""
+    return {f"cc-{item[0]}" for item in _active_sessions()}
 
 
 def _session_last_activity(session_id):
@@ -680,10 +689,77 @@ def make_skills_panel():
     return Panel(t, title="[bold]Skills[/bold]  [dim](from ledger)[/dim]", border_style="magenta")
 
 
+# ── PID mapping (transcript UUID → cc-PID) ───────────────────────────────────
+
+_pid_map_cache = {}   # type: Dict[str, str]  # transcript UUID → cc-PID
+_pid_map_time = 0.0
+
+
+def _build_pid_map():
+    """Build mapping from transcript session UUIDs to cc-PIDs using ledger timestamps."""
+    global _pid_map_cache, _pid_map_time
+    # Only rebuild every 10s
+    now = time.time()
+    if now - _pid_map_time < 10 and _pid_map_cache:
+        return _pid_map_cache
+    _pid_map_time = now
+
+    entries = _load_ledger(last_n=5000)
+    # Build per-PID time ranges from ledger
+    pid_ranges = {}  # type: Dict[str, Tuple[datetime, datetime]]
+    for e in entries:
+        sid = e.get("session", "")
+        if not sid.startswith("cc-"):
+            continue
+        try:
+            ts = datetime.fromisoformat(e["ts"].replace("Z", "+00:00"))
+        except Exception:
+            continue
+        if sid not in pid_ranges:
+            pid_ranges[sid] = (ts, ts)
+        else:
+            first, last = pid_ranges[sid]
+            if ts < first:
+                first = ts
+            if ts > last:
+                last = ts
+            pid_ranges[sid] = (first, last)
+
+    # Match transcript sessions to PIDs by overlapping time ranges
+    result = {}
+    for uuid, entry in _index_cache.items():
+        try:
+            t_first = datetime.fromisoformat(entry["first_ts"])
+            t_last = datetime.fromisoformat(entry["last_ts"])
+            if t_first.tzinfo is None:
+                t_first = t_first.replace(tzinfo=timezone.utc)
+            if t_last.tzinfo is None:
+                t_last = t_last.replace(tzinfo=timezone.utc)
+        except Exception:
+            continue
+
+        best_pid = None
+        best_overlap = 0
+        for pid_sid, (p_first, p_last) in pid_ranges.items():
+            overlap_start = max(t_first, p_first)
+            overlap_end = min(t_last, p_last)
+            overlap = max(0, (overlap_end - overlap_start).total_seconds())
+            if overlap > best_overlap:
+                best_overlap = overlap
+                best_pid = pid_sid
+        if best_pid and best_overlap > 5:
+            result[uuid] = best_pid
+
+    _pid_map_cache = result
+    return result
+
+
 # ── call history (aggregated per session from ledger) ────────────────────────
 
 def _get_call_history():
-    """Aggregate tool calls per session from ledger. Returns list of dicts sorted by last activity."""
+    """Aggregate tool calls per session from ledger. Returns list of dicts sorted by last activity.
+    Includes recent tool details (merged from former Last Tool Activity panel).
+    """
     entries = _load_ledger(last_n=5000)
     tool_events = [e for e in entries if e.get("type") == "tool_use"]
     if not tool_events:
@@ -702,6 +778,8 @@ def _get_call_history():
                 "directive": e.get("directive", "—"),
                 "five_pct_start": e.get("five_pct"),
                 "five_pct_end": e.get("five_pct"),
+                "recent_tools": [],
+                "model": "?",
             }
         s = sessions[sid]
         s["calls"] += 1
@@ -711,6 +789,14 @@ def _get_call_history():
         pct = e.get("five_pct")
         if pct is not None:
             s["five_pct_end"] = pct
+        mdl = e.get("model", "")
+        if mdl and mdl != "?":
+            s["model"] = mdl
+        # Keep last 3 tool calls with snippets
+        snippet = e.get("tool_snippet", "")
+        s["recent_tools"].append(f"{tool}: {snippet[:20]}" if snippet else tool)
+        if len(s["recent_tools"]) > 3:
+            s["recent_tools"] = s["recent_tools"][-3:]
 
     result = []
     for sid, s in sessions.items():
@@ -740,13 +826,18 @@ def _get_call_history():
         # Source from index cache (accurate) with fallback to session ID lookup
         source = _index_cache.get(sid, {}).get("source", "cli")
 
+        # Recent tool detail (last tool with snippet)
+        recent_str = s["recent_tools"][-1] if s["recent_tools"] else "—"
+
         result.append({
             "session": sid,
             "source": source,
+            "model": _abbrev_model(s.get("model", "?")),
             "when": when_str,
             "when_date": when_date,
             "calls": s["calls"],
             "tools_str": tools_str,
+            "recent_str": recent_str,
             "pct_str": pct_str,
             "directive": s["directive"] or "—",
             "last_ts_raw": s["last_ts"],
@@ -1000,10 +1091,67 @@ def make_urgent_panel():
             )
     except Exception:
         pass
-    
+
+    # Check for runaway burn rate from drain events — with actionable detail
+    try:
+        entries = _load_ledger(last_n=200)
+        drain_events = [e for e in entries if e.get("type") == "tool_drain" and e.get("delta_5h", 0) > 0][-5:]
+        if drain_events:
+            last = drain_events[-1]
+            burn = float(last.get("burn_rate_per_min", 0))
+            num_sessions = int(last.get("cli_sessions", 0))
+            delta = float(last.get("delta_5h", 0))
+
+            if burn > 6 or (burn > 3 and num_sessions >= 2):
+                # Identify the top burner from active sessions
+                active = _active_sessions()
+                top_pid = None
+                top_delta = 0
+                top_directive = "—"
+                top_idle_secs = 0
+                for item in active:
+                    pid, _, directive, delta_str = item[0], item[1], item[2], item[3]
+                    try:
+                        d = float(delta_str.strip("+%"))
+                    except Exception:
+                        d = 0
+                    if d > top_delta:
+                        top_delta = d
+                        top_pid = pid
+                        top_directive = directive
+                        secs, _ = _session_last_activity(pid)
+                        top_idle_secs = secs or 0
+
+                severity = "[bold red]RUNAWAY[/bold red]" if burn > 6 else "[yellow]HIGH BURN[/yellow]"
+                line1 = (
+                    f"  {severity} — {burn:.1f}%/min across "
+                    f"{num_sessions} session{'s' if num_sessions != 1 else ''}."
+                )
+                alerts.append(line1)
+
+                if top_pid:
+                    idle_m = top_idle_secs // 60
+                    line2 = (
+                        f"  Top burner: [bold cyan]cc-{top_pid}[/bold cyan] "
+                        f"at [bold]+{top_delta:.0f}%[/bold] "
+                        f"({top_directive[:25]})"
+                    )
+                    if top_idle_secs > 300:
+                        line2 += (
+                            f" — [bold red]idle {idle_m}m[/bold red]. "
+                            f"Likely stuck. Run: [bold]kill {top_pid}[/bold]"
+                        )
+                    elif top_idle_secs > 60:
+                        line2 += f" — idle {idle_m}m. Monitor or close if unneeded."
+                    else:
+                        line2 += " — actively working."
+                    alerts.append(line2)
+    except Exception:
+        pass
+
     if not alerts:
         return None
-    
+
     from rich.text import Text
     t = Table(box=None, padding=(0, 0), expand=True, show_header=False)
     t.add_column(ratio=1)
@@ -1033,156 +1181,139 @@ def _etime_to_secs(etime):
 
 
 def make_sessions_panel():
+    """Active Sessions with inline call detail sub-rows."""
     sessions = _active_sessions()
+    entries = _load_ledger(last_n=500)
+    now_utc = datetime.now(timezone.utc)
+    now_local = datetime.now()
+
     t = Table(show_header=True, header_style="bold cyan", box=None, padding=(0, 1), expand=True)
-    t.add_column("Start", min_width=6, no_wrap=True)
-    t.add_column("Dur", min_width=6, no_wrap=True)
-    t.add_column("PID", min_width=9, no_wrap=True)
-    t.add_column("Mdl", min_width=7, no_wrap=True)
-    t.add_column("Used", min_width=6, no_wrap=True)
-    t.add_column("Status", min_width=14, no_wrap=True, overflow="ellipsis")
-    t.add_column("Source", width=10, no_wrap=True)
-    t.add_column("Directive", overflow="ellipsis", no_wrap=True)
-    if not sessions:
-        t.add_row("", "", "[dim]—[/dim]", "", "", "", "", "[dim]no active sessions[/dim]")
-    else:
-        # Build model lookup from ledger
-        entries = _load_ledger()
-        model_map = {}
-        for e in entries:
-            sid = e.get("session", "")
-            mdl = e.get("model")
-            if sid and mdl:
-                model_map[sid] = mdl
-        now = datetime.now()
-        for item in sessions:
-            pid, age, directive, delta = item[0], item[1], item[2], item[3]
-            source = item[4] if len(item) > 4 else "?"
-            # Compute start time from etime
-            elapsed = _etime_to_secs(age)
-            if elapsed is not None:
-                start_dt = now - timedelta(seconds=elapsed)
-                start_str = start_dt.strftime("%H:%M:%S")
-            else:
-                start_str = "?"
-            color = "green"
-            if delta == "new":
-                color = "dim"
-            else:
-                try:
-                    val = float(delta.strip("+%"))
-                    color = "red" if val > 10 else ("yellow" if val > 5 else "green")
-                except Exception:
-                    pass
-            secs_ago, last_tool = _session_last_activity(pid)
-            if secs_ago is not None and secs_ago < 45:
-                status = f"[bold green]⚡ {last_tool[:10]}[/bold green]"
-            elif secs_ago is not None and secs_ago < 300:
-                m = secs_ago // 60
-                s = secs_ago % 60
-                ago = f"{m}m{s:02d}s" if m else f"{s}s"
-                status = f"[dim]↺ {last_tool[:8]} {ago}[/dim]"
-            elif secs_ago is not None:
-                m = secs_ago // 60
-                status = f"[dim]· {m}m[/dim]"
-            else:
-                status = "[dim]· ?[/dim]"
-            src_color = "yellow" if ("/" in source or source == "paperclip") else ("green" if source == "cli" else ("cyan" if "atlas" in source else "dim"))
-            mdl = model_map.get(f"cc-{pid}", "?")
-            mdl_style = "magenta" if mdl == "opus" else ("cyan" if mdl == "sonnet" else "dim")
-            t.add_row(
-                f"[dim]{start_str}[/dim]",
-                f"[dim]{age}[/dim]",
-                f"[cyan]cc-{pid}[/cyan]",
-                f"[{mdl_style}]{mdl}[/{mdl_style}]",
-                f"[{color}]{delta}[/{color}]",
-                status,
-                f"[{src_color}]{source}[/{src_color}]",
-                directive,
-            )
-    return Panel(t, title="[bold]Active Sessions[/bold]", border_style="cyan")
-
-
-def make_active_calls_panel():
-    """Show the most recent tool calls for each active session."""
-    sessions = _active_sessions()
-    entries = _load_ledger(last_n=200)
-
-    t = Table(show_header=True, header_style="bold white", box=None, padding=(0, 1), expand=True)
-    t.add_column("Time", width=8, no_wrap=True)
+    t.add_column("When", width=9, no_wrap=True)
     t.add_column("Session", width=10, no_wrap=True)
-    t.add_column("Tool", width=20, no_wrap=True)
-    t.add_column("Ago", width=7, no_wrap=True)
-    t.add_column("5h%", width=5, no_wrap=True)
-    t.add_column("Source", width=12, no_wrap=True)
-    t.add_column("Directive", overflow="ellipsis", no_wrap=True, ratio=1)
+    t.add_column("Src", width=10, no_wrap=True)
+    t.add_column("Mdl", width=10, no_wrap=True)
+    t.add_column("Dur", width=12, no_wrap=True)
+    t.add_column("Used", width=11, no_wrap=True)
+    t.add_column("Directive", overflow="ellipsis", no_wrap=True)
 
     if not sessions:
-        t.add_row("", "[dim]—[/dim]", "", "", "", "[dim]no active sessions[/dim]")
-        return Panel(t, title="[bold]Last Tool Activity[/bold]", border_style="bright_white")
+        t.add_row("", "[dim]—[/dim]", "", "", "", "", "[dim]no active sessions[/dim]")
+        return Panel(t, title="[bold]Active Sessions[/bold]  [dim](live)[/dim]", border_style="cyan")
 
-    now = datetime.now(timezone.utc)
-    active_pids = {item[0] for item in sessions}
+    # Single-pass ledger scan: build model, last call, first output per session
+    model_map = {}    # type: Dict[str, str]
+    last_call = {}    # type: Dict[str, Tuple[datetime, str, int]]
+    first_out = {}    # type: Dict[str, int]
+    for e in entries:
+        sid = e.get("session", "")
+        if not sid:
+            continue
+        mdl = e.get("model")
+        if mdl and mdl != "?":
+            model_map[sid] = mdl
+        if e.get("type") == "tool_use":
+            if sid not in first_out:
+                first_out[sid] = e.get("output_tokens", 0)
+            try:
+                ts = datetime.fromisoformat(e["ts"].replace("Z", "+00:00"))
+                tool = _shorten_tool(e.get("tool", "?"))
+                out = e.get("output_tokens", 0)
+                last_call[sid] = (ts, tool, out)
+            except Exception:
+                pass
 
     for item in sessions:
-        pid = item[0]
-        directive = item[2]
+        pid, age, directive, delta = item[0], item[1], item[2], item[3]
         source = item[4] if len(item) > 4 else "?"
         sid = f"cc-{pid}"
 
-        # Get last 3 tool calls for this session
-        session_calls = [
-            e for e in reversed(entries)
-            if e.get("session") == sid and e.get("type") == "tool_use"
-        ][:3]
+        # ── Header row ──
+        elapsed_s = _etime_to_secs(age)
+        start_str = (now_local - timedelta(seconds=elapsed_s)).strftime("%H:%M:%S") if elapsed_s else "?"
 
-        if not session_calls:
-            src_color = "yellow" if ("/" in source or source == "paperclip") else ("green" if source == "cli" else ("cyan" if "atlas" in source else "dim"))
-            t.add_row(
-                "", f"[cyan]{sid}[/cyan]", "[dim]—[/dim]", "", "", f"[{src_color}]{source}[/{src_color}]",
-                f"[dim]{directive[:30]}[/dim]",
-            )
-            continue
-
-        for i, e in enumerate(session_calls):
-            tool = _shorten_tool(e.get("tool", "?"))
+        color = "green"
+        if delta == "new":
+            color = "dim"
+        else:
             try:
-                ts = datetime.fromisoformat(e["ts"].replace("Z", "+00:00"))
-                time_str = ts.astimezone().strftime("%H:%M:%S")
-                secs = int((now - ts).total_seconds())
-                m, s = divmod(secs, 60)
-                ago = f"{secs}s" if secs < 60 else f"{m}m{s:02d}s"
+                val = float(delta.strip("+%"))
+                color = "red" if val > 10 else ("yellow" if val > 5 else "green")
             except Exception:
-                time_str, ago = "?", "?"
+                pass
 
-            if i == 0:
-                src_color = "yellow" if ("/" in source or source == "paperclip") else ("green" if source == "cli" else ("cyan" if "atlas" in source else "dim"))
-                delta = e.get("delta_from_start", 0)
-                snippet = e.get("tool_snippet", "")
-                tool_display = f"{tool}: {snippet[:28]}" if snippet else tool
-                try:
-                    d = float(delta)
-                    pct_color = "red" if d > 5 else ("yellow" if d > 2 else "green")
-                    pct_str = f"[{pct_color}]+{d:.0f}%[/{pct_color}]"
-                except Exception:
-                    pct_str = "[dim]?[/dim]"
-                t.add_row(
-                    f"[dim]{time_str}[/dim]",
-                    f"[cyan]{sid}[/cyan]",
-                    f"[bold green]{tool_display}[/bold green]" if secs < 45 else tool_display,
-                    f"[dim]{ago}[/dim]",
-                    pct_str,
-                    f"[{src_color}]{source}[/{src_color}]",
-                    f"{directive[:30]}",
-                )
-            else:
-                snippet = e.get("tool_snippet", "")
-                tool_display = f"{tool}: {snippet[:28]}" if snippet else tool
-                t.add_row(
-                    "", "", f"[dim]{tool_display}[/dim]", f"[dim]{ago}[/dim]", "", "", "",
-                )
+        mdl = _abbrev_model(model_map.get(sid, "?"))
+        mdl_style = "magenta" if "opus" in mdl else ("cyan" if "sonnet" in mdl else "dim")
+        src_color = "yellow" if ("/" in source or source == "paperclip") else ("green" if source == "cli" else ("cyan" if "atlas" in source else "dim"))
 
-    return Panel(t, title="[bold]Last Tool Activity[/bold]", border_style="bright_white")
+        t.add_row(
+            f"[dim]{start_str}[/dim]",
+            f"[cyan]{sid}[/cyan]",
+            f"[{src_color}]{source}[/{src_color}]",
+            f"[{mdl_style}]{mdl}[/{mdl_style}]",
+            f"[dim]{age}[/dim]",
+            f"[{color}]{delta}[/{color}]",
+            directive,
+        )
+
+        # ── Sub-row: live call state ──
+        cpu = _get_pid_cpu(pid)
+        lc = last_call.get(sid)
+        if lc:
+            secs_since = int((now_utc - lc[0]).total_seconds())
+            tool_name = lc[1]
+            token_delta = lc[2] - first_out.get(sid, 0)
+        else:
+            secs_since = None
+            tool_name = "?"
+            token_delta = 0
+
+        # State detection
+        if secs_since is not None and secs_since < 15:
+            state = f"[bold green]>> {tool_name[:12]}[/bold green]"
+        elif cpu > 20:
+            state = "[bold yellow]thinking...[/bold yellow]"
+        elif secs_since is not None and secs_since < 120:
+            state = f"[dim]~ {tool_name[:12]}[/dim]"
+        else:
+            state = "[dim]idle[/dim]"
+
+        # Elapsed
+        if secs_since is not None:
+            m, s = divmod(secs_since, 60)
+            elapsed_str = f"{m}m{s:02d}s" if m else f"{s}s"
+        else:
+            elapsed_str = "—"
+
+        # Tokens
+        tok_str = f"{token_delta / 1000:.1f}k" if token_delta >= 1000 else str(token_delta)
+
+        # CPU
+        cpu_str = f"{cpu:.0f}%"
+        cpu_style = "bold yellow" if cpu > 50 else ("dim" if cpu < 5 else "")
+        cpu_val = f"[{cpu_style}]{cpu_str}[/{cpu_style}]" if cpu_style else cpu_str
+
+        t.add_row(
+            "", "", "",
+            f"  {state}",
+            f"[dim]ago:[/dim] {elapsed_str}",
+            f"[dim]tok:[/dim] {tok_str}",
+            f"[dim]cpu:[/dim] {cpu_val}",
+        )
+
+
+    return Panel(t, title="[bold]Active Sessions[/bold]  [dim](live)[/dim]", border_style="cyan")
+
+
+def _get_pid_cpu(pid):
+    """Get CPU usage percentage for a PID."""
+    try:
+        r = subprocess.run(
+            ['ps', '-p', str(pid), '-o', '%cpu='],
+            capture_output=True, text=True, timeout=2,
+        )
+        return float(r.stdout.strip())
+    except Exception:
+        return 0.0
 
 
 def make_tool_stats():
