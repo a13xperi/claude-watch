@@ -11,8 +11,6 @@ GLOBAL_LEDGER="$HOME/.claude/logs/token-ledger.jsonl"
 DIRECTIVE_FILE="/tmp/claude-directive-${PPID}"
 
 # ── Ensure directive file always exists ──────────────────────────
-# Claude sets a proper one on first interaction; this is a fallback
-# so the statusline and auto-register never see an empty name.
 if [ ! -f "$DIRECTIVE_FILE" ]; then
   echo "unnamed session" > "$DIRECTIVE_FILE"
 fi
@@ -32,6 +30,20 @@ seven_pct=$(jq -r '.rate_limits.seven_day.used_percentage // 0' "$DEBUG" 2>/dev/
 input=$(cat)
 tool=$(echo "$input" | jq -r '.tool_name // "unknown"' 2>/dev/null)
 
+# Extract tool input snippet (80 chars max)
+# For Bash: show the command. For Read/Write: show file path. For Skill: show skill name.
+tool_snippet=$(echo "$input" | jq -r '
+  .tool_input // {} |
+  if .command then .command
+  elif .file_path then .file_path
+  elif .pattern then .pattern
+  elif .query then .query
+  elif .skill then .skill
+  elif .prompt then .prompt
+  else (tostring)
+  end' 2>/dev/null | head -c 80 | tr '\n' ' ' | tr '"' "'" | tr '\\' '/')
+[ -z "$tool_snippet" ] && tool_snippet=""
+
 # Get session start snapshot
 if [ ! -f "$STATE" ]; then
   echo "${five_pct} ${now}" > "$STATE"
@@ -45,7 +57,7 @@ elapsed_min=$(echo "($now - $start_time) / 60" | bc 2>/dev/null || echo "1")
 burn_rate=$(echo "scale=2; $delta_pct / $elapsed_min" | bc 2>/dev/null || echo "0")
 
 # Log to per-session ledger + global ledger
-entry="{\"ts\":\"${now_iso}\",\"epoch\":${now},\"type\":\"tool_use\",\"session\":\"cc-${PPID}\",\"tool\":\"${tool}\",\"five_pct\":${five_pct},\"seven_pct\":${seven_pct},\"delta_from_start\":${delta_pct},\"burn_rate_per_min\":${burn_rate},\"directive\":\"${directive}\"}"
+entry="{\"ts\":\"${now_iso}\",\"epoch\":${now},\"type\":\"tool_use\",\"session\":\"cc-${PPID}\",\"tool\":\"${tool}\",\"tool_snippet\":\"${tool_snippet}\",\"five_pct\":${five_pct},\"seven_pct\":${seven_pct},\"delta_from_start\":${delta_pct},\"burn_rate_per_min\":${burn_rate},\"directive\":\"${directive}\"}"
 echo "$entry" >> "$LEDGER"
 echo "$entry" >> "$GLOBAL_LEDGER"
 
@@ -57,7 +69,6 @@ if [ -f "$BUDGET_FILE" ]; then
   hard_stop=$(jq -r '.hard_stop_at_pct' "$BUDGET_FILE" 2>/dev/null)
   burn_alert=$(jq -r '.burn_rate_alert_pct_per_min' "$BUDGET_FILE" 2>/dev/null)
 
-  # Check if session exceeded its budget
   over=$(echo "$delta_pct > $hard_stop" | bc 2>/dev/null)
   if [ "$over" = "1" ]; then
     cat <<BLOCK
@@ -66,7 +77,6 @@ BLOCK
     exit 0
   fi
 
-  # Warn on high burn rate
   hot=$(echo "$burn_rate > $burn_alert" | bc 2>/dev/null)
   if [ "$hot" = "1" ]; then
     echo "{\"decision\":\"warn\",\"reason\":\"HIGH BURN RATE: ${burn_rate}%/min. Session used ${delta_pct}% in ${elapsed_min}min. Budget: ${hard_stop}%\"}"

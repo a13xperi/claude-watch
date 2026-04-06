@@ -519,10 +519,11 @@ def _compute_tool_feed_rows(last_n=200):
             delta_str = "—"
             delta_style = "dim"
 
+        snippet = e.get("tool_snippet", "")
         rows.append({
             "ts_str": ts_str,
             "session": session,
-            "tool": tool,
+            "tool": f"{tool}: {snippet[:15]}" if snippet else tool,
             "directive": directive,
             "delta_str": delta_str,
             "delta_style": delta_style,
@@ -556,6 +557,56 @@ def _drain_status(drain_events):
 
 # ── Rich panel builders (used by Rich version + Textual Static widgets) ──────
 
+def _token_pacing():
+    """Predict time to 100% based on recent burn rates."""
+    entries = _load_ledger(last_n=200)
+    drains = [e for e in entries if e.get("type") == "tool_drain" and e.get("delta_5h", 0) > 0][-5:]
+    if not drains:
+        return None
+    
+    avg_burn = sum(d.get("burn_rate_per_min", 0) for d in drains) / len(drains)
+    if avg_burn <= 0:
+        return None
+    
+    five, _, five_reset_ts, _ = _current_pct()
+    try:
+        remaining = 100 - float(five)
+    except Exception:
+        return None
+    
+    if remaining <= 0:
+        return {"status": "at_limit", "mins_to_reset": 0, "avg_burn": avg_burn}
+    
+    mins_to_100 = remaining / avg_burn
+    
+    try:
+        reset = datetime.fromisoformat(five_reset_ts.replace("Z", "+00:00"))
+        mins_to_reset = max(0, (reset - datetime.now(timezone.utc)).total_seconds() / 60)
+    except Exception:
+        mins_to_reset = 0
+    
+    return {
+        "status": "pacing",
+        "mins_to_100": mins_to_100,
+        "mins_to_reset": mins_to_reset,
+        "avg_burn": avg_burn,
+        "remaining_pct": remaining,
+    }
+
+
+def _get_active_account():
+    """Return (label, name, lane) for active account."""
+    try:
+        d = json.loads((Path.home() / ".claude/accounts.json").read_text())
+        active = d.get("active", "?")
+        for acct in d.get("accounts", []):
+            if acct.get("label") == active:
+                return active, acct.get("name", "?"), acct.get("lane", "?")
+        return active, "?", "?"
+    except Exception:
+        return "?", "?", "?"
+
+
 def make_header(five, seven, five_reset_ts, seven_reset_ts):
     budget = _budget()
     def bar(pct, width=20):
@@ -578,10 +629,28 @@ def make_header(five, seven, five_reset_ts, seven_reset_ts):
         f"resets in [cyan]{_countdown(five_reset_ts)}[/cyan]",
         f"resets [cyan]{_reset_day(seven_reset_ts)}[/cyan]",
     )
+    label, name, lane = _get_active_account()
+    acct_color = "cyan" if label == "A" else ("magenta" if label == "B" else "yellow")
     t.add_row(
-        f"[dim]Budget: {budget}% per session[/dim]",
+        f"[{acct_color}]Account {label}[/{acct_color}]: {name} [dim]({lane})[/dim]",
         f"[dim]Updated: {datetime.now().strftime('%H:%M:%S')}[/dim]",
     )
+    # Token pacing prediction
+    pacing = _token_pacing()
+    if pacing:
+        if pacing["status"] == "at_limit":
+            pace_str = f"[red]AT LIMIT[/red] — reset in {_countdown(five_reset_ts)}"
+        else:
+            m100 = pacing["mins_to_100"]
+            mr = pacing["mins_to_reset"]
+            burn = pacing["avg_burn"]
+            if m100 < mr:
+                pace_str = f"[yellow]100% in ~{m100:.0f}m[/yellow] at {burn:.1f}%/min"
+            else:
+                headroom = mr - m100
+                pace_str = f"[green]~{pacing['remaining_pct']:.0f}% left[/green] at {burn:.1f}%/min — resets first"
+        t.add_row(pace_str, "")
+
     return Panel(t, title="[bold white]Token Monitor[/bold white]", border_style="bright_blue")
 
 
@@ -683,6 +752,7 @@ def make_active_calls_panel():
     t.add_column("Session", width=10, no_wrap=True)
     t.add_column("Tool", width=10, no_wrap=True)
     t.add_column("Ago", width=5, no_wrap=True)
+    t.add_column("5h%", width=5, no_wrap=True)
     t.add_column("Source", width=10, no_wrap=True)
     t.add_column("Directive", overflow="ellipsis", no_wrap=True, ratio=1)
 
@@ -724,16 +794,30 @@ def make_active_calls_panel():
 
             if i == 0:
                 src_color = "yellow" if source == "paperclip" else ("green" if source == "cli" else "dim")
+                # Show session's current 5h% from the latest call
+                call_pct = e.get("five_pct", "?")
+                delta = e.get("delta_from_start", 0)
+                snippet = e.get("tool_snippet", "")
+                tool_display = f"{tool}: {snippet[:18]}" if snippet else tool
+                try:
+                    d = float(delta)
+                    pct_color = "red" if d > 5 else ("yellow" if d > 2 else "green")
+                    pct_str = f"[{pct_color}]+{d:.0f}%[/{pct_color}]"
+                except Exception:
+                    pct_str = "[dim]?[/dim]"
                 t.add_row(
                     f"[cyan]{sid}[/cyan]",
-                    f"[bold green]{tool}[/bold green]" if secs < 45 else tool,
+                    f"[bold green]{tool_display}[/bold green]" if secs < 45 else tool_display,
                     f"[dim]{ago}[/dim]",
+                    pct_str,
                     f"[{src_color}]{source}[/{src_color}]",
                     f"{directive[:30]}",
                 )
             else:
+                snippet = e.get("tool_snippet", "")
+                tool_display = f"{tool}: {snippet[:18]}" if snippet else tool
                 t.add_row(
-                    "", f"[dim]{tool}[/dim]", f"[dim]{ago}[/dim]", "", "",
+                    "", f"[dim]{tool_display}[/dim]", f"[dim]{ago}[/dim]", "", "", "",
                 )
 
     return Panel(t, title="[bold]Active Calls[/bold]", border_style="bright_white")
