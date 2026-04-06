@@ -1103,7 +1103,7 @@ def make_active_calls_panel():
 
     if not sessions:
         t.add_row("", "[dim]—[/dim]", "", "", "", "[dim]no active sessions[/dim]")
-        return Panel(t, title="[bold]Active Calls[/bold]", border_style="bright_white")
+        return Panel(t, title="[bold]Last Tool Activity[/bold]", border_style="bright_white")
 
     now = datetime.now(timezone.utc)
     active_pids = {item[0] for item in sessions}
@@ -1166,7 +1166,7 @@ def make_active_calls_panel():
                     "", "", f"[dim]{tool_display}[/dim]", f"[dim]{ago}[/dim]", "", "", "",
                 )
 
-    return Panel(t, title="[bold]Active Calls[/bold]", border_style="bright_white")
+    return Panel(t, title="[bold]Last Tool Activity[/bold]", border_style="bright_white")
 
 
 def make_tool_stats():
