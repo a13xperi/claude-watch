@@ -32,13 +32,13 @@ console = Console()
 def make_session_history_panel():
     sessions = _get_session_history()
 
-    t = Table(show_header=True, header_style="bold blue", box=None, padding=(0, 1), expand=True)
-    t.add_column("Time", min_width=5, no_wrap=True)
-    t.add_column("Dur", min_width=5, no_wrap=True)
-    t.add_column("Model", min_width=6, no_wrap=True)
-    t.add_column("~5h%", min_width=6, no_wrap=True)
-    t.add_column("OutTok", min_width=7, no_wrap=True, justify="right")
-    t.add_column("Directive / last prompt", overflow="ellipsis", no_wrap=True)
+    t = Table(show_header=True, header_style="bold blue", box=None, padding=(0, 0), expand=True)
+    t.add_column("Time", width=13, no_wrap=True)
+    t.add_column("Src", width=10, no_wrap=True)
+    t.add_column("Mdl", width=7, no_wrap=True)
+    t.add_column("~5h%", width=7, no_wrap=True)
+    t.add_column("Out", width=6, no_wrap=True, justify="right")
+    t.add_column("Directive", overflow="ellipsis", no_wrap=True, ratio=1)
 
     if not sessions:
         msg = "[dim]building index...[/dim]" if _index_building else "[dim]no sessions found[/dim]"
@@ -79,8 +79,11 @@ def make_session_history_panel():
         directive = (s["directive"] or "—")[:32]
         mdl = _abbrev_model(s.get("model", ""))
         mdl_color = "magenta" if mdl == "opus" else ("cyan" if mdl == "sonnet" else "dim")
+        time_dur = f"[dim]{end_str} {s['dur_str']:>6}[/dim]"
+        src = s.get("source", "?")
+        src_color = "yellow" if src == "paperclip" else ("green" if src == "cli" else ("cyan" if "atlas" in src else "dim"))
         t.add_row(
-            f"[dim]{end_str}[/dim]", f"[dim]{s['dur_str']}[/dim]",
+            time_dur, f"[{src_color}]{src}[/{src_color}]",
             f"[{mdl_color}]{mdl}[/{mdl_color}]", f"[{pct_color}]{pct_str}[/{pct_color}]",
             f"[dim]{out_str}[/dim]", directive,
         )
@@ -100,9 +103,9 @@ def make_live_feed(last_n=18):
     # Fixed order: Time, Session, Tool, Directive, Δ5h%
     t.add_column("Time", min_width=8, no_wrap=True)
     t.add_column("Session", min_width=9, no_wrap=True)
+    t.add_column("Δ5h%", min_width=6, no_wrap=True)
     t.add_column("Tool", min_width=6, no_wrap=True)
     t.add_column("Directive", overflow="ellipsis", no_wrap=True, ratio=3)
-    t.add_column("Δ5h%", min_width=6, no_wrap=True)
 
     if not rows:
         t.add_row("[dim]—[/dim]", "", "", "[dim]no events yet[/dim]", "")
@@ -111,9 +114,9 @@ def make_live_feed(last_n=18):
             t.add_row(
                 f"[dim]{r['ts_str']}[/dim]",
                 f"[cyan]{r['session']}[/cyan]",
+                f"[{r['delta_style']}]{r['delta_str']}[/{r['delta_style']}]",
                 r["tool"],
                 f"[dim]{r['directive'][:30]}[/dim]",
-                f"[{r['delta_style']}]{r['delta_str']}[/{r['delta_style']}]",
             )
 
     return Panel(t, title="[bold]Tool Call Feed[/bold]  [dim](newest first)[/dim]", border_style="magenta")

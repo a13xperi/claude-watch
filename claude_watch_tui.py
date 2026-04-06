@@ -9,15 +9,16 @@ from datetime import datetime, timedelta, timezone
 from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import Horizontal, Vertical
+from textual.containers import Horizontal
 from textual.widgets import DataTable, Static
 
 from claude_watch_data import (
+    make_active_calls_panel,
+    make_urgent_panel,
     _abbrev_model,
     _build_or_update_index,
     _compute_tool_feed_rows,
     _current_pct,
-    _ensure_index,
     _get_session_history,
     _index_building,
     _load_index,
@@ -28,6 +29,17 @@ from claude_watch_data import (
 )
 
 # ── Static widgets (wrap existing Rich renderables) ──────────────────────────
+
+
+class UrgentAlerts(Static):
+    def update_content(self):
+        panel = make_urgent_panel()
+        if panel:
+            self.update(panel)
+            self.display = True
+        else:
+            self.update("")
+            self.display = False
 
 
 class TokenHeader(Static):
@@ -45,6 +57,11 @@ class ToolFrequency(Static):
         self.update(make_tool_stats())
 
 
+class ActiveCalls(Static):
+    def update_content(self):
+        self.update(make_active_calls_panel())
+
+
 class DrainPanel(Static):
     def update_content(self):
         self.update(make_drain_panel())
@@ -55,17 +72,23 @@ class DrainPanel(Static):
 
 class SessionHistoryTable(DataTable):
     BORDER_TITLE = "Session History"
-    BORDER_SUBTITLE = "Tab to focus, arrows to scroll"
+    BORDER_SUBTITLE = "Tab to focus · arrows to scroll"
 
     def on_mount(self):
         self.cursor_type = "row"
         self.zebra_stripes = True
-        self.add_columns("Time", "Dur", "Model", "~5h%", "OutTok", "Directive / last prompt")
+        # Merged Time+Dur, matching Rich version layout
+        self.add_column("Time    Dur", width=13)
+        self.add_column("Session", width=9)
+        self.add_column("Src", width=10)
+        self.add_column("Mdl", width=7)
+        self.add_column("~5h%", width=7)
+        self.add_column("Out", width=6)
+        self.add_column("Directive")
 
     def refresh_rows(self):
         sessions = _get_session_history()
 
-        # Preserve scroll position
         try:
             cur_row = self.cursor_row
         except Exception:
@@ -75,7 +98,7 @@ class SessionHistoryTable(DataTable):
 
         if not sessions:
             self.add_row(
-                "...", "", "", "", "",
+                "...", "", "", "", "", "",
                 Text("building index..." if _index_building else "no sessions", style="dim"),
             )
             return
@@ -95,10 +118,12 @@ class SessionHistoryTable(DataTable):
 
             if group != current_group:
                 sep = f"── {group} " + "─" * 30
-                self.add_row(Text(sep, style="dim"), "", "", "", "", "", key=f"sep-{group}")
+                self.add_row(Text(sep, style="dim"), "", "", "", "", "", "", key=f"sep-{group}")
                 current_group = group
 
             end_str = s["last_ts"].astimezone().strftime("%H:%M")
+            time_dur = f"{end_str} {s['dur_str']:>6}"
+
             mdl = _abbrev_model(s.get("model", ""))
             mdl_style = "magenta" if mdl == "opus" else ("cyan" if mdl == "sonnet" else "dim")
 
@@ -115,19 +140,22 @@ class SessionHistoryTable(DataTable):
             out_k = s["output_tokens"]
             out_str = f"{out_k/1000:.1f}k" if out_k >= 1000 else str(out_k)
 
-            directive = (s["directive"] or "—")[:50]
+            directive = (s["directive"] or "—")[:60]
 
+            src = s.get("source", "?")
+            src_style = "yellow" if src == "paperclip" else ("green" if src == "cli" else ("cyan" if "atlas" in src else "dim"))
+            short_id = s["session_id"][:8]
             self.add_row(
-                Text(end_str, style="dim"),
-                Text(s["dur_str"], style="dim"),
+                Text(time_dur, style="dim"),
+                Text(short_id, style="dim"),
+                Text(src, style=src_style),
                 Text(mdl, style=mdl_style),
                 Text(pct, style=pct_style),
-                Text(out_str, style="dim"),
+                Text(out_str, style="dim", justify="right"),
                 directive,
                 key=s["session_id"],
             )
 
-        # Restore scroll position
         try:
             if cur_row < self.row_count:
                 self.move_cursor(row=cur_row)
@@ -136,14 +164,17 @@ class SessionHistoryTable(DataTable):
 
 
 class ToolCallFeed(DataTable):
-    BORDER_TITLE = "Tool Call Feed"
-    BORDER_SUBTITLE = "newest first"
+    BORDER_TITLE = "Tool Call Feed (newest first)"
 
     def on_mount(self):
         self.cursor_type = "row"
         self.zebra_stripes = True
-        # Fixed column order: Time, Session, Tool, Directive, Δ5h%
-        self.add_columns("Time", "Session", "Tool", "Directive", "Δ5h%")
+        self.add_column("Time", width=9)
+        self.add_column("Session", width=9)
+        self.add_column("Δ5h%", width=5)
+        self.add_column("Tool", width=8)
+        self.add_column("Src", width=10)
+        self.add_column("Directive")
 
     def refresh_rows(self):
         rows = _compute_tool_feed_rows(last_n=200)
@@ -156,16 +187,25 @@ class ToolCallFeed(DataTable):
         self.clear()
 
         if not rows:
-            self.add_row("...", "", "", Text("no events yet", style="dim"), "")
+            self.add_row("...", "", "", "", "", "", Text("no events yet", style="dim"))
             return
 
         for r in rows:
+            # Derive source from directive heuristic
+            d = r["directive"].lower()
+            if "morning" in d or "brief" in d or "monitor" in d or "health" in d:
+                src, sc = "paperclip", "yellow"
+            elif "unnamed" in d:
+                src, sc = "?", "dim"
+            else:
+                src, sc = "cli", "green"
             self.add_row(
                 Text(r["ts_str"], style="dim"),
                 Text(r["session"], style="cyan"),
-                r["tool"],
-                Text(r["directive"][:30], style="dim"),
                 Text(r["delta_str"], style=r["delta_style"]),
+                r["tool"],
+                Text(src, style=sc),
+                Text(r["directive"][:30], style="dim"),
             )
 
         try:
@@ -191,7 +231,9 @@ class ClaudeWatchApp(App):
 
     def compose(self) -> ComposeResult:
         yield TokenHeader(id="header")
+        yield UrgentAlerts(id="urgent")
         yield ActiveSessions(id="active-sessions")
+        yield ActiveCalls(id="active-calls")
         yield SessionHistoryTable(id="session-history")
         with Horizontal(id="feed-row"):
             yield ToolCallFeed(id="tool-feed")
@@ -202,7 +244,6 @@ class ClaudeWatchApp(App):
         _load_index()
         self.build_index()
         self.set_interval(1.0, self.refresh_data)
-        # Initial populate
         self.refresh_data()
 
     def build_index(self):
@@ -213,7 +254,9 @@ class ClaudeWatchApp(App):
     def refresh_data(self):
         five, seven, fr, sr = _current_pct()
         self.query_one("#header", TokenHeader).update_content(five, seven, fr, sr)
+        self.query_one("#urgent", UrgentAlerts).update_content()
         self.query_one("#active-sessions", ActiveSessions).update_content()
+        self.query_one("#active-calls", ActiveCalls).update_content()
         self.query_one("#session-history", SessionHistoryTable).refresh_rows()
         self.query_one("#tool-feed", ToolCallFeed).refresh_rows()
         self.query_one("#tool-freq", ToolFrequency).update_content()

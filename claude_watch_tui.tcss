@@ -3,9 +3,22 @@ Screen {
     overflow: hidden;
 }
 
+/* ── Urgent ── */
+#urgent {
+    height: auto;
+    max-height: 3;
+}
+
+/* ── Header ── */
 #header {
     height: auto;
     max-height: 5;
+}
+
+/* ── Active Sessions ── */
+#active-calls {
+    height: auto;
+    max-height: 10;
 }
 
 #active-sessions {
@@ -13,36 +26,56 @@ Screen {
     max-height: 8;
 }
 
+/* ── Session History (scrollable DataTable) ── */
 #session-history {
     height: 1fr;
     min-height: 6;
+    border: solid dodgerblue;
+    border-title-color: white;
+    border-title-style: bold;
 }
 
 #session-history:focus {
     border: tall $accent;
 }
 
+/* ── Feed row ── */
 #feed-row {
     layout: horizontal;
     height: 1fr;
     min-height: 6;
 }
 
+/* ── Tool Call Feed (scrollable DataTable) ── */
 #tool-feed {
     width: 3fr;
+    border: solid magenta;
+    border-title-color: white;
+    border-title-style: bold;
 }
 
 #tool-feed:focus {
     border: tall $accent;
 }
 
+/* ── Tool Frequency ── */
 #tool-freq {
     width: 1fr;
     height: auto;
     max-height: 20;
 }
 
+/* ── Passive Drain ── */
 #drain {
     height: auto;
     max-height: 12;
+}
+
+/* ── DataTable styling ── */
+DataTable {
+    scrollbar-size: 1 1;
+}
+
+DataTable > .datatable--header {
+    text-style: bold;
 }

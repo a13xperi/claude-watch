@@ -20,6 +20,7 @@ from rich.table import Table
 LEDGER = Path.home() / ".claude/logs/token-ledger.jsonl"
 BUDGET_FILE = Path.home() / ".claude/token-budget.json"
 TRANSCRIPTS_DIR = Path.home() / ".claude/projects/-Users-a13xperi"
+ALL_PROJECT_DIRS = Path.home() / ".claude/projects"
 SESSION_INDEX = Path.home() / ".claude/logs/session-index.jsonl"
 
 # ── helpers ──────────────────────────────────────────────────────────────────
@@ -132,7 +133,8 @@ def _active_sessions():
                         delta = f"+{raw_delta}%"
                 except Exception:
                     pass
-                sessions.append((pid, etime, directive or "—", delta))
+                source = _detect_source(pid)
+                sessions.append((pid, etime, directive or "—", delta, source))
     except Exception:
         pass
     return sessions
@@ -157,6 +159,36 @@ def _session_last_activity(session_id):
             except Exception:
                 pass
     return None, None
+
+
+def _detect_source(pid):
+    """Detect where a Claude session was launched from via parent process."""
+    try:
+        r = subprocess.run(
+            ['ps', '-p', pid, '-o', 'ppid='],
+            capture_output=True, text=True, timeout=2,
+        )
+        ppid = r.stdout.strip()
+        if not ppid:
+            return '?'
+        r2 = subprocess.run(
+            ['ps', '-p', ppid, '-o', 'command='],
+            capture_output=True, text=True, timeout=2,
+        )
+        parent_cmd = r2.stdout.strip().lower()
+        if 'paperclip' in parent_cmd:
+            return 'paperclip'
+        if 'atlas' in parent_cmd:
+            return 'atlas'
+        if 'electron' in parent_cmd or 'claude desktop' in parent_cmd:
+            return 'desktop'
+        if 'cron' in parent_cmd or 'launchd' in parent_cmd:
+            return 'scheduled'
+        if any(sh in parent_cmd for sh in ('zsh', 'bash', 'fish', 'sh ')):
+            return 'cli'
+        return 'cli'
+    except Exception:
+        return '?'
 
 
 # ── ledger ───────────────────────────────────────────────────────────────────
@@ -284,6 +316,23 @@ def _parse_transcript(f):
         return None
     directive = (last_prompt[:40] if last_prompt else None) or slug or f.stem[:8]
     dominant_model = max(model_counts, key=model_counts.get) if model_counts else ""
+    # Derive source from project directory name
+    parent = f.parent.name
+    if "paperclip" in parent:
+        source = "paperclip"
+    elif "atlas-backend" in parent:
+        source = "atlas-be"
+    elif "atlas-portal" in parent:
+        source = "atlas-fe"
+    elif "openclaw" in parent:
+        source = "openclaw"
+    elif "frank-pilot" in parent:
+        source = "frank"
+    elif parent == "-Users-a13xperi":
+        source = "cli"
+    else:
+        source = "agent"
+
     return {
         "session_id": f.stem,
         "first_ts": first_ts.isoformat(),
@@ -292,6 +341,7 @@ def _parse_transcript(f):
         "slug": slug or "",
         "directive": directive,
         "model": dominant_model,
+        "source": source,
         "file_mtime": f.stat().st_mtime,
     }
 
@@ -304,15 +354,18 @@ def _build_or_update_index():
     try:
         known = dict(_index_cache)
         new_entries = []
-        for f in TRANSCRIPTS_DIR.glob("*.jsonl"):
-            sid = f.stem
-            existing = known.get(sid)
-            if existing and f.stat().st_mtime <= existing.get("file_mtime", 0):
+        for proj_dir in ALL_PROJECT_DIRS.iterdir():
+            if not proj_dir.is_dir():
                 continue
-            result = _parse_transcript(f)
-            if result:
-                new_entries.append(result)
-                known[sid] = result
+            for f in proj_dir.glob("*.jsonl"):
+                sid = f.stem
+                existing = known.get(sid)
+                if existing and f.stat().st_mtime <= existing.get("file_mtime", 0):
+                    continue
+                result = _parse_transcript(f)
+                if result:
+                    new_entries.append(result)
+                    known[sid] = result
         if new_entries:
             with open(SESSION_INDEX, "a") as fh:
                 for entry in new_entries:
@@ -335,12 +388,10 @@ def _ensure_index():
 
 def _get_session_history():
     _ensure_index()
+    # Don't exclude any sessions — show everything in history.
+    # The current session appears in both Active Sessions and Session History.
+    # This is better than sessions mysteriously disappearing.
     current_session_id = None
-    try:
-        d = json.loads(Path("/tmp/statusline-debug.json").read_text())
-        current_session_id = d.get("session_id", "")
-    except Exception:
-        pass
 
     today = datetime.now(timezone.utc).astimezone().date()
     sessions = []
@@ -356,9 +407,12 @@ def _get_session_history():
 
         session_date = last_ts.astimezone().date()
         secs = int((last_ts - first_ts).total_seconds())
-        h, r = divmod(secs, 3600)
-        m = r // 60
-        dur_str = f"{h}h{m:02d}m" if h else f"{m}m"
+        if secs > 86400:  # >24h — multi-day transcript, duration meaningless
+            dur_str = "—"
+        else:
+            h, r = divmod(secs, 3600)
+            m = r // 60
+            dur_str = f"{h}h{m:02d}m" if h else f"{m}m"
 
         pct_str = "—"
         if session_date == today:
@@ -381,10 +435,11 @@ def _get_session_history():
             "directive": entry.get("directive", "—"),
             "slug": entry.get("slug", ""),
             "model": entry.get("model", ""),
+            "source": entry.get("source", "?"),
             "date": session_date,
         })
 
-    sessions.sort(key=lambda s: s["last_ts"], reverse=True)
+    sessions.sort(key=lambda s: (s["last_ts"], s["session_id"]), reverse=True)
     return sessions
 
 
@@ -511,14 +566,64 @@ def make_header(five, seven, five_reset_ts, seven_reset_ts):
     t.add_column(justify="left")
     t.add_column(justify="left")
     t.add_row(
-        f"[bold]5h window[/bold]   {bar(five)}   resets in [cyan]{_countdown(five_reset_ts)}[/cyan]",
-        f"[bold]7d window[/bold]   {bar(seven)}   resets [cyan]{_reset_day(seven_reset_ts)}[/cyan]",
+        f"[bold]5h window[/bold]   {bar(five)}",
+        f"[bold]7d window[/bold]   {bar(seven)}",
+    )
+    t.add_row(
+        f"resets in [cyan]{_countdown(five_reset_ts)}[/cyan]",
+        f"resets [cyan]{_reset_day(seven_reset_ts)}[/cyan]",
     )
     t.add_row(
         f"[dim]Budget: {budget}% per session[/dim]",
         f"[dim]Updated: {datetime.now().strftime('%H:%M:%S')}[/dim]",
     )
     return Panel(t, title="[bold white]Token Monitor[/bold white]", border_style="bright_blue")
+
+
+def make_urgent_panel():
+    """Return urgent alerts panel, or None if nothing urgent."""
+    five, seven, five_reset_ts, seven_reset_ts = _current_pct()
+    
+    alerts = []
+    
+    # Check 5h window — unallocated tokens expiring soon
+    try:
+        reset = datetime.fromisoformat(five_reset_ts.replace("Z", "+00:00"))
+        mins_left = int((reset - datetime.now(timezone.utc)).total_seconds() / 60)
+        pct_used = float(five)
+        pct_remaining = 100 - pct_used
+        
+        if mins_left <= 30 and pct_remaining >= 1:
+            if mins_left <= 5:
+                urgency = "[bold red blink]CRITICAL[/bold red blink]"
+                color = "red"
+            elif mins_left <= 10:
+                urgency = "[bold red]URGENT[/bold red]"
+                color = "red"
+            elif mins_left <= 15:
+                urgency = "[bold yellow]WARNING[/bold yellow]"
+                color = "yellow"
+            else:
+                urgency = "[yellow]HEADS UP[/yellow]"
+                color = "yellow"
+            
+            alerts.append(
+                f"  {urgency} — [bold]{pct_remaining:.0f}% tokens unused[/bold], "
+                f"resets in [{color}]{mins_left}m[/{color}]. Use them or lose them."
+            )
+    except Exception:
+        pass
+    
+    if not alerts:
+        return None
+    
+    from rich.text import Text
+    t = Table(box=None, padding=(0, 0), expand=True, show_header=False)
+    t.add_column(ratio=1)
+    for alert in alerts:
+        t.add_row(alert)
+    
+    return Panel(t, title="[bold red]⚠ URGENT[/bold red]", border_style="red")
 
 
 def make_sessions_panel():
@@ -528,11 +633,14 @@ def make_sessions_panel():
     t.add_column("Age", min_width=6, no_wrap=True)
     t.add_column("Used", min_width=6, no_wrap=True)
     t.add_column("Status", min_width=14, no_wrap=True, overflow="ellipsis")
+    t.add_column("Source", width=10, no_wrap=True)
     t.add_column("Directive", overflow="ellipsis", no_wrap=True)
     if not sessions:
-        t.add_row("[dim]—[/dim]", "", "", "", "[dim]no active sessions[/dim]")
+        t.add_row("[dim]—[/dim]", "", "", "", "", "[dim]no active sessions[/dim]")
     else:
-        for pid, age, directive, delta in sessions:
+        for item in sessions:
+            pid, age, directive, delta = item[0], item[1], item[2], item[3]
+            source = item[4] if len(item) > 4 else "?"
             color = "green"
             if delta == "new":
                 color = "dim"
@@ -552,11 +660,78 @@ def make_sessions_panel():
                 status = f"[dim]↺ {last_tool[:8]} {ago}[/dim]"
             else:
                 status = "[dim]● idle[/dim]"
+            src_color = "yellow" if source == "paperclip" else ("green" if source == "cli" else "dim")
             t.add_row(
                 f"[cyan]{pid}[/cyan]", f"[dim]{age}[/dim]",
-                f"[{color}]{delta}[/{color}]", status, directive,
+                f"[{color}]{delta}[/{color}]", status,
+                f"[{src_color}]{source}[/{src_color}]", directive,
             )
     return Panel(t, title="[bold]Active Sessions[/bold]", border_style="cyan")
+
+
+def make_active_calls_panel():
+    """Show the most recent tool calls for each active session."""
+    sessions = _active_sessions()
+    entries = _load_ledger(last_n=200)
+
+    t = Table(show_header=True, header_style="bold white", box=None, padding=(0, 1), expand=True)
+    t.add_column("Session", width=10, no_wrap=True)
+    t.add_column("Tool", width=10, no_wrap=True)
+    t.add_column("Ago", width=5, no_wrap=True)
+    t.add_column("Source", width=10, no_wrap=True)
+    t.add_column("Directive", overflow="ellipsis", no_wrap=True, ratio=1)
+
+    if not sessions:
+        t.add_row("[dim]—[/dim]", "", "", "", "[dim]no active sessions[/dim]")
+        return Panel(t, title="[bold]Active Calls[/bold]", border_style="bright_white")
+
+    now = datetime.now(timezone.utc)
+    active_pids = {item[0] for item in sessions}
+
+    for item in sessions:
+        pid = item[0]
+        directive = item[2]
+        source = item[4] if len(item) > 4 else "?"
+        sid = f"cc-{pid}"
+
+        # Get last 3 tool calls for this session
+        session_calls = [
+            e for e in reversed(entries)
+            if e.get("session") == sid and e.get("type") == "tool_use"
+        ][:3]
+
+        if not session_calls:
+            src_color = "yellow" if source == "paperclip" else ("green" if source == "cli" else "dim")
+            t.add_row(
+                f"[cyan]{sid}[/cyan]", "[dim]—[/dim]", "", f"[{src_color}]{source}[/{src_color}]",
+                f"[dim]{directive[:30]}[/dim]",
+            )
+            continue
+
+        for i, e in enumerate(session_calls):
+            tool = _shorten_tool(e.get("tool", "?"))
+            try:
+                ts = datetime.fromisoformat(e["ts"].replace("Z", "+00:00"))
+                secs = int((now - ts).total_seconds())
+                ago = f"{secs}s" if secs < 60 else f"{secs//60}m"
+            except Exception:
+                ago = "?"
+
+            if i == 0:
+                src_color = "yellow" if source == "paperclip" else ("green" if source == "cli" else "dim")
+                t.add_row(
+                    f"[cyan]{sid}[/cyan]",
+                    f"[bold green]{tool}[/bold green]" if secs < 45 else tool,
+                    f"[dim]{ago}[/dim]",
+                    f"[{src_color}]{source}[/{src_color}]",
+                    f"{directive[:30]}",
+                )
+            else:
+                t.add_row(
+                    "", f"[dim]{tool}[/dim]", f"[dim]{ago}[/dim]", "", "",
+                )
+
+    return Panel(t, title="[bold]Active Calls[/bold]", border_style="bright_white")
 
 
 def make_tool_stats():
