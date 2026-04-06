@@ -81,11 +81,37 @@ Screen {
     max-height: 10;
 }
 
+/* ── Burndown chart ── */
+#burndown {
+    height: auto;
+    max-height: 8;
+}
+
+/* ── Search input ── */
+#search-input {
+    height: auto;
+    max-height: 3;
+    margin: 0 1;
+    border: solid cyan;
+}
+
+/* ── System Health ── */
+#system-health {
+    height: auto;
+    max-height: 12;
+}
+
 /* ── Drill-down screen ── */
 #drilldown-header {
     height: auto;
     max-height: 2;
     padding: 0 1;
+}
+
+#accomplishments-view {
+    height: 1fr;
+    padding: 1 2;
+    overflow-y: auto;
 }
 
 #drilldown-table {

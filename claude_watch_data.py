@@ -284,6 +284,421 @@ def _interpolate_five_pct(target_ts):
     return best
 
 
+# ── accomplishments & gravity center ────────────────────────────────────────
+
+_HOME = str(Path.home())
+_PROJECTS = str(Path.home() / "projects")
+
+_GIT_COMMIT_RE = re.compile(r'git\s+commit\s[^|;]*?-m\s+"([^"\n$]+)"')
+# Match heredoc-style commit: git commit -m "$(cat <<'EOF'\nMessage here\n..."
+_GIT_COMMIT_HEREDOC_RE = re.compile(
+    r"git\s+commit\s.*?-m\s+\"\$\(cat\s+<<'?EOF'?\n\s*(.+?)(?:\n|\\n)", re.DOTALL
+)
+_GIT_PUSH_RE = re.compile(r'git\s+push\s+\S+\s+(\S+)')
+_NOISE_PATHS = {"/tmp/", ".claude/plans/", "session-index.jsonl", ".claude/directives/",
+                "statusline-debug.json", "claude-directive-", "claude-token-state-"}
+
+
+def _short_path(p):
+    # type: (str) -> str
+    """Shorten a file path for display."""
+    if not p:
+        return ""
+    if p.startswith(_PROJECTS + "/"):
+        return p[len(_PROJECTS) + 1:]
+    if p.startswith(_HOME + "/"):
+        return "~/" + p[len(_HOME) + 1:]
+    return p
+
+
+def _is_noise_path(p):
+    # type: (str) -> bool
+    for noise in _NOISE_PATHS:
+        if noise in p:
+            return True
+    return False
+
+
+def _classify_bash(cmd):
+    # type: (str) -> Optional[str]
+    """Classify a bash command as notable or None."""
+    if not cmd:
+        return None
+    cl = cmd.lower().strip()
+    if cl.startswith("echo ") or cl.startswith("cat /tmp/") or cl.startswith("ls "):
+        return None
+    for kw in ("deploy", "vercel ", "railway ", "npm run build", "npm run test",
+               "pytest", "jest ", "npx ", "docker ", "make "):
+        if kw in cl:
+            return cmd.strip()[:80]
+    return None
+
+
+def _parse_mcp_tool(name):
+    # type: (str) -> Optional[str]
+    """Parse mcp tool name to 'server:action'."""
+    if not name.startswith("mcp__"):
+        return None
+    rest = name[5:]
+    if rest.startswith("claude_ai_"):
+        rest = rest[10:]
+    parts = rest.split("__", 1)
+    if len(parts) == 2:
+        return f"{parts[0]}:{parts[1]}"
+    return rest
+
+
+def _extract_accomplishments_from_file(f):
+    # type: (Path) -> Dict[str, Any]
+    """Parse a transcript file and extract accomplishments."""
+    acc = {
+        "files_edited": [],
+        "files_created": [],
+        "git_commits": [],
+        "git_pushes": [],
+        "skills": [],
+        "mcp_ops": [],
+        "bash_notable": [],
+        "user_prompts": [],
+        "errors": 0,
+        "turn_count": 0,
+    }  # type: Dict[str, Any]
+
+    seen_files = set()  # type: set
+    seen_skills = set()  # type: set
+    seen_mcp = set()  # type: set
+    prompt_count = 0
+
+    try:
+        with open(f) as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except Exception:
+                    continue
+
+                t = obj.get("type", "")
+
+                # Collect user prompts
+                if t == "human":
+                    msg = obj.get("message", {})
+                    if isinstance(msg, dict):
+                        content = msg.get("content", "")
+                        prompt_text = ""
+                        if isinstance(content, str):
+                            prompt_text = content.strip()
+                        elif isinstance(content, list):
+                            for c in content:
+                                if isinstance(c, dict) and c.get("type") == "text":
+                                    prompt_text = c.get("text", "").strip()
+                                    break
+                        if prompt_text and prompt_count < 5:
+                            # Skip system reminders
+                            if not prompt_text.startswith("<system-reminder>"):
+                                acc["user_prompts"].append(prompt_text[:80])
+                                prompt_count += 1
+
+                elif t == "assistant":
+                    acc["turn_count"] += 1
+                    msg = obj.get("message", {})
+                    content = msg.get("content", [])
+                    if not isinstance(content, list):
+                        continue
+
+                    for block in content:
+                        if not isinstance(block, dict) or block.get("type") != "tool_use":
+                            continue
+
+                        name = block.get("name", "")
+                        inp = block.get("input", {})
+                        if not isinstance(inp, dict):
+                            continue
+
+                        # File edits
+                        if name == "Edit":
+                            fp = inp.get("file_path", "")
+                            if fp and not _is_noise_path(fp) and fp not in seen_files:
+                                seen_files.add(fp)
+                                acc["files_edited"].append(_short_path(fp))
+
+                        # File creates
+                        elif name == "Write":
+                            fp = inp.get("file_path", "")
+                            if fp and not _is_noise_path(fp) and fp not in seen_files:
+                                seen_files.add(fp)
+                                acc["files_created"].append(_short_path(fp))
+
+                        # Bash commands
+                        elif name == "Bash":
+                            cmd = inp.get("command", "")
+                            # Git commits
+                            m = _GIT_COMMIT_RE.search(cmd)
+                            if not m:
+                                m = _GIT_COMMIT_HEREDOC_RE.search(cmd)
+                            if m:
+                                msg = m.group(1).strip()
+                                if msg and not msg.startswith("$"):
+                                    acc["git_commits"].append(msg[:80])
+                            # Git pushes
+                            m2 = _GIT_PUSH_RE.search(cmd)
+                            if m2:
+                                acc["git_pushes"].append(m2.group(1))
+                            # Notable commands
+                            notable = _classify_bash(cmd)
+                            if notable and len(acc["bash_notable"]) < 10:
+                                acc["bash_notable"].append(notable)
+
+                        # Skills
+                        elif name == "Skill":
+                            skill = inp.get("skill", "")
+                            if skill and skill not in seen_skills:
+                                seen_skills.add(skill)
+                                acc["skills"].append(skill)
+
+                        # Agent subagents
+                        elif name == "Agent":
+                            desc = inp.get("description", "")
+                            if desc and len(acc["bash_notable"]) < 10:
+                                acc["bash_notable"].append(f"agent: {desc}")
+
+                        # MCP operations
+                        elif name.startswith("mcp__"):
+                            parsed = _parse_mcp_tool(name)
+                            if parsed and parsed not in seen_mcp:
+                                seen_mcp.add(parsed)
+                                acc["mcp_ops"].append(parsed)
+
+                # Check for errors in tool results
+                elif t == "user":
+                    msg = obj.get("message", {})
+                    if isinstance(msg, dict):
+                        content = msg.get("content", [])
+                        if isinstance(content, list):
+                            for c in content:
+                                if isinstance(c, dict) and c.get("is_error"):
+                                    acc["errors"] += 1
+
+    except Exception:
+        pass
+
+    return acc
+
+
+def _extract_accomplishments(session_id):
+    # type: (str) -> Dict[str, Any]
+    """Extract accomplishments for a session by ID."""
+    # Check cached index first
+    entry = _index_cache.get(session_id, {})
+    cached = entry.get("accomplishments")
+    if cached:
+        return cached
+    # Parse from transcript
+    f = _find_transcript(session_id)
+    if not f:
+        return {}
+    return _extract_accomplishments_from_file(f)
+
+
+def _gravity_center(accomplishments, fallback=""):
+    # type: (Dict[str, Any], str) -> str
+    """Synthesize a short label from accomplishments."""
+    if not accomplishments:
+        return fallback
+
+    # 1. Git commits — use first commit message
+    commits = accomplishments.get("git_commits", [])
+    if commits:
+        msg = commits[0]
+        if len(commits) > 1:
+            return f"{msg[:50]} (+{len(commits)-1} commits)"
+        return msg[:60]
+
+    # 2. Files edited — group by top-level dir
+    edited = accomplishments.get("files_edited", [])
+    created = accomplishments.get("files_created", [])
+    all_files = edited + created
+    if all_files:
+        # Find most common project prefix
+        dirs = []  # type: List[str]
+        for fp in all_files:
+            parts = fp.split("/")
+            if len(parts) >= 2:
+                dirs.append(parts[0])
+            else:
+                dirs.append(fp)
+        if dirs:
+            top_dir = max(set(dirs), key=dirs.count)
+            n = len(all_files)
+            if n == 1:
+                return f"edit {all_files[0][:55]}"
+            return f"edit {n} files in {top_dir}"[:60]
+
+    # 3. Skills used
+    skills = accomplishments.get("skills", [])
+    if skills:
+        return " + ".join(skills[:3])[:60]
+
+    # 4. MCP operations
+    mcp = accomplishments.get("mcp_ops", [])
+    if mcp:
+        # Group by server
+        servers = defaultdict(int)
+        for op in mcp:
+            srv = op.split(":")[0] if ":" in op else op
+            servers[srv] += 1
+        parts = [f"{c} {s}" for s, c in sorted(servers.items(), key=lambda x: x[1], reverse=True)[:3]]
+        return ", ".join(parts)[:60]
+
+    # 5. Only exploration
+    prompts = accomplishments.get("user_prompts", [])
+    turns = accomplishments.get("turn_count", 0)
+    if turns > 0:
+        if prompts:
+            return prompts[0][:60]
+        return f"session ({turns} turns)"
+
+    return fallback
+
+
+def _derive_project(source, project_dir, accomplishments=None):
+    # type: (str, str, Optional[Dict[str, Any]]) -> str
+    """Derive human-readable project name."""
+    # Known source → project mappings
+    if source in ("atlas-be", "atlas-fe"):
+        return "atlas"
+    if source == "openclaw":
+        return "openclaw"
+    if source == "frank":
+        return "frank"
+    if "/" in source:
+        # Paperclip agent: SAGE/DevOp → SAGE, KAA/scheduler → KAA
+        return source.split("/")[0].lower()
+    if source == "paperclip":
+        return "paperclip"
+
+    # For cli sessions, infer from project_dir or files touched
+    dir_name = Path(project_dir).name if project_dir else ""
+
+    # Check project_dir for known patterns
+    for name in ("atlas-backend", "atlas-portal", "atlas"):
+        if name in dir_name:
+            return "atlas"
+    for name in ("openclaw", "frank-pilot", "paperclip", "claude-watch"):
+        if name in dir_name:
+            return name
+
+    # Check files in accomplishments
+    if accomplishments:
+        all_files = accomplishments.get("files_edited", []) + accomplishments.get("files_created", [])
+        for fp in all_files:
+            fp_lower = fp.lower()
+            for proj in ("claude-watch", "atlas-portal", "atlas-backend", "openclaw",
+                         "frank-pilot", "paperclip", "adinkra"):
+                if proj in fp_lower:
+                    if "atlas" in proj:
+                        return "atlas"
+                    return proj
+
+    # Home directory / general CLI
+    if dir_name == "-Users-a13xperi" or source == "cli":
+        return "home"
+
+    return dir_name[:12] if dir_name else "?"
+
+
+def _resolve_ccid_for_session(session_id, first_ts, last_ts):
+    # type: (str, datetime, datetime) -> Optional[str]
+    """Resolve CCID (cc-PID) for a session via timestamp overlap with ledger entries."""
+    entries = _load_ledger(last_n=10000)
+
+    # Build per-PID time ranges
+    pid_ranges = {}  # type: Dict[str, Tuple[datetime, datetime]]
+    for e in entries:
+        sid = e.get("session", "")
+        if not sid.startswith("cc-"):
+            continue
+        try:
+            ts = datetime.fromisoformat(e["ts"].replace("Z", "+00:00"))
+        except Exception:
+            continue
+        if sid not in pid_ranges:
+            pid_ranges[sid] = (ts, ts)
+        else:
+            f, l = pid_ranges[sid]
+            if ts < f:
+                f = ts
+            if ts > l:
+                l = ts
+            pid_ranges[sid] = (f, l)
+
+    # Find best overlap
+    if first_ts.tzinfo is None:
+        first_ts = first_ts.replace(tzinfo=timezone.utc)
+    if last_ts.tzinfo is None:
+        last_ts = last_ts.replace(tzinfo=timezone.utc)
+
+    best_pid = None
+    best_overlap = 0.0
+    for pid_sid, (p_first, p_last) in pid_ranges.items():
+        overlap_start = max(first_ts, p_first)
+        overlap_end = min(last_ts, p_last)
+        overlap = max(0.0, (overlap_end - overlap_start).total_seconds())
+        if overlap > best_overlap:
+            best_overlap = overlap
+            best_pid = pid_sid
+    if best_pid and best_overlap > 5:
+        return best_pid
+    return None
+
+
+# ── CCID lookup ─────────────────────────────────────────────────────────────
+
+_ccid_to_uuid = {}  # type: Dict[str, str]
+
+
+def _rebuild_ccid_index():
+    """Rebuild reverse CCID → UUID lookup from index cache."""
+    global _ccid_to_uuid
+    result = {}
+    for uuid, entry in _index_cache.items():
+        ccid = entry.get("ccid")
+        if ccid:
+            result[ccid] = uuid
+    _ccid_to_uuid = result
+
+
+def lookup_by_ccid(user_input):
+    # type: (str) -> Optional[Dict]
+    """Look up session by CCID number, cc-PID, or UUID prefix."""
+    _ensure_index()
+    s = user_input.strip()
+
+    # Try as CCID number: "72887" → "cc-72887"
+    if s.isdigit():
+        s = f"cc-{s}"
+
+    # Try as cc-PID
+    if s.startswith("cc-"):
+        uuid = _ccid_to_uuid.get(s)
+        if uuid:
+            return _index_cache.get(uuid)
+        # Fallback: scan index
+        for uid, entry in _index_cache.items():
+            if entry.get("ccid") == s:
+                return entry
+        return None
+
+    # Try as UUID prefix
+    for uid, entry in _index_cache.items():
+        if uid.startswith(s):
+            return entry
+
+    return None
+
+
 # ── session index ────────────────────────────────────────────────────────────
 
 _index_cache = {}
@@ -313,6 +728,7 @@ def _load_index():
             pass
     _index_cache = cache
     _index_loaded = True
+    _rebuild_ccid_index()
     return cache
 
 
@@ -321,6 +737,18 @@ def _parse_transcript(f):
     first_ts = last_ts = None
     slug = last_prompt = None
     model_counts = defaultdict(int)
+
+    # Accomplishments tracking (inline with existing loop)
+    acc = {
+        "files_edited": [], "files_created": [], "git_commits": [],
+        "git_pushes": [], "skills": [], "mcp_ops": [],
+        "bash_notable": [], "user_prompts": [], "errors": 0, "turn_count": 0,
+    }  # type: Dict[str, Any]
+    seen_files = set()  # type: set
+    seen_skills = set()  # type: set
+    seen_mcp = set()  # type: set
+    prompt_count = 0
+
     try:
         with open(f) as fh:
             for line in fh:
@@ -341,6 +769,7 @@ def _parse_transcript(f):
                         last_ts = ts
                     except Exception:
                         pass
+
                 if t == "assistant":
                     msg = obj.get("message", {})
                     usage = msg.get("usage", {})
@@ -349,14 +778,94 @@ def _parse_transcript(f):
                     mdl = msg.get("model", "")
                     if mdl and not mdl.startswith("<"):
                         model_counts[mdl] += out
-                if t == "system" and not slug:
+
+                    # Extract tool_use blocks for accomplishments
+                    acc["turn_count"] += 1
+                    content = msg.get("content", [])
+                    if isinstance(content, list):
+                        for block in content:
+                            if not isinstance(block, dict) or block.get("type") != "tool_use":
+                                continue
+                            name = block.get("name", "")
+                            inp = block.get("input", {})
+                            if not isinstance(inp, dict):
+                                continue
+
+                            if name == "Edit":
+                                fp = inp.get("file_path", "")
+                                if fp and not _is_noise_path(fp) and fp not in seen_files:
+                                    seen_files.add(fp)
+                                    acc["files_edited"].append(_short_path(fp))
+                            elif name == "Write":
+                                fp = inp.get("file_path", "")
+                                if fp and not _is_noise_path(fp) and fp not in seen_files:
+                                    seen_files.add(fp)
+                                    acc["files_created"].append(_short_path(fp))
+                            elif name == "Bash":
+                                cmd = inp.get("command", "")
+                                gc = _GIT_COMMIT_RE.search(cmd)
+                                if not gc:
+                                    gc = _GIT_COMMIT_HEREDOC_RE.search(cmd)
+                                if gc:
+                                    msg = gc.group(1).strip()
+                                    if msg and not msg.startswith("$"):
+                                        acc["git_commits"].append(msg[:80])
+                                gp = _GIT_PUSH_RE.search(cmd)
+                                if gp:
+                                    acc["git_pushes"].append(gp.group(1))
+                                notable = _classify_bash(cmd)
+                                if notable and len(acc["bash_notable"]) < 10:
+                                    acc["bash_notable"].append(notable)
+                            elif name == "Skill":
+                                skill = inp.get("skill", "")
+                                if skill and skill not in seen_skills:
+                                    seen_skills.add(skill)
+                                    acc["skills"].append(skill)
+                            elif name == "Agent":
+                                desc = inp.get("description", "")
+                                if desc and len(acc["bash_notable"]) < 10:
+                                    acc["bash_notable"].append(f"agent: {desc}")
+                            elif name.startswith("mcp__"):
+                                parsed = _parse_mcp_tool(name)
+                                if parsed and parsed not in seen_mcp:
+                                    seen_mcp.add(parsed)
+                                    acc["mcp_ops"].append(parsed)
+
+                elif t == "human":
+                    msg = obj.get("message", {})
+                    if isinstance(msg, dict):
+                        content = msg.get("content", "")
+                        prompt_text = ""
+                        if isinstance(content, str):
+                            prompt_text = content.strip()
+                        elif isinstance(content, list):
+                            for c in content:
+                                if isinstance(c, dict) and c.get("type") == "text":
+                                    prompt_text = c.get("text", "").strip()
+                                    break
+                        if prompt_text and prompt_count < 5 and not prompt_text.startswith("<system-reminder>"):
+                            acc["user_prompts"].append(prompt_text[:80])
+                            prompt_count += 1
+
+                elif t == "user":
+                    msg = obj.get("message", {})
+                    if isinstance(msg, dict):
+                        content = msg.get("content", [])
+                        if isinstance(content, list):
+                            for c in content:
+                                if isinstance(c, dict) and c.get("is_error"):
+                                    acc["errors"] += 1
+
+                elif t == "system" and not slug:
                     s = obj.get("slug", "")
                     if s:
                         slug = s
-                if t == "last-prompt":
+
+                elif t == "last-prompt":
                     lp = obj.get("lastPrompt", "")
                     if lp:
                         last_prompt = lp
+
     except Exception:
         return None
     if first_ts is None:
@@ -393,6 +902,9 @@ def _parse_transcript(f):
     else:
         source = "agent"
 
+    gravity = _gravity_center(acc, directive)
+    project = _derive_project(source, str(f.parent), acc)
+
     return {
         "session_id": f.stem,
         "first_ts": first_ts.isoformat(),
@@ -400,6 +912,9 @@ def _parse_transcript(f):
         "output_tokens": total_out,
         "slug": slug or "",
         "directive": directive,
+        "gravity": gravity,
+        "project": project,
+        "accomplishments": acc,
         "model": dominant_model,
         "source": source,
         "project_dir": str(f.parent),
@@ -421,10 +936,26 @@ def _build_or_update_index():
             for f in proj_dir.glob("*.jsonl"):
                 sid = f.stem
                 existing = known.get(sid)
-                if existing and f.stat().st_mtime <= existing.get("file_mtime", 0):
+                # Re-index if missing new fields or mtime changed
+                needs_update = (
+                    not existing
+                    or f.stat().st_mtime > existing.get("file_mtime", 0)
+                    or "gravity" not in existing
+                )
+                if not needs_update:
                     continue
                 result = _parse_transcript(f)
                 if result:
+                    # Resolve CCID via timestamp overlap
+                    if not result.get("ccid"):
+                        try:
+                            ft = datetime.fromisoformat(result["first_ts"])
+                            lt = datetime.fromisoformat(result["last_ts"])
+                            ccid = _resolve_ccid_for_session(sid, ft, lt)
+                            if ccid:
+                                result["ccid"] = ccid
+                        except Exception:
+                            pass
                     new_entries.append(result)
                     known[sid] = result
         if new_entries:
@@ -433,6 +964,7 @@ def _build_or_update_index():
                 for entry in known.values():
                     fh.write(json.dumps(entry) + "\n")
             _index_cache = dict(known)
+            _rebuild_ccid_index()
     except Exception:
         pass
     finally:
@@ -497,10 +1029,11 @@ def _get_session_history():
             "output_tokens": entry.get("output_tokens", 0),
             "pct_str": pct_str,
             "dur_str": dur_str,
-            "directive": entry.get("directive", "—"),
+            "directive": entry.get("gravity") or entry.get("directive", "—"),
             "slug": entry.get("slug", ""),
             "model": entry.get("model", ""),
             "source": entry.get("source", "?"),
+            "project": entry.get("project", "—"),
             "date": session_date,
         })
 
@@ -823,15 +1356,21 @@ def _get_call_history():
             when_str = "?"
             when_date = None
 
-        # Source from index cache (accurate) with fallback to session ID lookup
-        source = _index_cache.get(sid, {}).get("source", "cli")
+        # Source and project from index cache
+        idx_entry = _index_cache.get(sid, {})
+        source = idx_entry.get("source", "cli")
+        project = idx_entry.get("project", "—")
 
         # Recent tool detail (last tool with snippet)
         recent_str = s["recent_tools"][-1] if s["recent_tools"] else "—"
 
+        # Use gravity center for directive when available
+        directive = idx_entry.get("gravity") or s["directive"] or "—"
+
         result.append({
             "session": sid,
             "source": source,
+            "project": project,
             "model": _abbrev_model(s.get("model", "?")),
             "when": when_str,
             "when_date": when_date,
@@ -839,7 +1378,7 @@ def _get_call_history():
             "tools_str": tools_str,
             "recent_str": recent_str,
             "pct_str": pct_str,
-            "directive": s["directive"] or "—",
+            "directive": directive,
             "last_ts_raw": s["last_ts"],
         })
 
@@ -956,6 +1495,264 @@ def _drain_status(drain_events):
         per = burn / sessions if sessions else burn
         return "yellow", f"▲  {sessions} sessions — ~{per:.1f}%/min each"
     return "green", f"●  Normal — {sessions} session{'s' if sessions != 1 else ''}, ~{burn:.0f}%/min"
+
+
+# ── burndown chart data ─────────────────────────────────────────────────────
+
+_burndown_cache = None  # type: Optional[Dict]
+_burndown_cache_time = 0.0
+
+
+def _get_burndown_data():
+    # type: () -> Dict[str, Any]
+    """Compute burndown chart data for current 5h window."""
+    global _burndown_cache, _burndown_cache_time
+    now = time.time()
+    if _burndown_cache and now - _burndown_cache_time < 30:
+        return _burndown_cache
+
+    five, _, five_reset_ts, _ = _current_pct()
+    if five == "?" or not five_reset_ts:
+        return {}
+
+    try:
+        reset = datetime.fromisoformat(five_reset_ts.replace("Z", "+00:00"))
+        now_utc = datetime.now(timezone.utc)
+        window_start = reset - timedelta(hours=5)
+        mins_total = 300.0  # 5 hours
+        mins_elapsed = max(0, (now_utc - window_start).total_seconds() / 60)
+        mins_to_reset = max(0, (reset - now_utc).total_seconds() / 60)
+        remaining_pct = 100.0 - float(five)
+    except Exception:
+        return {}
+
+    # Load ledger and bucket actual data at 2-min intervals
+    entries = _load_ledger()
+    raw_points = []  # type: List[Tuple[float, float]]  # (mins_elapsed, remaining_pct)
+    for e in entries:
+        if e.get("type") != "tool_use":
+            continue
+        pct = e.get("five_pct")
+        if pct is None:
+            continue
+        try:
+            ts = datetime.fromisoformat(e["ts"].replace("Z", "+00:00"))
+            if ts < window_start:
+                continue
+            elapsed = (ts - window_start).total_seconds() / 60
+            raw_points.append((elapsed, 100.0 - float(pct)))
+        except Exception:
+            continue
+
+    # Bucket into 2-minute intervals
+    bucket_size = 2.0
+    num_buckets = int(mins_elapsed / bucket_size) + 1
+    actual = []  # type: List[Tuple[float, float]]
+    for i in range(num_buckets):
+        bucket_min = i * bucket_size
+        bucket_max = bucket_min + bucket_size
+        pts = [r for m, r in raw_points if bucket_min <= m < bucket_max]
+        if pts:
+            actual.append((bucket_min + bucket_size / 2, pts[-1]))
+        elif actual:
+            actual.append((bucket_min + bucket_size / 2, actual[-1][1]))
+
+    # If no data at all, start with 100%
+    if not actual:
+        actual = [(0, 100.0)]
+
+    # Ideal pace: straight line from 100% at start to 0% at reset
+    ideal = []  # type: List[Tuple[float, float]]
+    for i in range(num_buckets + int(mins_to_reset / bucket_size) + 1):
+        m = i * bucket_size
+        ideal_remaining = max(0, 100.0 * (1.0 - m / mins_total))
+        ideal.append((m, ideal_remaining))
+
+    # Current rate: average over last 10 minutes
+    current_rate = 0.0
+    recent = [(m, r) for m, r in raw_points if m > mins_elapsed - 10]
+    if len(recent) >= 2:
+        delta_pct = recent[0][1] - recent[-1][1]  # remaining dropped by this much
+        delta_mins = recent[-1][0] - recent[0][0]
+        if delta_mins > 0:
+            current_rate = delta_pct / delta_mins  # %/min consumed
+
+    # Projection
+    projected_wall_mins = None  # type: Optional[float]
+    projected_remaining_at_reset = remaining_pct
+    if current_rate > 0:
+        projected_wall_mins = remaining_pct / current_rate
+        projected_remaining_at_reset = max(0, remaining_pct - current_rate * mins_to_reset)
+
+    # Status
+    if projected_wall_mins is not None and projected_wall_mins < 15:
+        status = "critical"
+    elif projected_wall_mins is not None and projected_wall_mins < mins_to_reset:
+        status = "burning_fast"
+    elif mins_to_reset < 30 and remaining_pct > 30:
+        status = "wasting"
+    else:
+        status = "on_track"
+
+    result = {
+        "actual": actual,
+        "ideal": ideal,
+        "projected_wall_mins": projected_wall_mins,
+        "projected_remaining_at_reset": projected_remaining_at_reset,
+        "current_rate": current_rate,
+        "remaining_pct": remaining_pct,
+        "mins_to_reset": mins_to_reset,
+        "mins_elapsed": mins_elapsed,
+        "mins_total": mins_total,
+        "window_start": window_start,
+        "window_reset": reset,
+        "status": status,
+    }  # type: Dict[str, Any]
+    _burndown_cache = result
+    _burndown_cache_time = now
+    return result
+
+
+# ── system health ───────────────────────────────────────────────────────────
+
+_SYSTEM_MEM_MB = 16384  # default, updated on first call
+_health_cache = None  # type: Optional[Dict]
+_health_cache_time = 0.0
+
+# Process name → display label mapping
+_INFRA_NAMES = {
+    "Virtual Machine Service for Claude": "VM Svc Claude",
+    "stable": "Warp",
+    "Notion Helper (Renderer)": "Notion",
+    "Notion Helper": "Notion",
+    "Notion": "Notion",
+    "chrome-headless-shell": "chrome-headless",
+    "node": "node",
+    "Claude Helper (Renderer)": "Claude Desktop",
+    "Claude Helper": "Claude Desktop",
+}
+
+
+def _get_system_health():
+    # type: () -> Dict[str, Any]
+    """Return system health snapshot from ps."""
+    global _health_cache, _health_cache_time, _SYSTEM_MEM_MB
+    now = time.time()
+    if _health_cache and now - _health_cache_time < 5:
+        return _health_cache
+
+    # Get system memory once
+    try:
+        r = subprocess.run(["sysctl", "-n", "hw.memsize"], capture_output=True, text=True, timeout=2)
+        _SYSTEM_MEM_MB = int(r.stdout.strip()) // (1024 * 1024)
+    except Exception:
+        pass
+
+    # Get all processes
+    try:
+        r = subprocess.run(
+            ["ps", "-eo", "pid,pcpu,rss,comm"],
+            capture_output=True, text=True, timeout=3,
+        )
+    except Exception:
+        return {}
+
+    # Get active session info for cross-referencing
+    active = _active_sessions()
+    active_pids = {item[0]: item[2] for item in active}  # pid → directive
+
+    claude_sessions = []  # type: List[Dict]
+    infra_raw = defaultdict(lambda: {"cpu": 0.0, "mem_mb": 0.0, "pids": [], "count": 0})
+    total_cpu = 0.0
+    total_mem = 0.0
+
+    for line in r.stdout.splitlines()[1:]:  # skip header
+        parts = line.strip().split(None, 3)
+        if len(parts) < 4:
+            continue
+        try:
+            pid = parts[0]
+            cpu = float(parts[1])
+            mem_kb = int(parts[2])
+            comm = parts[3].strip()
+        except Exception:
+            continue
+
+        mem_mb = mem_kb / 1024.0
+
+        # Is this a Claude CLI session?
+        comm_base = comm.rsplit("/", 1)[-1] if "/" in comm else comm
+        if comm_base == "claude":
+            directive = active_pids.get(pid, "—")
+            is_active = pid in active_pids
+            status = "active" if is_active else "exited"
+            if is_active and cpu > 20:
+                # Check if idle (no recent tool call)
+                secs, _ = _session_last_activity(pid)
+                if secs and secs > 300:
+                    status = "runaway"
+            claude_sessions.append({
+                "pid": pid, "cpu": cpu, "mem_mb": round(mem_mb),
+                "directive": directive, "status": status,
+            })
+            total_cpu += cpu
+            total_mem += mem_mb
+            continue
+
+        # Check against infrastructure names
+        for pattern, label in _INFRA_NAMES.items():
+            if pattern in comm:
+                infra_raw[label]["cpu"] += cpu
+                infra_raw[label]["mem_mb"] += mem_mb
+                infra_raw[label]["pids"].append(pid)
+                infra_raw[label]["count"] += 1
+                total_cpu += cpu
+                total_mem += mem_mb
+                break
+
+    # Build infrastructure list
+    infrastructure = []  # type: List[Dict]
+    for name, data in sorted(infra_raw.items(), key=lambda x: x[1]["mem_mb"], reverse=True):
+        entry = {
+            "name": name,
+            "cpu": round(data["cpu"], 1),
+            "mem_mb": round(data["mem_mb"]),
+            "count": data["count"],
+            "pid": data["pids"][0] if data["count"] == 1 else "—",
+        }  # type: Dict[str, Any]
+        infrastructure.append(entry)
+
+    # Sort claude sessions by CPU desc
+    claude_sessions.sort(key=lambda x: x["cpu"], reverse=True)
+
+    # Alerts
+    alerts = []  # type: List[str]
+    for s in claude_sessions:
+        if s["status"] == "runaway":
+            alerts.append(f"cc-{s['pid']} runaway: {s['cpu']:.0f}% CPU while idle >5m")
+    for inf in infrastructure:
+        if inf["mem_mb"] > 3000:
+            count_str = f" across {inf['count']} processes" if inf["count"] > 1 else ""
+            alerts.append(f"{inf['name']} using {inf['mem_mb']/1024:.1f}GB{count_str}")
+        if inf["cpu"] > 50:
+            alerts.append(f"{inf['name']} at {inf['cpu']:.0f}% CPU")
+
+    mem_pct = (total_mem / _SYSTEM_MEM_MB * 100) if _SYSTEM_MEM_MB else 0
+
+    result = {
+        "claude_sessions": claude_sessions,
+        "infrastructure": infrastructure,
+        "totals": {
+            "cpu": round(total_cpu, 1),
+            "mem_mb": round(total_mem),
+            "mem_pct": round(mem_pct, 1),
+            "system_mem_mb": _SYSTEM_MEM_MB,
+        },
+        "alerts": alerts,
+    }  # type: Dict[str, Any]
+    _health_cache = result
+    _health_cache_time = now
+    return result
 
 
 # ── Rich panel builders (used by Rich version + Textual Static widgets) ──────
@@ -1191,13 +1988,14 @@ def make_sessions_panel():
     t.add_column("When", width=9, no_wrap=True)
     t.add_column("Session", width=10, no_wrap=True)
     t.add_column("Src", width=10, no_wrap=True)
+    t.add_column("Project", width=12, no_wrap=True)
     t.add_column("Mdl", width=10, no_wrap=True)
     t.add_column("Dur", width=12, no_wrap=True)
     t.add_column("Used", width=11, no_wrap=True)
     t.add_column("Directive", overflow="ellipsis", no_wrap=True)
 
     if not sessions:
-        t.add_row("", "[dim]—[/dim]", "", "", "", "", "[dim]no active sessions[/dim]")
+        t.add_row("", "[dim]—[/dim]", "", "", "", "", "", "[dim]no active sessions[/dim]")
         return Panel(t, title="[bold]Active Sessions[/bold]  [dim](live)[/dim]", border_style="cyan")
 
     # Single-pass ledger scan: build model, last call, first output per session
@@ -1245,10 +2043,37 @@ def make_sessions_panel():
         mdl_style = "magenta" if "opus" in mdl else ("cyan" if "sonnet" in mdl else "dim")
         src_color = "yellow" if ("/" in source or source == "paperclip") else ("green" if source == "cli" else ("cyan" if "atlas" in source else "dim"))
 
+        # Derive project for active session from ledger files
+        project = "—"
+        # Check if we have files in ledger to derive project
+        ledger_files = []
+        for e in entries:
+            if e.get("session") == sid:
+                snippet = e.get("tool_snippet", "")
+                if snippet:
+                    ledger_files.append(snippet)
+        # Simple heuristic from directive or source
+        if source in ("atlas-be", "atlas-fe"):
+            project = "atlas"
+        elif source == "openclaw":
+            project = "openclaw"
+        elif source == "frank":
+            project = "frank"
+        elif "/" in source:
+            project = source.split("/")[0].lower()
+        else:
+            # Try to infer from directive text
+            d_lower = directive.lower() if directive else ""
+            for p in ("claude-watch", "atlas", "paperclip", "openclaw", "frank"):
+                if p in d_lower:
+                    project = p
+                    break
+
         t.add_row(
             f"[dim]{start_str}[/dim]",
             f"[cyan]{sid}[/cyan]",
             f"[{src_color}]{source}[/{src_color}]",
+            f"[dim]{project}[/dim]",
             f"[{mdl_style}]{mdl}[/{mdl_style}]",
             f"[dim]{age}[/dim]",
             f"[{color}]{delta}[/{color}]",
@@ -1293,7 +2118,7 @@ def make_sessions_panel():
         cpu_val = f"[{cpu_style}]{cpu_str}[/{cpu_style}]" if cpu_style else cpu_str
 
         t.add_row(
-            "", "", "",
+            "", "", "", "",
             f"  {state}",
             f"[dim]ago:[/dim] {elapsed_str}",
             f"[dim]tok:[/dim] {tok_str}",
