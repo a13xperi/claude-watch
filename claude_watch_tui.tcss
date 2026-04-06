@@ -1,0 +1,48 @@
+Screen {
+    layout: vertical;
+    overflow: hidden;
+}
+
+#header {
+    height: auto;
+    max-height: 5;
+}
+
+#active-sessions {
+    height: auto;
+    max-height: 8;
+}
+
+#session-history {
+    height: 1fr;
+    min-height: 6;
+}
+
+#session-history:focus {
+    border: tall $accent;
+}
+
+#feed-row {
+    layout: horizontal;
+    height: 1fr;
+    min-height: 6;
+}
+
+#tool-feed {
+    width: 3fr;
+}
+
+#tool-feed:focus {
+    border: tall $accent;
+}
+
+#tool-freq {
+    width: 1fr;
+    height: auto;
+    max-height: 20;
+}
+
+#drain {
+    height: auto;
+    max-height: 12;
+}
