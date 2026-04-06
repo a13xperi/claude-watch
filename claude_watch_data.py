@@ -1033,7 +1033,7 @@ def make_sessions_panel():
     t = Table(show_header=True, header_style="bold cyan", box=None, padding=(0, 1), expand=True)
     t.add_column("Start", min_width=6, no_wrap=True)
     t.add_column("Dur", min_width=6, no_wrap=True)
-    t.add_column("PID", min_width=6, no_wrap=True)
+    t.add_column("PID", min_width=9, no_wrap=True)
     t.add_column("Used", min_width=6, no_wrap=True)
     t.add_column("Status", min_width=14, no_wrap=True, overflow="ellipsis")
     t.add_column("Source", width=10, no_wrap=True)
@@ -1078,7 +1078,7 @@ def make_sessions_panel():
             t.add_row(
                 f"[dim]{start_str}[/dim]",
                 f"[dim]{age}[/dim]",
-                f"[cyan]{pid}[/cyan]",
+                f"[cyan]cc-{pid}[/cyan]",
                 f"[{color}]{delta}[/{color}]",
                 status,
                 f"[{src_color}]{source}[/{src_color}]",
