@@ -110,6 +110,24 @@ Screen {
     border: solid dodgerblue;
 }
 
+/* ── Usage metrics screen ── */
+#metrics-header {
+    height: auto;
+    max-height: 2;
+    padding: 0 1;
+}
+
+#metrics-table {
+    height: 1fr;
+    border: solid cyan;
+}
+
+#metrics-summary {
+    height: auto;
+    max-height: 3;
+    padding: 0 1;
+}
+
 /* ── DataTable styling ── */
 DataTable {
     scrollbar-size: 1 1;

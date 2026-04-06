@@ -23,12 +23,12 @@ from claude_watch_data import (
     _get_call_history,
     _get_session_history,
     _get_session_turns,
+    _get_usage_metrics,
     _index_building,
     _load_index,
     make_drain_panel,
     make_header,
     make_sessions_panel,
-    _get_call_history,
     make_skills_panel,
     make_tool_stats,
 )
@@ -151,6 +151,68 @@ class SessionDrillDown(Screen):
             "",
             "",
             Text(f"{len(turns)} turns", style="bold"),
+        )
+
+    def action_pop_screen(self):
+        self.app.pop_screen()
+
+
+class UsageMetricsScreen(Screen):
+    BINDINGS = [
+        Binding("escape", "pop_screen", "Back"),
+        Binding("q", "pop_screen", "Back"),
+    ]
+
+    def compose(self) -> ComposeResult:
+        yield Static(id="metrics-header")
+        yield DataTable(id="metrics-table")
+        yield Static(id="metrics-summary")
+
+    def on_mount(self):
+        metrics, total = _get_usage_metrics(days=7)
+        _, seven, _, _ = _current_pct()
+
+        self.query_one("#metrics-header", Static).update(
+            f"[bold]Usage Metrics — last 7 days[/bold]  "
+            f"[dim]Total output: {total/1000:.0f}k tokens  "
+            f"Account 7d: {seven}%  (Escape to go back)[/dim]"
+        )
+
+        table = self.query_one("#metrics-table", DataTable)
+        table.cursor_type = "row"
+        table.zebra_stripes = True
+        table.add_column("Source", width=20)
+        table.add_column("Sessions", width=9)
+        table.add_column("Output Tok", width=11)
+        table.add_column("Avg/Session", width=12)
+        table.add_column("% of Total", width=11)
+        table.add_column("Share")
+
+        for m in metrics:
+            src = m["source"]
+            src_style = "yellow" if ("/" in src or src == "paperclip") else (
+                "green" if src == "cli" else ("cyan" if "atlas" in src else "dim")
+            )
+            out_k = m["output_tokens"]
+            out_str = f"{out_k/1000:.1f}k" if out_k >= 1000 else str(out_k)
+            avg_k = m["avg_tokens"]
+            avg_str = f"{avg_k/1000:.1f}k" if avg_k >= 1000 else str(avg_k)
+            pct = m["pct_of_total"]
+            bar_len = max(1, int(pct / 2.5))  # 40 chars = 100%
+            bar = "█" * bar_len + "░" * (40 - bar_len)
+            bar_color = "yellow" if ("/" in src) else ("green" if src == "cli" else "cyan")
+            table.add_row(
+                Text(src, style=src_style),
+                Text(str(m["sessions"]), justify="right"),
+                Text(out_str, justify="right"),
+                Text(avg_str, justify="right"),
+                Text(f"{pct:.1f}%", justify="right"),
+                Text(bar[:40], style=bar_color),
+            )
+
+        self.query_one("#metrics-summary", Static).update(
+            f"[dim]Sessions above represent all indexed transcripts from the last 7 days. "
+            f"7d account budget usage ({seven}%) is account-level and not split per source.[/dim]"
         )
 
     def action_pop_screen(self):
@@ -394,6 +456,7 @@ class ClaudeWatchApp(App):
     BINDINGS = [
         Binding("q", "quit", "Quit"),
         Binding("r", "force_refresh", "Refresh"),
+        Binding("u", "show_usage", "Usage"),
         Binding("tab", "focus_next", "Next panel", show=False),
         Binding("shift+tab", "focus_previous", "Prev panel", show=False),
     ]
@@ -440,6 +503,9 @@ class ClaudeWatchApp(App):
     def action_force_refresh(self):
         self.build_index()
         self.refresh_data()
+
+    def action_show_usage(self):
+        self.push_screen(UsageMetricsScreen())
 
 
 def main():

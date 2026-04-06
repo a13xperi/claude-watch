@@ -589,6 +589,50 @@ def _get_session_turns(session_id):
     return turns
 
 
+# ── usage metrics ────────────────────────────────────────────────────────────
+
+def _get_usage_metrics(days=7):
+    """Aggregate output tokens by source over the last N days.
+    Returns (metrics_list, total_output_tokens).
+    Each metric: source, output_tokens, sessions, avg_tokens, pct_of_total.
+    """
+    _ensure_index()
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+
+    by_source = defaultdict(lambda: {"output_tokens": 0, "sessions": 0})
+    total_output = 0
+
+    for sid, entry in _index_cache.items():
+        try:
+            last_ts = datetime.fromisoformat(entry["last_ts"])
+            if last_ts.tzinfo is None:
+                last_ts = last_ts.replace(tzinfo=timezone.utc)
+        except Exception:
+            continue
+        if last_ts < cutoff:
+            continue
+
+        src = entry.get("source", "?")
+        tokens = entry.get("output_tokens", 0)
+        by_source[src]["output_tokens"] += tokens
+        by_source[src]["sessions"] += 1
+        total_output += tokens
+
+    metrics = []
+    for src, data in sorted(by_source.items(), key=lambda x: x[1]["output_tokens"], reverse=True):
+        pct = (data["output_tokens"] / total_output * 100) if total_output else 0
+        avg = data["output_tokens"] // data["sessions"] if data["sessions"] else 0
+        metrics.append({
+            "source": src,
+            "output_tokens": data["output_tokens"],
+            "sessions": data["sessions"],
+            "avg_tokens": avg,
+            "pct_of_total": pct,
+        })
+
+    return metrics, total_output
+
+
 # ── skill stats ──────────────────────────────────────────────────────────────
 
 def _get_skill_stats():
