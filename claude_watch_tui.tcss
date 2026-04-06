@@ -58,39 +58,23 @@ Screen {
     border: tall $accent;
 }
 
-/* ── Feed row ── */
+/* ── Stats row (Tool Frequency + Skills side by side) ── */
 #feed-row {
     layout: horizontal;
-    height: 1fr;
-    min-height: 6;
-}
-
-/* ── Tool Call Feed (scrollable DataTable) ── */
-#tool-feed {
-    width: 3fr;
-    border: solid magenta;
-    border-title-color: white;
-    border-title-style: bold;
-}
-
-#tool-feed:focus {
-    border: tall $accent;
-}
-
-/* ── Stats column (Tool Frequency + Skills) ── */
-#stats-col {
-    width: 1fr;
     height: auto;
+    max-height: 14;
 }
 
 #tool-freq {
+    width: 1fr;
     height: auto;
-    max-height: 16;
+    max-height: 14;
 }
 
 #skills {
+    width: 1fr;
     height: auto;
-    max-height: 12;
+    max-height: 14;
 }
 
 /* ── Passive Drain (shrunk) ── */

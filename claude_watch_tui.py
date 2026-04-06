@@ -18,7 +18,6 @@ from claude_watch_data import (
     make_urgent_panel,
     _abbrev_model,
     _build_or_update_index,
-    _compute_tool_feed_rows,
     _current_pct,
     _get_call_history,
     _get_session_history,
@@ -469,10 +468,8 @@ class ClaudeWatchApp(App):
         with Horizontal(id="history-row"):
             yield CallHistoryTable(id="call-history")
         with Horizontal(id="feed-row"):
-            yield ToolCallFeed(id="tool-feed")
-            with Vertical(id="stats-col"):
-                yield ToolFrequency(id="tool-freq")
-                yield SkillsPanel(id="skills")
+            yield ToolFrequency(id="tool-freq")
+            yield SkillsPanel(id="skills")
         yield SessionHistoryTable(id="session-history")
         yield DrainPanel(id="drain")
 
@@ -494,7 +491,6 @@ class ClaudeWatchApp(App):
         self.query_one("#active-sessions", ActiveSessions).update_content()
         self.query_one("#active-calls", ActiveCalls).update_content()
         self.query_one("#session-history", SessionHistoryTable).refresh_rows()
-        self.query_one("#tool-feed", ToolCallFeed).refresh_rows()
         self.query_one("#tool-freq", ToolFrequency).update_content()
         self.query_one("#skills", SkillsPanel).update_content()
         self.query_one("#call-history", CallHistoryTable).refresh_rows()
