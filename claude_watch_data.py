@@ -637,7 +637,7 @@ def _get_usage_metrics(days=7):
 
 def _get_skill_stats():
     """Return list of (skill_name, count, last_used_str) from ledger."""
-    entries = _load_ledger(last_n=500)
+    entries = _load_ledger(last_n=2000)
     skill_counts = defaultdict(int)
     skill_last = {}  # type: Dict[str, str]
     for e in entries:
@@ -645,9 +645,9 @@ def _get_skill_stats():
             continue
         tool = e.get("tool", "")
         snippet = e.get("tool_snippet", "")
-        if tool == "Skill" and snippet:
+        if tool == "Skill":
             # snippet is the skill name (e.g. "claim-task", "paperclip")
-            name = "/" + snippet.strip().split()[0].lstrip("/")
+            name = "/" + snippet.strip().split()[0].lstrip("/") if snippet.strip() else "/unknown"
             skill_counts[name] += 1
             ts = e.get("ts", "")
             try:
