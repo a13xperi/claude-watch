@@ -468,11 +468,11 @@ class ClaudeWatchApp(App):
             yield ActiveCalls(id="active-calls")
             with Horizontal(id="history-row"):
                 yield CallHistoryTable(id="call-history")
+            yield SessionHistoryTable(id="session-history")
+            yield DrainPanel(id="drain")
             with Horizontal(id="feed-row"):
                 yield ToolFrequency(id="tool-freq")
                 yield SkillsPanel(id="skills")
-            yield SessionHistoryTable(id="session-history")
-            yield DrainPanel(id="drain")
 
     def on_mount(self):
         _load_index()
