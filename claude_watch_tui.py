@@ -578,13 +578,48 @@ class BurndownChart(Static):
                 border.append("─")
         border_str = "".join(border)
 
+        # Pacing verdict — the key "am I wasting tokens?" indicator
+        needed_rate = remaining / mins_to_reset if mins_to_reset > 0 else 0.0
+        if remaining < 3:
+            verdict = "[bold green]✓ USED UP[/bold green]"
+        elif rate >= needed_rate * 0.9:
+            verdict = "[bold green]✓ ON PACE[/bold green]"
+        elif status == "critical":
+            wall_str = f"~{wall_mins:.0f}m" if wall_mins else "soon"
+            verdict = f"[bold red]⚡ WALL in {wall_str}[/bold red]"
+        elif status == "burning_fast":
+            verdict = "[bold yellow]⚡ FAST[/bold yellow]"
+        elif status == "wasting" or rate < needed_rate * 0.5:
+            wasted = proj_remaining if proj_remaining > 0 else 0
+            verdict = f"[bold red]⚠ WASTING ~{wasted:.0f}%[/bold red]"
+        else:
+            verdict = "[yellow]~ SLOW[/yellow]"
+
+        verdict_line = (
+            f"{verdict}  [{rate_color}]{rate:.1f}%/min[/{rate_color}]"
+            f"  →  [dim]{needed_rate:.1f}%/min needed[/dim]"
+            f"  │  [dim]Resets in {reset_str}[/dim]"
+        )
+
+        if remaining < 3 or (rate >= needed_rate * 0.9 and status not in ("critical", "burning_fast")):
+            proj_label = f"[green]~{proj_remaining:.0f}% at reset[/green]"
+        else:
+            proj_label = f"[yellow]~{proj_remaining:.0f}% wasted at reset[/yellow]"
+
+        details_line = (
+            f"[{remaining_color}]{remaining:.0f}% left[/{remaining_color}]"
+            f"  │  [{budget_color}]Budget: {budget_per_10:.1f}%/10m[/{budget_color}]"
+            f"  │  {proj_label}"
+        )
+
         lines = [
             f"100%│{rows[0]}│",
             f"    │{rows[1]}│",
             f"  0%│{rows[2]}│",
             f"    └{border_str}┘",
             f"     [dim]{axis_str}[/dim]",
-            f"[{remaining_color}]{remaining:.0f}% left[/{remaining_color}]  [{rate_color}]{rate:.1f}%/min[/{rate_color}]  {proj_str}  [{budget_color}]Budget: {budget_per_10:.1f}%/10m[/{budget_color}]  [dim]Resets in {reset_str}[/dim]",
+            verdict_line,
+            details_line,
         ]
 
         content = "\n".join(lines)
