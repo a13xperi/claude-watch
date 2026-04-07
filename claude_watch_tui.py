@@ -5,6 +5,7 @@ Scrollable panels, keyboard navigation, no dead space.
 """
 
 import json
+import math
 import os
 import sys
 import time
@@ -992,11 +993,29 @@ class BurndownChart(Static):
         else:
             score_line = ""
 
+        # Token zone classification
+        def _token_zone(pct):
+            try:
+                p = float(pct)
+            except Exception:
+                return ("?", "dim")
+            if p < 40:
+                return ("COOL", "green")
+            if p < 70:
+                return ("WARM", "yellow")
+            if p < 85:
+                return ("HOT", "red")
+            return ("REDLINE", "bold red")
+
+        five_zone, five_zcolor = _token_zone(five)
+        seven_zone, seven_zcolor = _token_zone(seven)
+
         # Build right-side lines (aligned with chart rows)
         r = [
             f"  [bold {used_color}]{used_pct:.0f}% Used[/bold {used_color}]  [bold {left_color}]{remaining:.0f}% Left[/bold {left_color}]",
             f"  [bold]5h[/bold] {mini_bar(five)} {float(five):.0f}%  [dim]resets {reset_str}[/dim]",
             f"  [bold]7d[/bold] {mini_bar(seven)} {float(seven):.0f}%  [dim]{_reset_day(sr)[:10]}[/dim]",
+            f"  [{five_zcolor}]{five_zone}[/{five_zcolor}] 5h  [{seven_zcolor}]{seven_zone}[/{seven_zcolor}] 7d",
             f"  [{acct_color}]Acct {label}[/{acct_color}]: {name} [dim]({lane})[/dim]",
             f"  {pace_str}",
             f"  {verdict}",
@@ -1011,6 +1030,7 @@ class BurndownChart(Static):
             f"     [dim]{axis_str}[/dim]{r[4]}",
             r[5],
             r[6],
+            r[7],
         ]
 
         content = "\n".join(lines)
@@ -1080,7 +1100,16 @@ class SystemHealthPanel(Static):
                        else ("cyan" if "atlas" in source else "dim"))
             )
 
-            mem_str = f"{mem/1024:.1f}GB" if mem >= 1024 else f"{mem}MB"
+            def mem_mini_gauge(mb):
+                pct = min(mb / 10, 100)  # scale: 1000MB = 100%
+                filled = min(int(pct * 3 / 100), 3)
+                color = "green" if mb < 300 else ("yellow" if mb < 500 else "red")
+                bar = f"[{color}]{'█' * filled}{'░' * (3 - filled)}[/{color}]"
+                if mb >= 1024:
+                    return f"{bar} {mb / 1024:.1f}GB"
+                return f"{bar} {mb}MB"
+
+            mem_str = mem_mini_gauge(mem)
             if st == "runaway":
                 dot = "[bold red]⚠ [/bold red]"
                 status_str = f"[bold red]runaway[/bold red] ({directive[:20]})"
@@ -1101,7 +1130,7 @@ class SystemHealthPanel(Static):
                 f"[{co_style}]{co_name}[/{co_style}]",
                 f"[dim]{project}[/dim]",
                 f"[{mdl_style}]{mdl}[/{mdl_style}]",
-                mem_str,
+                Text.from_markup(mem_str),
                 status_str,
             )
 
@@ -1142,6 +1171,38 @@ class SystemHealthPanel(Static):
         total_mem_str = f"{total_mem/1024:.1f}GB" if total_mem >= 1024 else f"{total_mem:.0f}MB"
         mem_pct_color = "red" if mem_pct > 80 else ("yellow" if mem_pct > 60 else "green")
 
+        # Summary gauge row
+        def gauge_bar(pct, width=10):
+            filled = int(pct * width / 100)
+            color = "green" if pct < 40 else ("yellow" if pct < 70 else "red")
+            return f"[{color}]{'█' * filled}{'░' * (width - filled)}[/{color}]"
+
+        def zone_label(pct):
+            if pct < 40:
+                return ("COOL", "green")
+            if pct < 70:
+                return ("WARM", "yellow")
+            if pct < 85:
+                return ("HOT", "red")
+            return ("REDLINE", "bold red")
+
+        mem_zone, mem_zc = zone_label(mem_pct)
+        cpu_capped = min(total_cpu, 100)
+        cpu_zone, cpu_zc = zone_label(cpu_capped)
+        mem_gb = total_mem / 1024
+        sys_gb = sys_mem / 1024
+
+        t.add_row(
+            "",
+            Text.from_markup(f"MEM {gauge_bar(mem_pct)} {mem_gb:.1f}GB/{sys_gb:.0f}GB [{mem_zc}]{mem_zone}[/{mem_zc}]"),
+            "",
+            "",
+            "",
+            Text.from_markup(f"CPU {gauge_bar(cpu_capped)} {total_cpu:.0f}% [{cpu_zc}]{cpu_zone}[/{cpu_zc}]"),
+            "",
+            "",
+        )
+
         t.add_row(
             "",
             "[bold]Total AI stack[/bold]",
@@ -1155,29 +1216,6 @@ class SystemHealthPanel(Static):
 
         self.display = True
         self.update(Panel(t, title="[bold]System Health[/bold]", border_style="magenta"))
-
-
-class HealthScreen(Screen):
-    """Full-screen system health view."""
-
-    BINDINGS = [
-        Binding("escape", "pop_screen", "Back"),
-        Binding("q", "pop_screen", "Back"),
-    ]
-
-    def compose(self) -> ComposeResult:
-        yield NavBar(active="nav-health")
-        yield Static(id="health-header")
-        yield SystemHealthPanel(id="health-panel")
-
-    def on_mount(self):
-        self.query_one("#health-header", Static).update(
-            "[bold]System Health[/bold]"
-        )
-        self.query_one("#health-panel", SystemHealthPanel).update_content()
-
-    def action_pop_screen(self):
-        self.app.pop_screen()
 
 
 # ── Navigation bar ───────────────────────────────────────────────────────────
@@ -1204,6 +1242,30 @@ class NavBar(Horizontal):
         for label, btn_id in buttons:
             variant = "primary" if btn_id == self._active else "default"
             yield Button(label, id=btn_id, variant=variant)
+
+
+
+class HealthScreen(Screen):
+    """Full-screen system health view."""
+
+    BINDINGS = [
+        Binding("escape", "pop_screen", "Back"),
+        Binding("q", "pop_screen", "Back"),
+    ]
+
+    def compose(self) -> ComposeResult:
+        yield NavBar(active="nav-health")
+        yield Static(id="health-header")
+        yield SystemHealthPanel(id="health-panel")
+
+    def on_mount(self):
+        self.query_one("#health-header", Static).update(
+            "[bold]System Health[/bold]"
+        )
+        self.query_one("#health-panel", SystemHealthPanel).update_content()
+
+    def action_pop_screen(self):
+        self.app.pop_screen()
 
 
 # ── Drill-down screen ────────────────────────────────────────────────────────
@@ -3221,6 +3283,65 @@ class CyclePlanScreen(Screen):
 # ── App ──────────────────────────────────────────────────────────────────────
 
 
+def _render_pie_chart(sessions, width=30, height=15):
+    """Render an ASCII pie chart using Unicode blocks."""
+    if not sessions:
+        return "[dim]No data[/dim]"
+
+    # Use output_tokens for proportions (more meaningful than % which are all similar)
+    total_tokens = sum(s.get("output_tokens", 0) or 1 for s in sessions)
+
+    # Build angle ranges for each session
+    slices = []  # (start_angle, end_angle, color, label)
+    current_angle = -math.pi / 2  # Start from top (12 o'clock)
+    for s in sessions:
+        tokens = s.get("output_tokens", 0) or 1
+        sweep = 2 * math.pi * tokens / total_tokens
+        slices.append((current_angle, current_angle + sweep, s["color"], s.get("directive", "")[:15] or s["session_id"][:10]))
+        current_angle += sweep
+
+    # Render circle
+    cx, cy = width / 2, height / 2
+    # Account for terminal character aspect ratio (~2:1 width:height)
+    rx = width / 2 - 1  # radius x
+    ry = height / 2 - 0.5  # radius y
+
+    lines = []
+    for row in range(height):
+        line_chars = []
+        for col in range(width):
+            # Normalize to unit circle
+            dx = (col - cx) / rx if rx else 0
+            dy = (row - cy) / ry if ry else 0
+            dist = math.sqrt(dx * dx + dy * dy)
+
+            if dist > 1.0:
+                line_chars.append(" ")
+                continue
+
+            # Calculate angle
+            angle = math.atan2(dy, dx)
+
+            # Find which slice this angle belongs to
+            color = "white"
+            for start, end, c, _ in slices:
+                # Normalize angles
+                a = angle
+                s_a = start
+                # Handle wrap-around
+                while a < s_a:
+                    a += 2 * math.pi
+                if s_a <= a < end:
+                    color = c
+                    break
+
+            line_chars.append(f"[{color}]\u2588[/{color}]")
+
+        lines.append("".join(line_chars))
+
+    return "\n".join(lines)
+
+
 class TokenAttributionScreen(Screen):
     """Full-screen token attribution breakdown."""
 
@@ -3231,7 +3352,11 @@ class TokenAttributionScreen(Screen):
 
     def compose(self) -> ComposeResult:
         from textual.widgets import Footer
+        yield NavBar(active="nav-dashboard")
         yield Static(id="attr-header")
+        with Horizontal(id="attr-chart-row"):
+            yield Static(id="attr-pie")
+            yield Static(id="attr-legend")
         yield DataTable(id="attr-table")
         yield Footer()
 
@@ -3247,9 +3372,13 @@ class TokenAttributionScreen(Screen):
     def refresh_data(self):
         data = _get_token_attribution()
         header = self.query_one("#attr-header", Static)
+        pie_widget = self.query_one("#attr-pie", Static)
+        legend_widget = self.query_one("#attr-legend", Static)
 
         if not data or not data.get("sessions"):
             header.update("[bold]Token Attribution[/bold] \u2014 No data yet")
+            pie_widget.update("")
+            legend_widget.update("")
             return
 
         total = data["total_used_pct"]
@@ -3279,6 +3408,29 @@ class TokenAttributionScreen(Screen):
 
         bar = "".join(bar_chars)
         header.update(f"[bold]Who Ate My {total:.0f}%?[/bold]  5h rolling window\n{bar}")
+
+        # Render pie chart
+        pie_text = _render_pie_chart(sessions)
+        pie_widget.update(pie_text)
+
+        # Render legend
+        total_tokens = sum(s.get("output_tokens", 0) or 0 for s in sessions)
+        legend_lines = []
+        for s in sessions:
+            color = s["color"]
+            directive = s.get("directive", "")[:25] if s.get("directive") else s["session_id"][:12]
+            out_tokens = s.get("output_tokens", 0) or 0
+            if out_tokens >= 1_000_000:
+                tok_str = f"{out_tokens / 1_000_000:.1f}M"
+            elif out_tokens >= 1_000:
+                tok_str = f"{out_tokens / 1_000:.0f}K"
+            else:
+                tok_str = str(out_tokens)
+            pct_of_total = (out_tokens / total_tokens * 100) if total_tokens > 0 else 0
+            legend_lines.append(
+                f"[{color}]\u2588\u2588[/{color}] {directive:<25s} {tok_str:>6s} {pct_of_total:>4.0f}%"
+            )
+        legend_widget.update("\n".join(legend_lines))
 
         # Populate table
         table = self.query_one("#attr-table", DataTable)
@@ -3524,6 +3676,11 @@ class ClaudeWatchApp(App):
             "nav-cycles": "view-cycles",
         }
         btn_id = event.button.id or ""
+        if not btn_id.startswith("nav-"):
+            return
+        # Pop to root first (handles nav from detail screens)
+        while len(self.screen_stack) > 1:
+            self.pop_screen()
         if btn_id in btn_map:
             self.switch_view(btn_map[btn_id])
         elif btn_id == "nav-health":
