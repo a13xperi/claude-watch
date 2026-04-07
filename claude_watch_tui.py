@@ -52,6 +52,7 @@ from claude_watch_data import (
     _gravity_center,
     _index_building,
     _index_cache,
+    _index_lock,
     _load_index,
     _load_ledger,
     _shorten_tool,
@@ -1317,7 +1318,8 @@ class SessionDrillDown(Screen):
         commits = len(acc.get("git_commits", []))
         errors = acc.get("errors", 0)
         # Get output tokens + model from index cache for cost estimate
-        idx_entry = _index_cache.get(self.session_id, {})
+        with _index_lock:
+            idx_entry = _index_cache.get(self.session_id, {})
         out_tok = idx_entry.get("output_tokens", 0)
         session_cost = _estimate_cost(out_tok, idx_entry.get("model", ""))
         summary_parts = [f"[bold]{turns}[/bold] turns"]
@@ -2454,10 +2456,12 @@ class SessionHistoryTable(DataTable):
 
         self.clear()
 
+        with _index_lock:
+            _building = _index_building
         if not sessions:
             self.add_row(
                 "...", "", "", "", "", "", "", "", "", "",
-                Text("building index..." if _index_building else "no sessions in this window", style="dim"),
+                Text("building index..." if _building else "no sessions in this window", style="dim"),
             )
             return
 
