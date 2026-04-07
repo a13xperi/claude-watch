@@ -3024,14 +3024,19 @@ def _score_window(window_start_ts, window_reset_ts):
                     window_projects.add(proj)
         except Exception:
             pass
-    ship_score = _score_dimension(total_commits, 5)
-
     for e in window_entries:
         if e.get("type") == "tool_use":
             d = (e.get("directive") or "").lower()
             for p in ("atlas", "claude-watch", "paperclip", "openclaw", "frank", "kaa"):
                 if p in d:
                     window_projects.add(p)
+
+    # Augment with cycle monitor items
+    ci_done, ci_projects = _get_cycle_items_for_scoring(window_start_ts.isoformat())
+    total_commits += ci_done
+    window_projects |= ci_projects
+
+    ship_score = _score_dimension(total_commits, 5)
     breadth_score = _score_dimension(len(window_projects), 4)
 
     drain_rates = []
@@ -3633,3 +3638,214 @@ def _estimate_pct_for_tokens(tokens_k):
     """
     pct = tokens_k * 1000 / 5500
     return round(pct, 1)
+
+
+# -- Cycle Monitor (Supabase-backed freeform items per 5h window) -----------
+
+
+def _get_cycle_items(window_start):
+    # type: (str) -> List[dict]
+    """GET cycle_items for a given window_start."""
+    import urllib.request
+    config = _get_battlestation_config()
+    url = (
+        f"{_SUPABASE_URL}/cycle_items"
+        f"?user_id=eq.{config['user_id']}"
+        f"&window_start=eq.{window_start}"
+        f"&order=created_at.asc"
+    )
+    try:
+        req = urllib.request.Request(url, headers={
+            "apikey": _SUPABASE_KEY,
+            "Authorization": f"Bearer {_SUPABASE_KEY}",
+        })
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            return json.loads(resp.read())
+    except Exception:
+        return []
+
+
+def _post_cycle_item(window_start, category, title, project=""):
+    # type: (str, str, str, str) -> Optional[dict]
+    """POST a new cycle_item. Returns the inserted row or None."""
+    import urllib.request
+    config = _get_battlestation_config()
+    payload = {
+        "user_id": config["user_id"],
+        "window_start": window_start,
+        "category": category,
+        "title": title,
+        "status": "open",
+        "project": project,
+    }
+    try:
+        data = json.dumps(payload).encode()
+        req = urllib.request.Request(
+            f"{_SUPABASE_URL}/cycle_items",
+            data=data,
+            headers={
+                "apikey": _SUPABASE_KEY,
+                "Authorization": f"Bearer {_SUPABASE_KEY}",
+                "Content-Type": "application/json",
+                "Prefer": "return=representation",
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            rows = json.loads(resp.read())
+            return rows[0] if rows else None
+    except Exception:
+        return None
+
+
+def _update_cycle_item(item_id, updates):
+    # type: (str, dict) -> bool
+    """PATCH a cycle_item by id. Returns True on success."""
+    import urllib.request
+    try:
+        data = json.dumps(updates).encode()
+        req = urllib.request.Request(
+            f"{_SUPABASE_URL}/cycle_items?id=eq.{item_id}",
+            data=data,
+            headers={
+                "apikey": _SUPABASE_KEY,
+                "Authorization": f"Bearer {_SUPABASE_KEY}",
+                "Content-Type": "application/json",
+            },
+            method="PATCH",
+        )
+        urllib.request.urlopen(req, timeout=5)
+        return True
+    except Exception:
+        return False
+
+
+def _delete_cycle_item(item_id):
+    # type: (str) -> bool
+    """DELETE a cycle_item by id. Returns True on success."""
+    import urllib.request
+    try:
+        req = urllib.request.Request(
+            f"{_SUPABASE_URL}/cycle_items?id=eq.{item_id}",
+            headers={
+                "apikey": _SUPABASE_KEY,
+                "Authorization": f"Bearer {_SUPABASE_KEY}",
+            },
+            method="DELETE",
+        )
+        urllib.request.urlopen(req, timeout=5)
+        return True
+    except Exception:
+        return False
+
+
+def _get_recent_cycle_summaries(limit=3):
+    # type: (int) -> List[dict]
+    """Summarise recent completed cycles with item counts."""
+    cycles = _get_all_cycles()
+    summaries = []
+    for c in cycles:
+        if c.get("is_current"):
+            continue
+        items = _get_cycle_items(c["cycle_id"])
+        items_done = sum(1 for i in items if i.get("status") == "done")
+        items_rolled = sum(1 for i in items if i.get("status") == "rolled")
+        projects = list({i.get("project", "") for i in items if i.get("project")})
+        try:
+            dt = datetime.fromisoformat(c["cycle_id"].replace("Z", "+00:00"))
+            when_str = dt.astimezone().strftime(f"%b {dt.day} %-I%p").replace("AM", "am").replace("PM", "pm")
+        except Exception:
+            when_str = c["cycle_id"][:16]
+        summaries.append({
+            "window_start": c["cycle_id"],
+            "stars": c.get("stars", ""),
+            "items_total": len(items),
+            "items_done": items_done,
+            "items_rolled": items_rolled,
+            "projects": projects,
+            "when_str": when_str,
+        })
+        if len(summaries) >= limit:
+            break
+    return summaries
+
+
+def _get_cycle_items_for_scoring(window_start):
+    # type: (str) -> Tuple[int, set]
+    """Return (done_count, project_set) for scoring integration."""
+    items = _get_cycle_items(window_start)
+    done_count = sum(1 for i in items if i.get("status") == "done")
+    projects = {i.get("project", "") for i in items if i.get("project")}
+    return done_count, projects
+
+
+def _roll_cycle_items(old_window_start, new_window_start):
+    # type: (str, str) -> int
+    """Roll open items from old window to new window. Returns count rolled."""
+    import urllib.request
+    config = _get_battlestation_config()
+    # Fetch open items from old window
+    url = (
+        f"{_SUPABASE_URL}/cycle_items"
+        f"?user_id=eq.{config['user_id']}"
+        f"&window_start=eq.{old_window_start}"
+        f"&status=eq.open"
+        f"&order=created_at.asc"
+    )
+    try:
+        req = urllib.request.Request(url, headers={
+            "apikey": _SUPABASE_KEY,
+            "Authorization": f"Bearer {_SUPABASE_KEY}",
+        })
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            open_items = json.loads(resp.read())
+    except Exception:
+        return 0
+
+    rolled = 0
+    now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    for item in open_items:
+        # Clone to new window
+        clone_payload = {
+            "user_id": config["user_id"],
+            "window_start": new_window_start,
+            "category": item.get("category", ""),
+            "title": item.get("title", ""),
+            "status": "open",
+            "project": item.get("project", ""),
+        }
+        try:
+            data = json.dumps(clone_payload).encode()
+            req = urllib.request.Request(
+                f"{_SUPABASE_URL}/cycle_items",
+                data=data,
+                headers={
+                    "apikey": _SUPABASE_KEY,
+                    "Authorization": f"Bearer {_SUPABASE_KEY}",
+                    "Content-Type": "application/json",
+                },
+                method="POST",
+            )
+            urllib.request.urlopen(req, timeout=5)
+        except Exception:
+            continue
+
+        # Mark original as rolled
+        try:
+            patch_data = json.dumps({"status": "rolled", "resolved_at": now_iso}).encode()
+            req = urllib.request.Request(
+                f"{_SUPABASE_URL}/cycle_items?id=eq.{item['id']}",
+                data=patch_data,
+                headers={
+                    "apikey": _SUPABASE_KEY,
+                    "Authorization": f"Bearer {_SUPABASE_KEY}",
+                    "Content-Type": "application/json",
+                },
+                method="PATCH",
+            )
+            urllib.request.urlopen(req, timeout=5)
+            rolled += 1
+        except Exception:
+            pass
+
+    return rolled

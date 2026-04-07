@@ -288,20 +288,7 @@ class ActiveSessionsTable(DataTable):
             else:
                 co_name, co_style = _project_to_company(project)
 
-            self.add_row(
-                Text(start_str, style="dim"),
-                Text.from_markup(f"[bold green]● [/bold green][cyan]{sid}[/cyan]"),
-                Text(source, style=src_color),
-                Text(co_name, style=co_style),
-                Text(project, style="dim"),
-                Text(mdl, style=mdl_style),
-                Text(age, style="dim"),
-                Text(delta, style=color),
-                Text(directive),
-                key=f"active-{pid}",
-            )
-
-            # Sub-row: live call state
+            # Compute state BEFORE main row so dot color reflects live activity
             cpu = _get_pid_cpu(pid)
             lc = last_call.get(sid)
             if lc:
@@ -316,12 +303,29 @@ class ActiveSessionsTable(DataTable):
             # State detection
             if secs_since is not None and secs_since < 15:
                 state_txt = Text(f">> {tool_name[:12]}", style="bold green")
+                dot_color = "bold green"
             elif cpu > 20:
                 state_txt = Text("thinking...", style="bold yellow")
+                dot_color = "bold yellow"
             elif secs_since is not None and secs_since < 120:
                 state_txt = Text(f"~ {tool_name[:12]}", style="dim")
+                dot_color = "green"
             else:
                 state_txt = Text("idle", style="dim")
+                dot_color = "green"
+
+            self.add_row(
+                Text(start_str, style="dim"),
+                Text.from_markup(f"[{dot_color}]\u25cf [/{dot_color}][cyan]{sid}[/cyan]"),
+                Text(source, style=src_color),
+                Text(co_name, style=co_style),
+                Text(project, style="dim"),
+                Text(mdl, style=mdl_style),
+                Text(age, style="dim"),
+                Text(delta, style=color),
+                Text(directive),
+                key=f"active-{pid}",
+            )
 
             # Elapsed
             if secs_since is not None:
@@ -2245,6 +2249,515 @@ class LeaderboardScreen(Screen):
         self.app.pop_screen()
 
 
+# ── Cycles screens ──────────────────────────────────────────────────────────
+
+
+class CyclesScreen(Screen):
+    """Overview of all 5-hour usage cycles (windows)."""
+
+    BINDINGS = [
+        Binding("escape", "pop_screen", "Back"),
+        Binding("q", "pop_screen", "Back"),
+        Binding("p", "show_plan", "Plan"),
+    ]
+
+    def compose(self) -> ComposeResult:
+        yield Static(id="cycles-current")
+        yield DataTable(id="cycles-list")
+
+    def on_mount(self):
+        from claude_watch_data import (
+            _get_current_cycle, _get_all_cycles, _get_cycle_sessions,
+            _get_cycle_plan, _countdown, _format_cost, _current_pct,
+        )
+
+        current = _get_current_cycle()
+        all_cycles = _get_all_cycles()
+
+        # ── Current cycle panel ──
+        panel = self.query_one("#cycles-current", Static)
+        if current:
+            five, _seven, five_reset, _sr = _current_pct()
+            reset_str = _countdown(five_reset) if five_reset else "?"
+            try:
+                burn_pct = float(five)
+            except (ValueError, TypeError):
+                burn_pct = 0.0
+            bar_len = 20
+            filled = int(burn_pct / 100 * bar_len)
+            bar = "\u2588" * filled + "\u2591" * (bar_len - filled)
+            bar_color = "green" if burn_pct < 50 else ("yellow" if burn_pct < 80 else "red")
+
+            # Unique projects
+            sessions = _get_cycle_sessions(current["cycle_id"])
+            projects = sorted({s.get("project", "?") for s in sessions if s.get("project")})
+            proj_str = ", ".join(projects[:5]) if projects else "\u2014"
+
+            plan = _get_cycle_plan(current["cycle_id"])
+            plan_str = "[green]plan set[/green]" if plan else "[dim]no plan[/dim]"
+
+            panel.update(
+                f"[bold]CURRENT CYCLE[/bold]  resets in {reset_str}\n"
+                f"  [{bar_color}]{bar}[/{bar_color}] {burn_pct:.0f}%  "
+                f"[bold]{current['session_count']}[/bold] sessions  "
+                f"Projects: {proj_str}  {plan_str}  "
+                f"Cost: {current['cost_str']}  "
+                f"Gravity: [cyan]{current['gravity_label'] or chr(8212)}[/cyan]"
+            )
+        else:
+            panel.update("[dim]No active cycle[/dim]")
+
+        # ── Past cycles table ──
+        dt = self.query_one("#cycles-list", DataTable)
+        dt.cursor_type = "row"
+        dt.zebra_stripes = True
+        dt.add_column("#", width=4)
+        dt.add_column("When", width=18)
+        dt.add_column("Peak%", width=7)
+        dt.add_column("Sessions", width=9)
+        dt.add_column("Projects", width=20)
+        dt.add_column("Stars", width=10)
+        dt.add_column("Cost", width=8)
+        dt.add_column("Gravity", width=14)
+
+        self._cycle_map = {}  # row_key -> cycle dict
+        rank = 0
+        for c in all_cycles:
+            if c.get("is_current"):
+                continue
+            rank += 1
+            try:
+                start_dt = datetime.fromisoformat(c["start_ts"])
+                when_str = start_dt.strftime("%b %-d %-I:%M %p")
+            except Exception:
+                when_str = c["start_ts"][:16]
+
+            peak = c.get("peak_five_pct", 0)
+            peak_color = "green" if peak >= 80 else ("yellow" if peak >= 40 else "dim")
+
+            # Projects from sessions
+            sessions = _get_cycle_sessions(c["cycle_id"])
+            projects = sorted({s.get("project", "?") for s in sessions if s.get("project")})
+            proj_str = ", ".join(projects[:3]) if projects else "\u2014"
+
+            row_key = f"cyc-{rank}"
+            self._cycle_map[row_key] = c
+            dt.add_row(
+                Text(str(rank), justify="right"),
+                Text(when_str),
+                Text(f"{peak:.0f}%", style=peak_color, justify="right"),
+                Text(str(c.get("session_count", 0)), justify="right"),
+                Text(proj_str),
+                Text(c.get("stars", ""), style="yellow"),
+                Text(c.get("cost_str", "")),
+                Text(c.get("gravity_label", "") or "\u2014", style="cyan"),
+                key=row_key,
+            )
+
+        if rank == 0:
+            dt.add_row("", Text("No past cycles recorded yet", style="dim"),
+                        "", "", "", "", "", "")
+
+    def on_data_table_row_selected(self, event):
+        row_key = str(event.row_key.value) if hasattr(event.row_key, 'value') else str(event.row_key)
+        cycle = self._cycle_map.get(row_key)
+        if cycle:
+            self.app.push_screen(CycleDetailScreen(cycle))
+
+    def action_show_plan(self):
+        self.app.push_screen(CyclePlanScreen())
+
+    def action_pop_screen(self):
+        self.app.pop_screen()
+
+
+class CycleDetailScreen(Screen):
+    """Detailed view of a single 5-hour cycle."""
+
+    BINDINGS = [
+        Binding("escape", "pop_screen", "Back"),
+        Binding("q", "pop_screen", "Back"),
+    ]
+
+    def __init__(self, cycle):
+        super().__init__()
+        self.cycle = cycle
+
+    def compose(self) -> ComposeResult:
+        yield Static(id="cdetail-header")
+        yield Static(id="cdetail-scores")
+        yield Static(id="cdetail-accomplishments")
+        yield DataTable(id="cdetail-sessions")
+        yield Static(id="cdetail-plan")
+
+    def on_mount(self):
+        from claude_watch_data import (
+            _get_cycle_sessions, _get_cycle_plan, _stars_display,
+            _format_cost, _estimate_cost, _countdown,
+        )
+
+        c = self.cycle
+
+        # ── Header ──
+        try:
+            start_dt = datetime.fromisoformat(c["start_ts"])
+            end_dt = datetime.fromisoformat(c["end_ts"])
+            start_str = start_dt.strftime("%b %-d %-I:%M %p")
+            end_str = end_dt.strftime("%-I:%M %p")
+        except Exception:
+            start_str = c["start_ts"][:16]
+            end_str = c["end_ts"][:16]
+
+        stars = c.get("stars", "")
+        acc = c.get("accomplishments", {})
+        commits = len(acc.get("git_commits", []))
+        peak = c.get("peak_five_pct", 0)
+
+        self.query_one("#cdetail-header", Static).update(
+            f"[bold]CYCLE:[/bold] {start_str} \u2014 {end_str}  {stars}\n"
+            f"  Peak: [bold]{peak:.0f}%[/bold]  "
+            f"Sessions: [bold]{c.get('session_count', 0)}[/bold]  "
+            f"Cost: [bold]{c.get('cost_str', '')}[/bold]  "
+            f"Commits: [bold]{commits}[/bold]  "
+            f"[dim](Escape / q to go back)[/dim]"
+        )
+
+        # ── Scores ──
+        ws = c.get("window_score")
+        scores_panel = self.query_one("#cdetail-scores", Static)
+        if ws:
+            dims = []
+            for dim_key in ("burn", "parallel", "ship", "breadth", "velocity"):
+                val = ws.get(dim_key, 0)
+                dim_stars = _stars_display(val)
+                color = "green" if val >= 4 else ("yellow" if val >= 2.5 else "red")
+                dims.append(f"{dim_key.capitalize()}: [{color}]{dim_stars} ({val})[/{color}]")
+            scores_panel.update("  ".join(dims))
+        else:
+            scores_panel.update("[dim]No window score available[/dim]")
+
+        # ── Accomplishments ──
+        acc_panel = self.query_one("#cdetail-accomplishments", Static)
+        files_edited = len(acc.get("files_edited", []))
+        files_created = len(acc.get("files_created", []))
+        errors = acc.get("errors", 0)
+        skills = acc.get("skills", [])
+        turns = acc.get("turn_count", 0)
+
+        acc_lines = []
+        err_style = "red" if errors else "dim"
+        acc_lines.append(
+            f"  Files edited: [bold]{files_edited}[/bold]  "
+            f"Files created: [bold]{files_created}[/bold]  "
+            f"Commits: [bold]{commits}[/bold]  "
+            f"Errors: [bold {err_style}]{errors}[/bold {err_style}]  "
+            f"Turns: [bold]{turns}[/bold]"
+        )
+        if skills:
+            acc_lines.append(f"  Skills: {', '.join(skills[:10])}")
+        acc_panel.update("\n".join(acc_lines))
+
+        # ── Sessions DataTable ──
+        dt = self.query_one("#cdetail-sessions", DataTable)
+        dt.cursor_type = "row"
+        dt.zebra_stripes = True
+        dt.add_column("Session", width=12)
+        dt.add_column("Project", width=18)
+        dt.add_column("Duration", width=10)
+        dt.add_column("Tokens", width=10)
+        dt.add_column("Cost", width=8)
+        dt.add_column("Directive", width=30)
+
+        sessions = _get_cycle_sessions(c["cycle_id"])
+        self._session_map = {}  # row_key -> session dict
+
+        for i, s in enumerate(sessions):
+            sid = s.get("session_id", "?")
+            short_sid = sid[:10] if len(sid) > 10 else sid
+            project = s.get("project", "\u2014")
+            tokens = s.get("output_tokens", 0) or 0
+            model = s.get("model", "")
+            cost = _estimate_cost(tokens, model)
+            directive = s.get("directive", "") or ""
+
+            # Duration
+            try:
+                first = s.get("first_ts")
+                last = s.get("last_ts")
+                if first and last:
+                    if not isinstance(first, datetime):
+                        first = datetime.fromisoformat(str(first).replace("Z", "+00:00"))
+                    if not isinstance(last, datetime):
+                        last = datetime.fromisoformat(str(last).replace("Z", "+00:00"))
+                    dur_secs = int((last - first).total_seconds())
+                    dur_m = dur_secs // 60
+                    dur_str = f"{dur_m}m" if dur_m < 60 else f"{dur_m // 60}h{dur_m % 60:02d}m"
+                else:
+                    dur_str = "\u2014"
+            except Exception:
+                dur_str = "\u2014"
+
+            tok_str = f"{tokens // 1000}k" if tokens >= 1000 else str(tokens)
+
+            row_key = f"csess-{i}"
+            self._session_map[row_key] = s
+            dt.add_row(
+                Text(short_sid, style="cyan"),
+                Text(project),
+                Text(dur_str, justify="right"),
+                Text(tok_str, justify="right"),
+                Text(_format_cost(cost)),
+                Text(directive[:30], style="dim"),
+                key=row_key,
+            )
+
+        if not sessions:
+            dt.add_row(
+                Text("\u2014", style="dim"), Text("No sessions in this cycle", style="dim"),
+                Text(""), Text(""), Text(""), Text(""),
+            )
+
+        # ── Plan ──
+        plan_panel = self.query_one("#cdetail-plan", Static)
+        plan = _get_cycle_plan(c["cycle_id"])
+        if plan:
+            tasks = plan.get("tasks", [])
+            if tasks:
+                lines = ["[bold]PLAN[/bold]"]
+                for t in tasks:
+                    status = t.get("status", "pending")
+                    icon = "\u2713" if status == "done" else ("\u2298" if status == "skipped" else "\u25cb")
+                    color = "green" if status == "done" else ("dim" if status == "skipped" else "white")
+                    lines.append(
+                        f"  [{color}]{icon} {t.get('title', '?')}  "
+                        f"({t.get('project', '?')})  "
+                        f"est:{t.get('est_pct', 0):.0f}%  "
+                        f"act:{t.get('act_pct', 0):.0f}%[/{color}]"
+                    )
+                plan_panel.update("\n".join(lines))
+            else:
+                plan_panel.update("[dim]Plan exists but has no tasks[/dim]")
+        else:
+            plan_panel.update("[dim]No plan for this cycle[/dim]")
+
+    def on_data_table_row_selected(self, event):
+        row_key = str(event.row_key.value) if hasattr(event.row_key, 'value') else str(event.row_key)
+        s = self._session_map.get(row_key)
+        if s:
+            self.app.push_screen(SessionDrillDown(
+                session_id=s.get("session_id", ""),
+                directive=s.get("directive", ""),
+                project=s.get("project", "\u2014"),
+            ))
+
+    def action_pop_screen(self):
+        self.app.pop_screen()
+
+
+class CyclePlanScreen(Screen):
+    """Plan tasks for the current 5-hour cycle."""
+
+    BINDINGS = [
+        Binding("escape", "pop_screen", "Back"),
+        Binding("q", "pop_screen", "Back"),
+        Binding("a", "add_task", "Add"),
+        Binding("d", "done_task", "Done"),
+        Binding("s", "skip_task", "Skip"),
+    ]
+
+    def compose(self) -> ComposeResult:
+        yield Static(id="cplan-header")
+        yield DataTable(id="cplan-tasks")
+        yield DataTable(id="cplan-available")
+
+    def on_mount(self):
+        self._load_and_render()
+
+    def _load_and_render(self):
+        from claude_watch_data import (
+            _get_current_cycle, _get_cycle_plan, _save_cycle_plan,
+            _get_plannable_tasks, _current_pct, _format_cost,
+        )
+
+        current = _get_current_cycle()
+        header = self.query_one("#cplan-header", Static)
+
+        if not current:
+            header.update("[dim]No active cycle \u2014 start a session to create one[/dim]")
+            return
+
+        self._cycle_id = current["cycle_id"]
+        plan = _get_cycle_plan(self._cycle_id)
+        if not plan:
+            plan = {"cycle_id": self._cycle_id, "tasks": [], "budget_pct": 100.0}
+        self._plan = plan
+
+        # Budget calculation
+        five, _seven, _fr, _sr = _current_pct()
+        try:
+            burned = float(five)
+        except (ValueError, TypeError):
+            burned = 0.0
+
+        allocated = sum(t.get("est_pct", 0) for t in plan.get("tasks", []))
+        remaining = 100.0 - burned
+        plan_remaining = remaining - allocated
+
+        bar_len = 30
+        burned_chars = int(burned / 100 * bar_len)
+        alloc_chars = int(allocated / 100 * bar_len)
+        free_chars = bar_len - burned_chars - alloc_chars
+        if free_chars < 0:
+            free_chars = 0
+            alloc_chars = bar_len - burned_chars
+
+        _full = '\u2588'
+        _light = '\u2591'
+        bar = (
+            f"[red]{_full * burned_chars}[/red]"
+            f"[yellow]{_full * alloc_chars}[/yellow]"
+            f"[green]{_light * free_chars}[/green]"
+        )
+
+        header.update(
+            f"[bold]CYCLE PLAN[/bold]  {bar}  "
+            f"Burned: [red]{burned:.0f}%[/red]  "
+            f"Allocated: [yellow]{allocated:.0f}%[/yellow]  "
+            f"Free: [green]{plan_remaining:.0f}%[/green]\n"
+            f"  [dim](a=add task  d=mark done  s=skip  Escape=back)[/dim]"
+        )
+
+        # ── Planned tasks table ──
+        pt = self.query_one("#cplan-tasks", DataTable)
+        pt.clear(columns=True)
+        pt.cursor_type = "row"
+        pt.zebra_stripes = True
+        pt.add_column("#", width=4)
+        pt.add_column("Status", width=8)
+        pt.add_column("Task", width=35)
+        pt.add_column("Project", width=15)
+        pt.add_column("Est%", width=6)
+        pt.add_column("Act%", width=6)
+
+        tasks = plan.get("tasks", [])
+        for i, t in enumerate(tasks):
+            status = t.get("status", "pending")
+            icon = "\u2713 done" if status == "done" else ("\u2298 skip" if status == "skipped" else "\u25cb pend")
+            color = "green" if status == "done" else ("dim" if status == "skipped" else "white")
+
+            pt.add_row(
+                Text(str(i + 1), justify="right"),
+                Text(icon, style=color),
+                Text(t.get("title", "?")[:35]),
+                Text(t.get("project", "?")),
+                Text(f"{t.get('est_pct', 0):.0f}%", justify="right"),
+                Text(f"{t.get('act_pct', 0):.0f}%", justify="right"),
+                key=f"ptask-{i}",
+            )
+
+        if not tasks:
+            pt.add_row("", Text("No tasks planned \u2014 press 'a' on available tasks below", style="dim"),
+                        "", "", "", "")
+
+        # ── Available tasks table ──
+        at = self.query_one("#cplan-available", DataTable)
+        at.clear(columns=True)
+        at.cursor_type = "row"
+        at.zebra_stripes = True
+        at.add_column("ID", width=6)
+        at.add_column("Title", width=35)
+        at.add_column("Project", width=15)
+        at.add_column("~kT", width=6)
+        at.add_column("Est%", width=6)
+        at.add_column("Tier", width=6)
+        at.add_column("Pri", width=5)
+
+        available = _get_plannable_tasks()
+        # Filter out already-planned task IDs
+        planned_ids = {t.get("id") for t in tasks}
+        self._available_tasks = []
+        for t in available:
+            if t.get("id") in planned_ids:
+                continue
+            self._available_tasks.append(t)
+            at.add_row(
+                Text(str(t.get("id", "?"))[:6]),
+                Text(t.get("title", "?")[:35]),
+                Text(t.get("project", "?")),
+                Text(str(t.get("est_tokens_k", "?"))),
+                Text(f"{t.get('est_pct', 0):.0f}%", justify="right"),
+                Text(str(t.get("tier", "?"))),
+                Text(str(t.get("priority", "?"))),
+                key=f"avail-{t.get('id', '')}",
+            )
+
+        if not self._available_tasks:
+            at.add_row("", Text("No ready tasks in Build Tracker", style="dim"),
+                        "", "", "", "", "")
+
+    def action_add_task(self):
+        from claude_watch_data import _save_cycle_plan
+        at = self.query_one("#cplan-available", DataTable)
+        if not at.row_count or not hasattr(self, '_available_tasks') or not self._available_tasks:
+            return
+
+        # Find the task by cursor position
+        try:
+            idx = at.cursor_row
+            if idx >= len(self._available_tasks):
+                return
+            task = self._available_tasks[idx]
+        except (IndexError, AttributeError):
+            return
+
+        new_entry = {
+            "id": task.get("id"),
+            "title": task.get("title", "?"),
+            "project": task.get("project", "?"),
+            "est_pct": task.get("est_pct", 0),
+            "status": "pending",
+            "act_pct": 0,
+        }
+        self._plan.setdefault("tasks", []).append(new_entry)
+        _save_cycle_plan(self._plan)
+        self._load_and_render()
+
+    def action_done_task(self):
+        from claude_watch_data import _save_cycle_plan
+        pt = self.query_one("#cplan-tasks", DataTable)
+        tasks = self._plan.get("tasks", [])
+        if not pt.row_count or not tasks:
+            return
+        try:
+            idx = pt.cursor_row
+            if idx >= len(tasks):
+                return
+            tasks[idx]["status"] = "done"
+            _save_cycle_plan(self._plan)
+            self._load_and_render()
+        except (IndexError, AttributeError):
+            return
+
+    def action_skip_task(self):
+        from claude_watch_data import _save_cycle_plan
+        pt = self.query_one("#cplan-tasks", DataTable)
+        tasks = self._plan.get("tasks", [])
+        if not pt.row_count or not tasks:
+            return
+        try:
+            idx = pt.cursor_row
+            if idx >= len(tasks):
+                return
+            tasks[idx]["status"] = "skipped"
+            _save_cycle_plan(self._plan)
+            self._load_and_render()
+        except (IndexError, AttributeError):
+            return
+
+    def action_pop_screen(self):
+        self.app.pop_screen()
+
+
 class NavBar(Horizontal):
     """Top navigation bar with clickable buttons."""
 
@@ -2254,6 +2767,7 @@ class NavBar(Horizontal):
         yield Button("Sessions", id="nav-sessions", variant="default")
         yield Button("Projects", id="nav-projects", variant="default")
         yield Button("Leaderboard", id="nav-leaderboard", variant="default")
+        yield Button("Cycles", id="nav-cycles", variant="default")
         yield Button("Usage", id="nav-usage", variant="default")
         yield Button("MCP", id="nav-mcp", variant="default")
 
@@ -2277,6 +2791,7 @@ class ClaudeWatchApp(App):
         Binding("a", "toggle_accounts", "Accounts"),
         Binding("c", "show_capacity", "Capacity"),
         Binding("h", "toggle_health", "Health"),
+        Binding("y", "show_cycles", "Cycles"),
         Binding("slash", "start_search", "Search"),
         Binding("tab", "focus_next", "Next panel", show=False),
         Binding("shift+tab", "focus_previous", "Prev panel", show=False),
@@ -2407,6 +2922,9 @@ class ClaudeWatchApp(App):
     def action_show_capacity(self):
         self.push_screen(AccountCapacityScreen())
 
+    def action_show_cycles(self):
+        self.push_screen(CyclesScreen())
+
     def on_button_pressed(self, event: Button.Pressed) -> None:
         btn_id = event.button.id or ""
         if btn_id == "nav-dashboard":
@@ -2424,6 +2942,8 @@ class ClaudeWatchApp(App):
             self.action_show_usage()
         elif btn_id == "nav-mcp":
             self.action_show_mcp()
+        elif btn_id == "nav-cycles":
+            self.action_show_cycles()
 
     def action_toggle_accounts(self):
         acct = self.query_one("#account-capacity", AccountCapacityPanel)

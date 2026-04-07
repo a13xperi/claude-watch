@@ -67,7 +67,7 @@ Screen {
 /* ── Session Narrative (what was built in this 5h window) ── */
 #session-narrative {
     height: auto;
-    max-height: 12;
+    max-height: 18;
     border: solid green;
     border-title-color: white;
     border-title-style: bold;
@@ -107,10 +107,23 @@ Screen {
     max-height: 14;
 }
 
-/* ── Passive Drain (shrunk) ── */
-#drain {
+/* ── Drain + Agents row ── */
+#drain-row {
+    layout: horizontal;
     height: auto;
-    max-height: 10;
+    max-height: 14;
+}
+
+#drain {
+    width: 1fr;
+    height: auto;
+    max-height: 14;
+}
+
+#agents {
+    width: 1fr;
+    height: auto;
+    max-height: 14;
 }
 
 /* ── Burndown chart ── */
@@ -260,3 +273,28 @@ DataTable > .datatable--header {
     border: solid yellow;
     border-title-color: white;
 }
+
+/* ── Cycles screen ── */
+#cycles-current {
+    height: auto;
+    max-height: 5;
+    padding: 0 1;
+}
+
+#cycles-list {
+    height: 1fr;
+    border: solid cyan;
+    border-title-color: white;
+}
+
+/* ── Cycle detail ── */
+#cdetail-header { height: auto; max-height: 3; padding: 0 1; }
+#cdetail-scores { height: auto; max-height: 2; padding: 0 1; }
+#cdetail-accomplishments { height: auto; max-height: 5; padding: 0 1; }
+#cdetail-sessions { height: 1fr; min-height: 8; border: solid dodgerblue; }
+#cdetail-plan { height: auto; max-height: 8; padding: 0 1; }
+
+/* ── Cycle plan ── */
+#cplan-header { height: auto; max-height: 4; padding: 0 1; }
+#cplan-tasks { height: auto; max-height: 12; border: solid green; }
+#cplan-available { height: 1fr; border: solid yellow; }
