@@ -448,6 +448,7 @@ def _detect_source(pid):
 
 # ── ledger ───────────────────────────────────────────────────────────────────
 
+_MAX_LEDGER_CACHE = 10_000
 _ledger_cache_time = 0.0
 _ledger_cache = []
 
@@ -473,6 +474,8 @@ def _load_ledger(last_n=None):
                             pass
         except Exception:
             pass
+        if len(entries) > _MAX_LEDGER_CACHE:
+            entries = entries[-_MAX_LEDGER_CACHE:]
         _ledger_cache = entries
         _ledger_cache_time = mtime
     if last_n is not None:
