@@ -83,8 +83,8 @@ class LazyView(ScrollableContainer):
 
 def _start_hot_reload_watcher(app):
     # type: (Any) -> None
-    """Watch *.py files in the same directory. On any mtime change, restart the process."""
-    watch_dir = Path(__file__).parent
+    """Watch source files for changes. Signal the app instead of auto-restarting."""
+    watch_dir = Path(__file__).resolve().parent
 
     def _snapshot():
         # type: () -> Dict[Path, float]
@@ -94,6 +94,11 @@ def _start_hot_reload_watcher(app):
                 result[p] = p.stat().st_mtime
             except Exception:
                 pass
+        tcss = watch_dir / "claude_watch_tui.tcss"
+        try:
+            result[tcss] = tcss.stat().st_mtime
+        except Exception:
+            pass
         return result
 
     mtimes = _snapshot()
@@ -101,8 +106,41 @@ def _start_hot_reload_watcher(app):
         time.sleep(2)
         current = _snapshot()
         if current != mtimes:
-            app.call_from_thread(app._trigger_reload)
-            return
+            mtimes = current
+            app.call_from_thread(app._signal_files_changed)
+
+
+_BACKUP_DIR = Path(f"/tmp/claude-watch-backup-{os.getpid()}")
+_SOURCE_DIR = Path(__file__).resolve().parent
+_BACKUP_FILES = ["claude_watch_tui.py", "claude_watch_data.py", "claude_watch.py", "claude_watch_tui.tcss"]
+
+
+def _backup_working_files():
+    """Snapshot current source files as last-known-good backup."""
+    try:
+        _BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+        import shutil
+        for fname in _BACKUP_FILES:
+            src = _SOURCE_DIR / fname
+            if src.exists():
+                shutil.copy2(str(src), str(_BACKUP_DIR / fname))
+    except Exception:
+        pass
+
+
+def _restore_backup_files():
+    """Restore backed-up files over current files. Returns True if restored."""
+    import shutil
+    if not _BACKUP_DIR.exists():
+        return False
+    restored = False
+    for fname in _BACKUP_FILES:
+        bak = _BACKUP_DIR / fname
+        dst = _SOURCE_DIR / fname
+        if bak.exists():
+            shutil.copy2(str(bak), str(dst))
+            restored = True
+    return restored
 
 
 def _project_to_company(project: str) -> tuple[str, str]:
@@ -1219,6 +1257,51 @@ class SystemHealthPanel(Static):
         self.update(Panel(t, title="[bold]System Health[/bold]", border_style="magenta"))
 
 
+
+class ReloadBanner(Static):
+    """Banner shown when source files have changed. Click or press Shift+R to reload."""
+
+    DEFAULT_CSS = """
+    ReloadBanner {
+        display: none;
+        height: 1;
+        dock: top;
+        background: $warning;
+        color: $text;
+        text-align: center;
+        text-style: bold;
+    }
+    ReloadBanner.reverted {
+        background: $error;
+    }
+    """
+
+    def __init__(self, **kwargs):
+        super().__init__("", **kwargs)
+        self._mode = "hidden"
+
+    def show_pending(self):
+        self._mode = "pending"
+        self.update("[reverse] FILES CHANGED [/reverse]  Press [bold]Shift+R[/bold] to reload build")
+        self.remove_class("reverted")
+        self.display = True
+
+    def show_reverted(self, error_msg=""):
+        self._mode = "reverted"
+        short_err = error_msg.strip().split("\n")[-1][:80] if error_msg else "import error"
+        self.update(f"[reverse] BUILD BROKEN \u2014 REVERTED [/reverse]  {short_err}")
+        self.add_class("reverted")
+        self.display = True
+
+    def hide_banner(self):
+        self._mode = "hidden"
+        self.display = False
+
+    def on_click(self):
+        if self._mode == "pending":
+            self.app.action_reload_build()
+
+
 # ── Navigation bar ───────────────────────────────────────────────────────────
 
 
@@ -1691,8 +1774,8 @@ class SessionTasksView(LazyView):
 
     BINDINGS = [
         Binding("n", "focus_add", "New"),
-        Binding("e", "edit_item", "Edit"),
-        Binding("enter", "toggle_done", "Done"),
+        Binding("enter", "edit_item", "Edit"),
+        Binding("x", "toggle_done", "Done"),
         Binding("r", "roll_item", "Roll"),
         Binding("d", "delete_item", "Delete"),
         Binding("slash", "start_filter", "Filter"),
@@ -1709,6 +1792,7 @@ class SessionTasksView(LazyView):
             yield Button("Idea \U0001f4a1", id="cm-cat-idea", classes="cm-cat", variant="default")
             yield Button("Dir \U0001f9ed", id="cm-cat-dir", classes="cm-cat", variant="default")
         with Horizontal(id="cm-project-row"):
+            yield Button("All", id="cm-proj-all", classes="cm-proj")
             yield Button("None", id="cm-proj-none", classes="cm-proj", variant="primary")
             yield Button("Atlas", id="cm-proj-atlas", classes="cm-proj")
             yield Button("CW", id="cm-proj-claude-watch", classes="cm-proj")
@@ -1727,6 +1811,7 @@ class SessionTasksView(LazyView):
         self._editing_id = None
         self._filtering = False
         self._filter_text = ""
+        self._show_all_windows = False
 
         # Compute window_start from burndown data
         bd = _get_burndown_data()
@@ -1772,7 +1857,7 @@ class SessionTasksView(LazyView):
         )
 
         # Fetch items
-        self._items = _get_cycle_items(self._window_start)
+        self._items = _get_cycle_items(self._window_start, all_windows=self._show_all_windows)
 
         # Apply filter if active
         display_items = self._items
@@ -1850,10 +1935,11 @@ class SessionTasksView(LazyView):
         stars = cycle.get("stars", "") if cycle else ""
 
         filter_str = f"  [yellow][filter: \"{self._filter_text}\"][/yellow]" if self._filter_text else ""
+        mode_label = "[bold yellow]ALL CYCLES[/bold yellow]" if self._show_all_windows else f"resets in {time_str}  {stars}"
         self.query_one("#cm-header", Static).update(
-            f"[bold]CYCLE MONITOR[/bold]  resets in {time_str}  {stars}  "
+            f"[bold]CYCLE MONITOR v2[/bold]  {mode_label}  "
             f"[green]{open_count} open[/green]  [dim]{done_count} done[/dim]{filter_str}  "
-            f"[dim](n=add  /=filter  a=all  e=edit  Enter=done  r=roll  d=delete  q=back)[/dim]"
+            f"[dim](n=add  /=filter  a=all  Enter=edit  x=done  r=roll  d=delete  q=back)[/dim]"
         )
 
         # Previous cycles
@@ -1919,10 +2005,15 @@ class SessionTasksView(LazyView):
         self.query_one("#cm-add-input", Input).focus()
 
     def _update_project_buttons(self):
+        all_btn = self.query_one("#cm-proj-all", Button)
+        all_btn.variant = "primary" if self._show_all_windows else "default"
         for proj in self.PROJECTS:
             pid = proj or "none"
             btn = self.query_one(f"#cm-proj-{pid}", Button)
-            btn.variant = "primary" if proj == self._project else "default"
+            if self._show_all_windows:
+                btn.variant = "default"
+            else:
+                btn.variant = "primary" if proj == self._project else "default"
 
     def on_key(self, event):
         from textual.widgets import Input
@@ -1994,10 +2085,16 @@ class SessionTasksView(LazyView):
             for bid, cat in cat_map.items():
                 btn = self.query_one(f"#{bid}", Button)
                 btn.variant = "primary" if cat == self._category else "default"
+        elif btn_id == "cm-proj-all":
+            self._show_all_windows = not self._show_all_windows
+            self._update_project_buttons()
+            self._reload()
         elif btn_id.startswith("cm-proj-"):
             proj_key = btn_id.removeprefix("cm-proj-")
             self._project = "" if proj_key == "none" else proj_key
+            self._show_all_windows = False
             self._update_project_buttons()
+            self._reload()
 
     def action_edit_item(self):
         from textual.widgets import Input
@@ -2030,6 +2127,12 @@ class SessionTasksView(LazyView):
         self._editing_id = item["id"]
         # Focus input
         inp.focus()
+
+    def on_data_table_row_selected(self, event):
+        """Handle click/Enter on a row — open edit mode."""
+        if event.data_table.id != "cm-table":
+            return
+        self.action_edit_item()
 
     def action_toggle_done(self):
         from claude_watch_data import _update_cycle_item
@@ -3485,12 +3588,16 @@ class ClaudeWatchApp(App):
         Binding("slash", "start_search", "Search"),
         Binding("tab", "focus_next", "Next panel", show=False),
         Binding("shift+tab", "focus_previous", "Prev panel", show=False),
+        Binding("R", "reload_build", "Reload", show=False),
     ]
 
     _filter_text = ""
+    _pending_reload = False
+    _revert_cooldown_until = 0.0
 
     def compose(self) -> ComposeResult:
         from textual.widgets import Input, Footer
+        yield ReloadBanner(id="reload-banner")
         yield NavBar(id="nav-bar")
         with ContentSwitcher(initial="view-dashboard", id="content-switcher"):
             with ScrollableContainer(id="view-dashboard"):
@@ -3545,6 +3652,7 @@ class ClaudeWatchApp(App):
 
     def on_mount(self):
         _load_index()
+        _backup_working_files()
         self.build_index()
         # Hide search input, account capacity, and header (merged into burndown)
         self.query_one("#search-input").display = False
@@ -3559,9 +3667,75 @@ class ClaudeWatchApp(App):
     _RESTART_EXIT_CODE = 42
 
     def _trigger_reload(self):
-        """Restart the process when source files change."""
-        self.notify("Reloading...", severity="warning", timeout=1)
-        self.set_timer(0.5, lambda: self.exit(return_code=self._RESTART_EXIT_CODE))
+        """Legacy — redirects to safe reload flow."""
+        self._signal_files_changed()
+
+    def _signal_files_changed(self):
+        """Called from watcher thread when source files change."""
+        import time as _time
+        if _time.time() < self._revert_cooldown_until:
+            return
+        self._pending_reload = True
+        try:
+            self.query_one("#reload-banner", ReloadBanner).show_pending()
+        except Exception:
+            pass
+
+    def action_reload_build(self):
+        """Validate new code and restart if safe, or revert if broken."""
+        if not self._pending_reload:
+            return
+
+        import subprocess, sys
+        project_dir = str(Path(__file__).resolve().parent)
+
+        result = subprocess.run(
+            [sys.executable, "-c", "import claude_watch_data; import claude_watch_tui"],
+            cwd=project_dir,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+
+        if result.returncode == 0:
+            self._pending_reload = False
+            _backup_working_files()
+            self.notify("Reloading...", severity="warning", timeout=1)
+            self.set_timer(0.5, lambda: self.exit(return_code=self._RESTART_EXIT_CODE))
+        else:
+            import time as _time
+            error_msg = result.stderr or result.stdout or "Unknown import error"
+            self._log_build_error(error_msg)
+            restored = _restore_backup_files()
+            try:
+                banner = self.query_one("#reload-banner", ReloadBanner)
+                if restored:
+                    banner.show_reverted(error_msg)
+                    self.notify("Build broken \u2014 reverted to last working version", severity="error", timeout=10)
+                else:
+                    banner.show_reverted("No backup available!")
+                    self.notify("Build broken \u2014 no backup to revert to!", severity="error", timeout=10)
+            except Exception:
+                pass
+            self._pending_reload = False
+            self._revert_cooldown_until = _time.time() + 5
+
+    def _log_build_error(self, error_msg):
+        """Log build error for debugging."""
+        try:
+            log_dir = Path.home() / ".claude" / "logs"
+            log_dir.mkdir(parents=True, exist_ok=True)
+            log_file = log_dir / "claude-watch-build-errors.log"
+            from datetime import datetime
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            with open(log_file, "a") as f:
+                f.write(f"\n{'=' * 60}\n")
+                f.write(f"[{timestamp}] Build validation failed\n")
+                f.write(f"{'=' * 60}\n")
+                f.write(error_msg)
+                f.write("\n")
+        except Exception:
+            pass
 
     def build_index(self):
         import threading

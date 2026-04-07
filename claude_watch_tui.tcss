@@ -30,6 +30,13 @@ Screen {
     text-style: bold;
 }
 
+/* -- Reload Banner -- */
+#reload-banner {
+    dock: top;
+    height: 1;
+    display: none;
+}
+
 #content-switcher {
     height: 1fr;
 }
