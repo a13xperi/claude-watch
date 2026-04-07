@@ -3,7 +3,10 @@
 ## What This Is
 Real-time terminal dashboard for monitoring Claude Code token usage. GitHub: a13xperi/claude-watch
 
-## Current State (v0.8 — CSV export, system notifications, cost polish)
+## Current State (v0.9 — multi-account capacity view)
+
+**v0.9 features (built on top of v0.8):**
+- **Multi-Account Capacity View (`c`)**: Full-screen view showing all three accounts (A/B/C) side by side. Each panel shows 5h/7d usage bars with visual progress, reset countdowns, lane, repos, and data freshness. Live data for active account, Supabase `account_capacity` snapshots for inactive. Data layer: `get_account_capacity_display()`, `_get_supabase_account_capacity()`
 
 **v0.8 features (built on top of v0.7):**
 - **CSV Export (`e`)**: Press `e` to export full session history to `~/Downloads/claude-watch-YYYYMMDD-HHMMSS.csv`. Columns: date, session_id, ccid, source, company, project, model, duration_min, five_pct, output_tokens, cost_usd, directive. Data layer: `export_session_history_csv(filepath) -> int`
@@ -56,13 +59,13 @@ Real-time terminal dashboard for monitoring Claude Code token usage. GitHub: a13
 - `python3 claude_watch_tui.py --session 72887 --context` → resume context packet
 - `python3 claude_watch_tui.py --list` → recent sessions table/JSON
 
-## What's Next (v0.9)
+## What's Next (v1.0)
 
 ### Ideas
 - Nested row expansion in Session History (expand to see full tool call detail)
-- Multi-account capacity view (A/B/C usage side by side)
 - Notification preferences (configurable thresholds, mute toggle)
 - CSV export filtering (date range, project, source)
+- Per-turn cost breakdown in drill-down view
 
 ## Key Context
 - Python 3.9.6 (no `X | None` type hints)
