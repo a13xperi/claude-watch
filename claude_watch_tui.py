@@ -1166,12 +1166,13 @@ class HealthScreen(Screen):
     ]
 
     def compose(self) -> ComposeResult:
+        yield NavBar(active="nav-health")
         yield Static(id="health-header")
         yield SystemHealthPanel(id="health-panel")
 
     def on_mount(self):
         self.query_one("#health-header", Static).update(
-            "[bold]System Health[/bold]  [dim](Escape / q to go back)[/dim]"
+            "[bold]System Health[/bold]"
         )
         self.query_one("#health-panel", SystemHealthPanel).update_content()
 
@@ -1626,6 +1627,7 @@ class SessionTasksView(LazyView):
 
     BINDINGS = [
         Binding("n", "focus_add", "New"),
+        Binding("e", "edit_item", "Edit"),
         Binding("enter", "toggle_done", "Done"),
         Binding("r", "roll_item", "Roll"),
         Binding("d", "delete_item", "Delete"),
@@ -1656,6 +1658,7 @@ class SessionTasksView(LazyView):
         self._project = ""
         self._items = []
         self._window_start = ""
+        self._editing_id = None
 
         # Compute window_start from burndown data
         bd = _get_burndown_data()
@@ -1771,7 +1774,7 @@ class SessionTasksView(LazyView):
         self.query_one("#cm-header", Static).update(
             f"[bold]CYCLE MONITOR[/bold]  resets in {time_str}  {stars}  "
             f"[green]{open_count} open[/green]  [dim]{done_count} done[/dim]  "
-            f"[dim](n=add  Enter=done  r=roll  d=delete  q=back)[/dim]"
+            f"[dim](n=add  e=edit  Enter=done  r=roll  d=delete  q=back)[/dim]"
         )
 
         # Previous cycles
@@ -1843,14 +1846,18 @@ class SessionTasksView(LazyView):
 
     def on_input_submitted(self, event):
         from textual.widgets import Input
-        from claude_watch_data import _post_cycle_item
+        from claude_watch_data import _post_cycle_item, _update_cycle_item
         inp = self.query_one("#cm-add-input", Input)
         if event.input != inp:
             return
         title = event.value.strip()
         if not title:
             return
-        _post_cycle_item(self._window_start, self._category, title, project=self._project)
+        if self._editing_id:
+            _update_cycle_item(self._editing_id, {"title": title, "category": self._category, "project": self._project})
+            self._editing_id = None
+        else:
+            _post_cycle_item(self._window_start, self._category, title, project=self._project)
         inp.value = ""
         self._reload()
         self.query_one("#cm-table", DataTable).focus()
@@ -1870,6 +1877,38 @@ class SessionTasksView(LazyView):
             proj_key = btn_id.removeprefix("cm-proj-")
             self._project = "" if proj_key == "none" else proj_key
             self._update_project_buttons()
+
+    def action_edit_item(self):
+        from textual.widgets import Input
+        dt = self.query_one("#cm-table", DataTable)
+        if dt.cursor_row is None:
+            return
+        try:
+            row_key_str = str(dt._row_order[dt.cursor_row])
+        except Exception:
+            return
+        if row_key_str.startswith("sep-"):
+            return
+        item = self._get_item_by_row_key(row_key_str)
+        if not item:
+            return
+        # Populate input with item's title
+        inp = self.query_one("#cm-add-input", Input)
+        inp.value = item.get("title", "")
+        # Set category and update buttons
+        self._category = item.get("category", "task")
+        cat_map = {"task": "#cm-cat-task", "bug": "#cm-cat-bug",
+                   "idea": "#cm-cat-idea", "direction": "#cm-cat-dir"}
+        for cat, btn_id in cat_map.items():
+            btn = self.query_one(btn_id, Button)
+            btn.variant = "primary" if cat == self._category else "default"
+        # Set project and update buttons
+        self._project = item.get("project", "")
+        self._update_project_buttons()
+        # Store editing state
+        self._editing_id = item["id"]
+        # Focus input
+        inp.focus()
 
     def action_toggle_done(self):
         from claude_watch_data import _update_cycle_item
@@ -2782,8 +2821,7 @@ class CycleDetailScreen(Screen):
             f"  Peak: [bold]{peak:.0f}%[/bold]  "
             f"Sessions: [bold]{c.get('session_count', 0)}[/bold]  "
             f"Cost: [bold]{c.get('cost_str', '')}[/bold]  "
-            f"Commits: [bold]{commits}[/bold]  "
-            f"[dim](Escape / q to go back)[/dim]"
+            f"Commits: [bold]{commits}[/bold]"
         )
 
         # ── Scores ──
@@ -2989,7 +3027,7 @@ class CyclePlanScreen(Screen):
             f"Burned: [red]{burned:.0f}%[/red]  "
             f"Allocated: [yellow]{allocated:.0f}%[/yellow]  "
             f"Free: [green]{plan_remaining:.0f}%[/green]\n"
-            f"  [dim](a=add task  d=mark done  s=skip  Escape=back)[/dim]"
+            f"  [dim](a=add task  d=mark done  s=skip)[/dim]"
         )
 
         # ── Planned tasks table ──
@@ -3241,23 +3279,56 @@ class ClaudeWatchApp(App):
     def compose(self) -> ComposeResult:
         from textual.widgets import Input, Footer
         yield NavBar(id="nav-bar")
-        with ScrollableContainer(id="main-scroll"):
-            yield TokenHeader(id="header")
-            yield AccountCapacityPanel(id="account-capacity")
-            yield BurndownChart(id="burndown")
-            yield TokenAttributionPanel(id="attribution")
-            yield Input(placeholder="Search sessions (ccid, project, directive)...", id="search-input")
-            yield UrgentAlerts(id="urgent")
-            yield SystemHealthPanel(id="system-health")
-            yield ActiveSessionsTable(id="active-sessions")
-            yield SessionNarrativePanel(id="session-narrative")
-            yield SessionHistoryTable(id="session-history")
-            yield DrainPanel(id="drain")
-            with Horizontal(id="feed-row"):
-                yield ToolFrequency(id="tool-freq")
-                yield SkillsPanel(id="skills")
-                yield AgentsPanel(id="agents")
+        with ContentSwitcher(initial="view-dashboard", id="content-switcher"):
+            with ScrollableContainer(id="view-dashboard"):
+                yield TokenHeader(id="header")
+                yield AccountCapacityPanel(id="account-capacity")
+                yield BurndownChart(id="burndown")
+                yield TokenAttributionPanel(id="attribution")
+                yield Input(placeholder="Search sessions (ccid, project, directive)...", id="search-input")
+                yield UrgentAlerts(id="urgent")
+                yield SystemHealthPanel(id="system-health")
+                yield ActiveSessionsTable(id="active-sessions")
+                yield SessionNarrativePanel(id="session-narrative")
+                yield SessionHistoryTable(id="session-history")
+                yield DrainPanel(id="drain")
+                with Horizontal(id="feed-row"):
+                    yield ToolFrequency(id="tool-freq")
+                    yield SkillsPanel(id="skills")
+                    yield AgentsPanel(id="agents")
+            yield UsageMetricsView(id="view-usage")
+            yield MCPStatsView(id="view-mcp")
+            yield SessionTasksView(id="view-sessions")
+            yield ProjectBoardView(id="view-projects")
+            yield AccountCapacityView(id="view-capacity")
+            yield LeaderboardView(id="view-leaderboard")
+            yield CyclesView(id="view-cycles")
         yield Footer()
+
+    def switch_view(self, view_id: str) -> None:
+        """Switch content view and update NavBar highlight."""
+        switcher = self.query_one("#content-switcher", ContentSwitcher)
+        switcher.current = view_id
+        # Lazy-load on first visit
+        if view_id != "view-dashboard":
+            view = self.query_one(f"#{view_id}")
+            if hasattr(view, '_loaded') and not view._loaded:
+                view._loaded = True
+                view.load_content()
+        # Update NavBar active button
+        nav_map = {
+            "view-dashboard": "nav-dashboard",
+            "view-usage": "nav-usage",
+            "view-mcp": "nav-mcp",
+            "view-sessions": "nav-sessions",
+            "view-projects": "nav-projects",
+            "view-capacity": "nav-capacity",
+            "view-leaderboard": "nav-leaderboard",
+            "view-cycles": "nav-cycles",
+        }
+        active_nav = nav_map.get(view_id, "")
+        for btn in self.query("#nav-bar Button"):
+            btn.variant = "primary" if btn.id == active_nav else "default"
 
     def on_mount(self):
         _load_index()
@@ -3285,25 +3356,34 @@ class ClaudeWatchApp(App):
         t.start()
 
     def refresh_data(self):
-        five, seven, fr, sr = _current_pct()
-        self.query_one("#header", TokenHeader).update_content(five, seven, fr, sr)
-        acct = self.query_one("#account-capacity", AccountCapacityPanel)
-        if acct.display:
-            acct.update_content()
-        self.query_one("#burndown", BurndownChart).update_content()
-        self.query_one("#attribution", TokenAttributionPanel).update_content()
-        self.query_one("#urgent", UrgentAlerts).update_content()
-        self.query_one("#active-sessions", ActiveSessionsTable).refresh_rows()
-        self.query_one("#session-narrative", SessionNarrativePanel).update_content()
-        self.query_one("#system-health", SystemHealthPanel).update_content()
-        self.query_one("#session-history", SessionHistoryTable).refresh_rows()
-        self.query_one("#tool-freq", ToolFrequency).update_content()
-        self.query_one("#skills", SkillsPanel).update_content()
-        self.query_one("#agents", AgentsPanel).update_content()
-        # CallHistoryTable removed — merged into SessionHistoryTable sub-rows
-        self.query_one("#drain", DrainPanel).update_content()
+        switcher = self.query_one("#content-switcher", ContentSwitcher)
 
-        # Auto-score completed windows
+        if switcher.current == "view-dashboard":
+            five, seven, fr, sr = _current_pct()
+            self.query_one("#header", TokenHeader).update_content(five, seven, fr, sr)
+            acct = self.query_one("#account-capacity", AccountCapacityPanel)
+            if acct.display:
+                acct.update_content()
+            self.query_one("#burndown", BurndownChart).update_content()
+            self.query_one("#attribution", TokenAttributionPanel).update_content()
+            self.query_one("#urgent", UrgentAlerts).update_content()
+            self.query_one("#active-sessions", ActiveSessionsTable).refresh_rows()
+            self.query_one("#session-narrative", SessionNarrativePanel).update_content()
+            self.query_one("#system-health", SystemHealthPanel).update_content()
+            self.query_one("#session-history", SessionHistoryTable).refresh_rows()
+            self.query_one("#tool-freq", ToolFrequency).update_content()
+            self.query_one("#skills", SkillsPanel).update_content()
+            self.query_one("#agents", AgentsPanel).update_content()
+            self.query_one("#drain", DrainPanel).update_content()
+        else:
+            try:
+                view = self.query_one(f"#{switcher.current}")
+                if hasattr(view, 'refresh_content'):
+                    view.refresh_content()
+            except Exception:
+                pass
+
+        # Auto-score completed windows (keep unconditional)
         from claude_watch_data import _check_and_score_completed_window
         new_score = _check_and_score_completed_window()
         if new_score:
@@ -3311,10 +3391,9 @@ class ClaudeWatchApp(App):
             ov = new_score.get("overall", 0)
             self.notify(f"Window scored: {stars} ({ov})", severity="information", timeout=10)
 
-        # System notifications on spike
+        # System notifications on spike (keep unconditional)
         try:
-            five_f = float(five)
-            seven_f = float(seven)
+            five_f, seven_f = [float(x) for x in _current_pct()[:2]]
             burndown = _get_burndown_data()
             burn_rate = burndown.get("current_rate") if burndown else None
             check_and_notify(five_f, seven_f, burn_rate)
@@ -3323,7 +3402,15 @@ class ClaudeWatchApp(App):
 
     def action_force_refresh(self):
         self.build_index()
-        self.refresh_data()
+        switcher = self.query_one("#content-switcher", ContentSwitcher)
+        if switcher.current == "view-dashboard":
+            self.refresh_data()
+        else:
+            view = self.query_one(f"#{switcher.current}")
+            if hasattr(view, '_loaded'):
+                view._loaded = False
+                view.load_content()
+                view._loaded = True
 
     def action_export_csv(self):
         filename = os.path.expanduser(
@@ -3346,52 +3433,45 @@ class ClaudeWatchApp(App):
             )
 
     def action_show_usage(self):
-        self.push_screen(UsageMetricsScreen())
+        self.switch_view("view-usage")
 
     def action_show_mcp(self):
-        self.push_screen(MCPStatsScreen())
+        self.switch_view("view-mcp")
 
     def action_show_session_tasks(self):
-        self.push_screen(CycleMonitorScreen())
+        self.switch_view("view-sessions")
 
     def action_show_project_board(self):
-        self.push_screen(ProjectBoardScreen())
+        self.switch_view("view-projects")
 
     def action_show_leaderboard(self):
-        self.push_screen(LeaderboardScreen())
+        self.switch_view("view-leaderboard")
 
     def action_show_capacity(self):
-        self.push_screen(AccountCapacityScreen())
+        self.switch_view("view-capacity")
 
     def action_show_attribution(self):
         self.push_screen(TokenAttributionScreen())
 
     def action_show_cycles(self):
-        self.push_screen(CyclesScreen())
+        self.switch_view("view-cycles")
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
+        btn_map = {
+            "nav-dashboard": "view-dashboard",
+            "nav-sessions": "view-sessions",
+            "nav-projects": "view-projects",
+            "nav-leaderboard": "view-leaderboard",
+            "nav-usage": "view-usage",
+            "nav-mcp": "view-mcp",
+            "nav-cycles": "view-cycles",
+        }
         btn_id = event.button.id or ""
-        if not btn_id.startswith("nav-"):
-            return
-        # Pop to root first
-        while len(self.screen_stack) > 1:
-            self.pop_screen()
-        if btn_id == "nav-dashboard":
-            return  # already at root
+        if btn_id in btn_map:
+            self.switch_view(btn_map[btn_id])
         elif btn_id == "nav-health":
+            self.switch_view("view-dashboard")
             self.action_toggle_health()
-        elif btn_id == "nav-sessions":
-            self.action_show_session_tasks()
-        elif btn_id == "nav-projects":
-            self.action_show_project_board()
-        elif btn_id == "nav-leaderboard":
-            self.action_show_leaderboard()
-        elif btn_id == "nav-usage":
-            self.action_show_usage()
-        elif btn_id == "nav-mcp":
-            self.action_show_mcp()
-        elif btn_id == "nav-cycles":
-            self.action_show_cycles()
 
     def action_toggle_accounts(self):
         acct = self.query_one("#account-capacity", AccountCapacityPanel)
@@ -3424,6 +3504,7 @@ class ClaudeWatchApp(App):
                 self.query_one("#session-history", SessionHistoryTable).refresh_rows()
 
     def on_key(self, event):
+        switcher = self.query_one("#content-switcher", ContentSwitcher)
         if event.key == "escape":
             from textual.widgets import Input
             search = self.query_one("#search-input", Input)
@@ -3434,6 +3515,14 @@ class ClaudeWatchApp(App):
                 self.query_one("#session-history", SessionHistoryTable).refresh_rows()
                 event.prevent_default()
                 event.stop()
+            elif switcher.current != "view-dashboard":
+                self.switch_view("view-dashboard")
+                event.prevent_default()
+                event.stop()
+        elif event.key == "p" and switcher.current == "view-cycles":
+            self.push_screen(CyclePlanScreen())
+            event.prevent_default()
+            event.stop()
 
 
 def _cli_session_lookup(args):

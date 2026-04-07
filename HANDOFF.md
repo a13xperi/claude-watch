@@ -3,7 +3,12 @@
 ## What This Is
 Real-time terminal dashboard for monitoring Claude Code token usage. GitHub: a13xperi/claude-watch
 
-## Current State (v0.9 — multi-account capacity view)
+## Current State (v0.12 — Cycle Monitor)
+
+**v0.12 features (built on top of v0.11):**
+- **Cycle Monitor (`s`)**: Replaced SessionTasksScreen. Freeform capture space for the current 5h token window. Quick-add items tagged by category (Bug/Task/Idea/Direction) and project (Atlas/CW/Paper/OClaw/Frank/KAA). Tab cycles category, Shift+Tab cycles project. DataTable grouped by category with separator rows. Actions: Enter=toggle done, r=roll forward, d=delete, e=edit. Items persist to Supabase `cycle_items` table. Done items feed into the gamification scoring (shipping + breadth). Previous cycles summary panel shows past window scores and item counts.
+- **Project Selector**: 7 project buttons in the add-item row. Click or Shift+Tab to select. Project column visible in the items table.
+- Data layer: `_get_cycle_items()`, `_post_cycle_item()`, `_update_cycle_item()`, `_delete_cycle_item()`, `_get_recent_cycle_summaries()`, `_get_cycle_items_for_scoring()`, `_roll_cycle_items()`
 
 **v0.9 features (built on top of v0.8):**
 - **Multi-Account Capacity View (`c`)**: Full-screen view showing all three accounts (A/B/C) side by side. Each panel shows 5h/7d usage bars with visual progress, reset countdowns, lane, repos, and data freshness. Live data for active account, Supabase `account_capacity` snapshots for inactive. Data layer: `get_account_capacity_display()`, `_get_supabase_account_capacity()`
@@ -46,7 +51,7 @@ Real-time terminal dashboard for monitoring Claude Code token usage. GitHub: a13
 **Hook:** `~/.claude/hooks/token-tracker.sh` — captures tool_snippet, model, output_tokens
 
 **Keybindings:**
-- `q` quit, `r` refresh, `e` export CSV, `u` usage metrics, `m` MCP stats, `h` toggle health, `Tab`/`Shift+Tab` focus panels
+- `q` quit, `r` refresh, `e` export CSV, `u` usage metrics, `m` MCP stats, `s` Cycle Monitor, `h` toggle health, `Tab`/`Shift+Tab` focus panels
 - `/` search/filter sessions, `Escape` clear search
 - `Enter`/`f` on Active Sessions → focus that session's Warp terminal
 - `Enter` on Session History → drill-down (accomplishments view)

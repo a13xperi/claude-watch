@@ -1216,11 +1216,25 @@ def _build_or_update_index():
                             pass
                     new_entries.append(result)
                     known[sid] = result
+        SESSION_INDEX.parent.mkdir(parents=True, exist_ok=True)
         if new_entries:
-            # Rewrite full index (deduped by session_id) instead of appending
-            with open(SESSION_INDEX, "w") as fh:
-                for entry in known.values():
-                    fh.write(json.dumps(entry) + "\n")
+            # Atomic rewrite: temp file + rename to prevent corruption on crash
+            fd, tmp_path = tempfile.mkstemp(
+                dir=SESSION_INDEX.parent,
+                prefix=".session-index-",
+                suffix=".tmp",
+            )
+            try:
+                with os.fdopen(fd, "w") as fh:
+                    for entry in known.values():
+                        fh.write(json.dumps(entry) + "\n")
+                os.replace(tmp_path, str(SESSION_INDEX))
+            except Exception:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+                raise
             _index_cache = dict(known)
             _rebuild_ccid_index()
     except Exception:

@@ -30,7 +30,11 @@ Screen {
     text-style: bold;
 }
 
-#main-scroll {
+#content-switcher {
+    height: 1fr;
+}
+
+#view-dashboard {
     height: 1fr;
 }
 
