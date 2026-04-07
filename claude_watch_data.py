@@ -177,7 +177,7 @@ def _active_sessions():
                     # it's measuring global drift, not actual consumption
                     age_secs = time.time() - start_epoch if start_epoch else 999
                     if raw_delta < 0:
-                        delta = "reset"  # 5h window reset during session
+                        delta = f"↻{cur:.0f}%"  # 5h window reset — show current absolute pct
                     elif age_secs < 120 and raw_delta > 5:
                         delta = "new"
                     else:
@@ -1315,7 +1315,7 @@ def _get_session_history():
                 try:
                     d_pct = round(float(pe) - float(ps), 1)
                     if d_pct < -5:
-                        pct_str = "reset"  # 5h window reset during session
+                        pct_str = "↻win"  # 5h window reset during session
                     else:
                         pct_str = f"+{d_pct}%" if d_pct >= 0 else f"{d_pct}%"
                 except Exception:
@@ -1932,7 +1932,7 @@ def _get_call_history():
         try:
             delta = float(s["five_pct_end"]) - float(s["five_pct_start"])
             if delta < -5:
-                pct_str = "reset"
+                pct_str = "↻win"
             else:
                 pct_str = f"+{delta:.1f}%" if delta >= 0 else f"{delta:.1f}%"
         except Exception:
@@ -4134,3 +4134,201 @@ def _roll_cycle_items(old_window_start, new_window_start):
             pass
 
     return rolled
+
+
+# ── Test Queue ────────────────────────────────────────────────────────────────
+
+def _get_test_queue(project=None, status="pending"):
+    # type: (str, str) -> list
+    """Fetch test_queue items from Supabase."""
+    import urllib.request
+    from urllib.parse import quote
+    config = _get_battlestation_config()
+    url = (
+        f"{_SUPABASE_URL}/test_queue"
+        f"?user_id=eq.{config['user_id']}"
+    )
+    if status is not None:
+        url += f"&status=eq.{quote(status)}"
+    if project:
+        url += f"&project=eq.{quote(project)}"
+    url += "&order=created_at.desc&limit=200"
+    try:
+        req = urllib.request.Request(url, headers={
+            "apikey": _SUPABASE_KEY,
+            "Authorization": f"Bearer {_SUPABASE_KEY}",
+        })
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            return json.loads(resp.read())
+    except Exception:
+        return []
+
+
+def _add_test_item(title, project="", source="manual", source_ref="", route="", priority="normal"):
+    # type: (str, str, str, str, str, str) -> dict
+    """Insert a new test_queue item. Returns inserted row or empty dict."""
+    import urllib.request
+    config = _get_battlestation_config()
+    payload = {
+        "user_id": config["user_id"],
+        "title": title[:200],
+        "project": project,
+        "source": source,
+        "source_ref": source_ref,
+        "route": route,
+        "priority": priority,
+        "status": "pending",
+    }
+    try:
+        data = json.dumps(payload).encode()
+        req = urllib.request.Request(
+            f"{_SUPABASE_URL}/test_queue",
+            data=data,
+            headers={
+                "apikey": _SUPABASE_KEY,
+                "Authorization": f"Bearer {_SUPABASE_KEY}",
+                "Content-Type": "application/json",
+                "Prefer": "return=representation",
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            rows = json.loads(resp.read())
+            return rows[0] if rows else {}
+    except Exception:
+        return {}
+
+
+def _update_test_item(item_id, status, notes=""):
+    # type: (str, str, str) -> bool
+    """Update test_queue item status. Sets tested_at on pass/fail/skip."""
+    import urllib.request
+    updates = {"status": status, "notes": notes}
+    if status in ("pass", "fail", "skip"):
+        updates["tested_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    try:
+        data = json.dumps(updates).encode()
+        req = urllib.request.Request(
+            f"{_SUPABASE_URL}/test_queue?id=eq.{item_id}",
+            data=data,
+            headers={
+                "apikey": _SUPABASE_KEY,
+                "Authorization": f"Bearer {_SUPABASE_KEY}",
+                "Content-Type": "application/json",
+            },
+            method="PATCH",
+        )
+        urllib.request.urlopen(req, timeout=5)
+        return True
+    except Exception:
+        return False
+
+
+def _delete_test_item(item_id):
+    # type: (str) -> bool
+    """Delete a test_queue item by id."""
+    import urllib.request
+    try:
+        req = urllib.request.Request(
+            f"{_SUPABASE_URL}/test_queue?id=eq.{item_id}",
+            headers={
+                "apikey": _SUPABASE_KEY,
+                "Authorization": f"Bearer {_SUPABASE_KEY}",
+            },
+            method="DELETE",
+        )
+        urllib.request.urlopen(req, timeout=5)
+        return True
+    except Exception:
+        return False
+
+
+def _import_atlas_qa_tests():
+    # type: () -> int
+    """Parse Atlas QA test-definitions.ts and upsert pending items.
+    Returns count of newly inserted items."""
+    import re
+    import os
+
+    ts_path = os.path.expanduser("~/atlas-portal/src/app/admin/qa/test-definitions.ts")
+    try:
+        with open(ts_path) as fh:
+            content = fh.read()
+    except Exception:
+        return 0
+
+    section_route_map = {
+        "auth": "/auth",
+        "dash": "/dashboard",
+        "craf": "/crafting",
+        "voic": "/voices",
+        "aler": "/signals",
+        "sign": "/signals",
+        "anal": "/analytics",
+        "brie": "/briefing",
+        "orac": "/onboarding",
+        "camp": "/campaigns",
+        "aren": "/arena",
+        "mana": "/management",
+        "team": "/management",
+        "queu": "/queue",
+        "nav": "/",
+        "perf": "/",
+        "desi": "/",
+        "a11y": "/",
+        "erro": "/",
+    }
+
+    priority_map = {
+        "critical": "high",
+        "high": "high",
+        "medium": "normal",
+        "normal": "normal",
+        "low": "low",
+    }
+
+    # Get existing qa source_refs to avoid duplicates
+    existing = _get_test_queue(status=None)
+    existing_refs = {
+        item["source_ref"] for item in existing
+        if item.get("source") == "qa" and item.get("source_ref")
+    }
+
+    test_pattern = re.compile(
+        r'id:\s*["\']([A-Z0-9]+-\d+)["\'].*?name:\s*["\']([^"\']+)["\']',
+        re.DOTALL,
+    )
+    priority_pattern = re.compile(r'priority:\s*["\']([^"\']+)["\']')
+
+    inserted = 0
+    for match in test_pattern.finditer(content):
+        test_id = match.group(1)
+        test_name = match.group(2)
+
+        if test_id in existing_refs:
+            continue
+
+        prefix = test_id.split("-")[0].lower()
+        route = ""
+        for key, r in section_route_map.items():
+            if prefix.startswith(key):
+                route = r
+                break
+
+        nearby = content[match.start():match.start() + 300]
+        pri_match = priority_pattern.search(nearby)
+        raw_priority = pri_match.group(1) if pri_match else "medium"
+        priority = priority_map.get(raw_priority, "normal")
+
+        result = _add_test_item(
+            title=f"{test_id}: {test_name}",
+            project="atlas",
+            source="qa",
+            source_ref=test_id,
+            route=route,
+            priority=priority,
+        )
+        if result:
+            inserted += 1
+
+    return inserted

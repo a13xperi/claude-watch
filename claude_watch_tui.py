@@ -57,6 +57,11 @@ from claude_watch_data import (
     _load_ledger,
     _shorten_tool,
     check_and_notify,
+    _get_test_queue,
+    _add_test_item,
+    _update_test_item,
+    _delete_test_item,
+    _import_atlas_qa_tests,
     export_session_history_csv,
     focus_session_terminal,
     get_account_capacity_display,
@@ -1322,6 +1327,7 @@ class NavBar(Horizontal):
             ("Cycles", "nav-cycles"),
             ("Usage", "nav-usage"),
             ("MCP", "nav-mcp"),
+            ("Test", "nav-test"),
         ]
         for label, btn_id in buttons:
             variant = "primary" if btn_id == self._active else "default"
@@ -3567,6 +3573,193 @@ class TokenAttributionScreen(Screen):
             )
 
 
+
+class TestQueueView(LazyView):
+    """Test Queue — things that need manual verification after shipping."""
+
+    BINDINGS = [
+        Binding("p", "mark_pass", "Pass"),
+        Binding("f", "mark_fail", "Fail"),
+        Binding("s", "mark_skip", "Skip"),
+        Binding("d", "delete_item", "Delete"),
+        Binding("i", "import_qa", "Import QA"),
+        Binding("r", "reload", "Reload"),
+        Binding("a", "toggle_all", "All/Pending"),
+    ]
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self._items = []
+        self._filter_project = ""
+        self._show_all = False
+
+    def compose(self) -> ComposeResult:
+        yield Static(id="tq-header")
+        yield Static(id="tq-filters")
+        yield DataTable(id="tq-table")
+        yield Static(id="tq-footer")
+
+    def load_content(self):
+        self._reload_data()
+
+    def _reload_data(self):
+        status_filter = None if self._show_all else "pending"
+        project_filter = self._filter_project if self._filter_project else None
+        self._items = _get_test_queue(project=project_filter, status=status_filter)
+        self._render()
+
+    def _render(self):
+        pending = sum(1 for i in self._items if i.get("status") == "pending")
+        passed  = sum(1 for i in self._items if i.get("status") == "pass")
+        failed  = sum(1 for i in self._items if i.get("status") == "fail")
+        skipped = sum(1 for i in self._items if i.get("status") == "skip")
+
+        mode_label = "all" if self._show_all else "pending only"
+        proj_label = self._filter_project or "all projects"
+        self.query_one("#tq-header", Static).update(
+            f"[bold cyan]Test Queue[/bold cyan]  "
+            f"[yellow]{pending} pending[/yellow]  "
+            f"[green]{passed} passed[/green]  "
+            f"[red]{failed} failed[/red]  "
+            f"[dim]{skipped} skipped  ·  {mode_label}  ·  {proj_label}[/dim]"
+        )
+
+        # Project filter pills
+        projects = sorted({i.get("project", "") for i in self._items if i.get("project")})
+        pills = []
+        for p in [""] + projects:
+            active = p == self._filter_project
+            label = p or "all"
+            pills.append(f"[{'bold cyan' if active else 'dim'}][{label}][/{'bold cyan' if active else 'dim'}]")
+        self.query_one("#tq-filters", Static).update("  ".join(pills))
+
+        dt = self.query_one("#tq-table", DataTable)
+        dt.clear(columns=True)
+        dt.cursor_type = "row"
+        dt.zebra_stripes = True
+        dt.add_column("#",       width=4)
+        dt.add_column("Project", width=10)
+        dt.add_column("Title",   width=46)
+        dt.add_column("Src",     width=9)
+        dt.add_column("Route",   width=14)
+        dt.add_column("Pri",     width=5)
+        dt.add_column("Age",     width=6)
+        dt.add_column("St",      width=4)
+
+        if not self._items:
+            dt.add_row(
+                "—", "", Text("no items — press i to import Atlas QA tests", style="dim"),
+                "", "", "", "", "",
+            )
+        else:
+            now = datetime.now(timezone.utc)
+            for idx, item in enumerate(self._items, 1):
+                status = item.get("status", "pending")
+                st_icon = {
+                    "pending": Text("·", style="yellow"),
+                    "pass":    Text("✓", style="green"),
+                    "fail":    Text("✗", style="red"),
+                    "skip":    Text("−", style="dim"),
+                }.get(status, Text("·"))
+
+                pri = item.get("priority", "normal")
+                pri_style = "red" if pri in ("high", "critical") else ("yellow" if pri == "normal" else "dim")
+
+                try:
+                    created = datetime.fromisoformat(item["created_at"].replace("Z", "+00:00"))
+                    delta = now - created
+                    age = f"{delta.days}d" if delta.days > 0 else f"{delta.seconds // 3600}h"
+                except Exception:
+                    age = "—"
+
+                proj = item.get("project", "—")
+                proj_style = (
+                    "cyan" if proj == "atlas" else
+                    ("yellow" if proj == "kaa" else
+                    ("magenta" if proj == "paperclip" else "dim"))
+                )
+
+                src = item.get("source", "—")
+                src_ref = item.get("source_ref", "")
+                src_display = src[:4] + (f"/{src_ref[:4]}" if src_ref else "")
+
+                dt.add_row(
+                    str(idx),
+                    Text(proj, style=proj_style),
+                    Text(item.get("title", "—")[:46]),
+                    Text(src_display, style="dim"),
+                    Text(item.get("route", "—")[:14], style="dim"),
+                    Text(pri[:4], style=pri_style),
+                    Text(age, style="dim"),
+                    st_icon,
+                    key=item["id"],
+                )
+
+        self.query_one("#tq-footer", Static).update(
+            "[dim]p[/dim]=pass  [dim]f[/dim]=fail  [dim]s[/dim]=skip  "
+            "[dim]d[/dim]=delete  [dim]i[/dim]=import Atlas QA  "
+            "[dim]a[/dim]=toggle all/pending  [dim]r[/dim]=reload"
+        )
+
+    def _get_selected_id(self):
+        # type: () -> str
+        dt = self.query_one("#tq-table", DataTable)
+        if not dt.row_count:
+            return ""
+        try:
+            key = dt.get_row_at(dt.cursor_row)
+            # key is the row_key value we set (item UUID)
+            rk = dt._row_order[dt.cursor_row]
+            return str(rk) if rk else ""
+        except Exception:
+            return ""
+
+    def _mark_selected(self, status):
+        item_id = self._get_selected_id()
+        if item_id and not item_id.startswith("—"):
+            _update_test_item(item_id, status)
+            self._reload_data()
+
+    def action_mark_pass(self):
+        self._mark_selected("pass")
+
+    def action_mark_fail(self):
+        self._mark_selected("fail")
+
+    def action_mark_skip(self):
+        self._mark_selected("skip")
+
+    def action_delete_item(self):
+        item_id = self._get_selected_id()
+        if item_id and not item_id.startswith("—"):
+            _delete_test_item(item_id)
+            self._reload_data()
+
+    def action_import_qa(self):
+        self.query_one("#tq-header", Static).update(
+            "[yellow]Importing Atlas QA tests...[/yellow]"
+        )
+        try:
+            count = _import_atlas_qa_tests()
+            self._reload_data()
+            # Brief success message (will be overwritten by next _render)
+            if count == 0:
+                self.query_one("#tq-header", Static).update(
+                    "[dim]All Atlas QA tests already imported (nothing new)[/dim]"
+                )
+        except Exception as e:
+            self.query_one("#tq-header", Static).update(
+                f"[red]Import failed: {e}[/red]"
+            )
+
+    def action_reload(self):
+        self._reload_data()
+
+    def action_toggle_all(self):
+        self._show_all = not self._show_all
+        self._reload_data()
+
+
 class ClaudeWatchApp(App):
     CSS_PATH = "claude_watch_tui.tcss"
     TITLE = "claude-watch"
@@ -3584,6 +3777,7 @@ class ClaudeWatchApp(App):
         Binding("c", "show_capacity", "Capacity"),
         Binding("h", "toggle_health", "Health"),
         Binding("y", "show_cycles", "Cycles"),
+        Binding("x", "show_test", "Test"),
         Binding("w", "show_attribution", "Who?"),
         Binding("slash", "start_search", "Search"),
         Binding("tab", "focus_next", "Next panel", show=False),
@@ -3623,6 +3817,7 @@ class ClaudeWatchApp(App):
             yield AccountCapacityView(id="view-capacity")
             yield LeaderboardView(id="view-leaderboard")
             yield CyclesView(id="view-cycles")
+            yield TestQueueView(id="view-test")
         yield Footer()
 
     def switch_view(self, view_id: str) -> None:
@@ -3645,6 +3840,7 @@ class ClaudeWatchApp(App):
             "view-capacity": "nav-capacity",
             "view-leaderboard": "nav-leaderboard",
             "view-cycles": "nav-cycles",
+            "view-test": "nav-test",
         }
         active_nav = nav_map.get(view_id, "")
         for btn in self.query("#nav-bar Button"):
@@ -3843,6 +4039,9 @@ class ClaudeWatchApp(App):
     def action_show_cycles(self):
         self.switch_view("view-cycles")
 
+    def action_show_test(self):
+        self.switch_view("view-test")
+
     def on_button_pressed(self, event: Button.Pressed) -> None:
         btn_map = {
             "nav-dashboard": "view-dashboard",
@@ -3852,6 +4051,7 @@ class ClaudeWatchApp(App):
             "nav-usage": "view-usage",
             "nav-mcp": "view-mcp",
             "nav-cycles": "view-cycles",
+            "nav-test": "view-test",
         }
         btn_id = event.button.id or ""
         if not btn_id.startswith("nav-"):
