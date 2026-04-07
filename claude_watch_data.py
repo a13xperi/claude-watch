@@ -715,7 +715,9 @@ def _extract_accomplishments(session_id):
     # type: (str) -> Dict[str, Any]
     """Extract accomplishments for a session by ID."""
     # Check cached index first
-    entry = _index_cache.get(session_id, {})
+    with _index_lock:
+        snapshot = _index_cache
+    entry = snapshot.get(session_id, {})
     cached = entry.get("accomplishments")
     if cached:
         return cached
@@ -944,6 +946,9 @@ def lookup_by_ccid(user_input):
     # type: (str) -> Optional[Dict]
     """Look up session by CCID number, cc-PID, or UUID prefix."""
     _ensure_index()
+    with _index_lock:
+        snapshot = _index_cache
+        ccid_snapshot = _ccid_to_uuid
     s = user_input.strip()
 
     # Try as CCID number: "72887" → "cc-72887"
@@ -952,17 +957,17 @@ def lookup_by_ccid(user_input):
 
     # Try as cc-PID
     if s.startswith("cc-"):
-        uuid = _ccid_to_uuid.get(s)
+        uuid = ccid_snapshot.get(s)
         if uuid:
-            return _index_cache.get(uuid)
+            return snapshot.get(uuid)
         # Fallback: scan index
-        for uid, entry in _index_cache.items():
+        for uid, entry in snapshot.items():
             if entry.get("ccid") == s:
                 return entry
         return None
 
     # Try as UUID prefix
-    for uid, entry in _index_cache.items():
+    for uid, entry in snapshot.items():
         if uid.startswith(s):
             return entry
 
@@ -975,6 +980,7 @@ _index_cache = {}
 _index_loaded = False
 _index_building = False
 _index_thread = None
+_index_lock = threading.RLock()
 
 
 def _load_index():
@@ -996,9 +1002,10 @@ def _load_index():
                         _log.debug("Malformed index line: %s", e)
         except Exception as e:
             _log.warning("Failed to load session index: %s", e)
-    _index_cache = cache
-    _index_loaded = True
-    _rebuild_ccid_index()
+    with _index_lock:
+        _index_cache = cache
+        _index_loaded = True
+        _rebuild_ccid_index()
     return cache
 
 
@@ -1195,11 +1202,13 @@ def _parse_transcript(f):
 
 def _build_or_update_index():
     global _index_building, _index_cache
-    if _index_building:
-        return
-    _index_building = True
+    with _index_lock:
+        if _index_building:
+            return
+        _index_building = True
     try:
-        known = dict(_index_cache)
+        with _index_lock:
+            known = dict(_index_cache)
         new_entries = []
         for proj_dir in ALL_PROJECT_DIRS.iterdir():
             if not proj_dir.is_dir():
@@ -1248,25 +1257,30 @@ def _build_or_update_index():
                 except OSError:
                     pass
                 raise
-            _index_cache = dict(known)
-            _rebuild_ccid_index()
+            with _index_lock:
+                _index_cache = dict(known)
+                _rebuild_ccid_index()
     except Exception as e:
         _log.exception("Index build failed")
     finally:
-        _index_building = False
+        with _index_lock:
+            _index_building = False
 
 
 def _ensure_index():
     global _index_thread
-    if not _index_loaded:
-        _load_index()
-    if _index_thread is None or not _index_thread.is_alive():
-        _index_thread = threading.Thread(target=_build_or_update_index, daemon=True)
-        _index_thread.start()
+    with _index_lock:
+        if not _index_loaded:
+            _load_index()
+        if _index_thread is None or not _index_thread.is_alive():
+            _index_thread = threading.Thread(target=_build_or_update_index, daemon=True)
+            _index_thread.start()
 
 
 def _get_session_history():
     _ensure_index()
+    with _index_lock:
+        snapshot = _index_cache
     # Don't exclude any sessions — show everything in history.
     # The current session appears in both Active Sessions and Session History.
     # This is better than sessions mysteriously disappearing.
@@ -1275,7 +1289,7 @@ def _get_session_history():
     today = datetime.now(timezone.utc).astimezone().date()
     sessions = []
 
-    for sid, entry in _index_cache.items():
+    for sid, entry in snapshot.items():
         if sid == current_session_id:
             continue
         try:
@@ -1330,7 +1344,9 @@ def _get_session_history():
 
 def _find_transcript(session_id):
     """Find transcript file for a session_id, checking index first then scanning."""
-    entry = _index_cache.get(session_id)
+    with _index_lock:
+        snapshot = _index_cache
+    entry = snapshot.get(session_id)
     if entry and entry.get("project_dir"):
         p = Path(entry["project_dir"]) / f"{session_id}.jsonl"
         if p.exists():
@@ -1378,6 +1394,8 @@ def _format_cost(cost):
 def export_session_history_csv(filepath):
     # type: (str) -> int
     """Export session history to CSV file. Returns number of rows written."""
+    with _index_lock:
+        snapshot = _index_cache
     sessions = _get_session_history()
     count = 0
     with open(filepath, "w", newline="") as f:
@@ -1415,7 +1433,7 @@ def export_session_history_csv(filepath):
                 company = ""
 
             # CCID from index
-            idx_entry = _index_cache.get(s["session_id"], {})
+            idx_entry = snapshot.get(s["session_id"], {})
             ccid = idx_entry.get("ccid", "")
 
             out_tokens = s.get("output_tokens", 0)
@@ -1567,12 +1585,14 @@ def _get_usage_metrics(days=7):
     Each metric: source, output_tokens, sessions, avg_tokens, pct_of_total.
     """
     _ensure_index()
+    with _index_lock:
+        snapshot = _index_cache
     cutoff = datetime.now(timezone.utc) - timedelta(days=days)
 
     by_source = defaultdict(lambda: {"output_tokens": 0, "sessions": 0})
     total_output = 0
 
-    for sid, entry in _index_cache.items():
+    for sid, entry in snapshot.items():
         try:
             last_ts = datetime.fromisoformat(entry["last_ts"])
             if last_ts.tzinfo is None:
@@ -1623,13 +1643,15 @@ def _get_daily_usage(days=7):
     Labels: 'Today' for today, abbreviated weekday name otherwise.
     """
     _ensure_index()
+    with _index_lock:
+        snapshot = _index_cache
     today = datetime.now().astimezone().date()
     result = []
     for offset in range(days - 1, -1, -1):
         day = today - timedelta(days=offset)
         total = sum(
             e.get("output_tokens", 0)
-            for e in _index_cache.values()
+            for e in snapshot.values()
             if _safe_date(e.get("last_ts")) == day
         )
         label = "Today" if offset == 0 else day.strftime("%a")
@@ -1643,6 +1665,8 @@ def _get_mcp_stats(days=7):
     Returns dict with by_server, top_actions, total_calls, sessions_with_mcp.
     """
     _ensure_index()
+    with _index_lock:
+        snapshot = _index_cache
     cutoff = datetime.now(timezone.utc) - timedelta(days=days)
 
     by_server = defaultdict(lambda: {"calls": 0, "actions": defaultdict(int)})  # type: Dict
@@ -1670,7 +1694,7 @@ def _get_mcp_stats(days=7):
 
     # Count sessions with any MCP usage from index
     sessions_with_mcp = 0
-    for entry in _index_cache.values():
+    for entry in snapshot.values():
         try:
             last_ts = datetime.fromisoformat(entry.get("last_ts", ""))
             if last_ts.tzinfo is None:
@@ -1739,11 +1763,13 @@ def _get_agent_stats(days=7):
     aggregated over last N days, sorted by count descending.
     """
     _ensure_index()
+    with _index_lock:
+        snapshot = _index_cache
     cutoff = datetime.now(timezone.utc) - timedelta(days=days)
     counts = defaultdict(int)  # type: Dict[str, int]
     last_seen = {}  # type: Dict[str, str]
 
-    for sid, entry in _index_cache.items():
+    for sid, entry in snapshot.items():
         try:
             last_ts_str = entry.get("last_ts", "")
             last_ts = datetime.fromisoformat(last_ts_str)
@@ -1797,6 +1823,8 @@ def _build_pid_map():
     if now - _pid_map_time < 10 and _pid_map_cache:
         return _pid_map_cache
     _pid_map_time = now
+    with _index_lock:
+        snapshot = _index_cache
 
     entries = _load_ledger(last_n=5000)
     # Build per-PID time ranges from ledger
@@ -1821,7 +1849,7 @@ def _build_pid_map():
 
     # Match transcript sessions to PIDs by overlapping time ranges
     result = {}
-    for uuid, entry in _index_cache.items():
+    for uuid, entry in snapshot.items():
         try:
             t_first = datetime.fromisoformat(entry["first_ts"])
             t_last = datetime.fromisoformat(entry["last_ts"])
@@ -1854,6 +1882,8 @@ def _get_call_history():
     """Aggregate tool calls per session from ledger. Returns list of dicts sorted by last activity.
     Includes recent tool details (merged from former Last Tool Activity panel).
     """
+    with _index_lock:
+        snapshot = _index_cache
     entries = _load_ledger(last_n=5000)
     tool_events = [e for e in entries if e.get("type") == "tool_use"]
     if not tool_events:
@@ -1918,7 +1948,7 @@ def _get_call_history():
             when_date = None
 
         # Source and project from index cache
-        idx_entry = _index_cache.get(sid, {})
+        idx_entry = snapshot.get(sid, {})
         source = idx_entry.get("source", "cli")
         project = idx_entry.get("project", "—")
 
@@ -1999,6 +2029,8 @@ def _compute_tool_feed_rows(last_n=200):
     """Return list of dicts with display-ready fields for tool feed.
     Each dict: ts_str, session, tool, directive, delta_str, delta_style
     """
+    with _index_lock:
+        snapshot = _index_cache
     entries = _load_ledger(last_n=500)
     tool_events = [e for e in entries if e.get("type") == "tool_use"][-last_n:]
     if not tool_events:
@@ -2059,7 +2091,7 @@ def _compute_tool_feed_rows(last_n=200):
         snippet = e.get("tool_snippet", "")
         # Strip cc- prefix from session for index lookup
         index_sid = session[3:] if session.startswith("cc-") else session
-        source = _index_cache.get(index_sid, {}).get("source", "cli")
+        source = snapshot.get(index_sid, {}).get("source", "cli")
         rows.append({
             "ts_str": ts_str,
             "session": session,
@@ -2224,6 +2256,8 @@ def _get_token_attribution():
     # type: () -> Dict[str, Any]
     """Compute per-session token consumption breakdown for current 5h window."""
     global _attribution_cache, _attribution_cache_time
+    with _index_lock:
+        snapshot = _index_cache
     now = time.time()
     if _attribution_cache and now - _attribution_cache_time < 30:
         return _attribution_cache
@@ -2268,7 +2302,7 @@ def _get_token_attribution():
     if not window_entries:
         return {}
 
-    # Backfill empty session IDs using _index_cache
+    # Backfill empty session IDs using snapshot
     for we in window_entries:
         if we["session"]:
             continue
@@ -2277,7 +2311,7 @@ def _get_token_attribution():
         # Try directive + timestamp match
         matched = False
         if directive:
-            for sid, entry in _index_cache.items():
+            for sid, entry in snapshot.items():
                 try:
                     ft = datetime.fromisoformat(entry["first_ts"].replace("Z", "+00:00"))
                     lt = datetime.fromisoformat(entry["last_ts"].replace("Z", "+00:00"))
@@ -2295,7 +2329,7 @@ def _get_token_attribution():
                     continue
         # Fallback: timestamp overlap only
         if not matched:
-            for sid, entry in _index_cache.items():
+            for sid, entry in snapshot.items():
                 try:
                     ft = datetime.fromisoformat(entry["first_ts"].replace("Z", "+00:00"))
                     lt = datetime.fromisoformat(entry["last_ts"].replace("Z", "+00:00"))
@@ -3232,6 +3266,8 @@ def _stars_display(score):
 
 
 def _score_window(window_start_ts, window_reset_ts):
+    with _index_lock:
+        snapshot = _index_cache
     entries = _load_ledger()
     window_entries = []
     for e in entries:
@@ -3260,7 +3296,7 @@ def _score_window(window_start_ts, window_reset_ts):
     _load_index()
     total_commits = 0
     window_projects = set()
-    for sid, entry in _index_cache.items():
+    for sid, entry in snapshot.items():
         try:
             lts = entry.get("last_ts", "")
             if not lts:
