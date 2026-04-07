@@ -1398,8 +1398,8 @@ class ProjectBoardScreen(Screen):
 
         # Left panel: project summary
         summary_table = RichTable(show_header=True, show_edge=False, pad_edge=False)
-        summary_table.add_column("Project", style="bold")
         summary_table.add_column("Co", style="dim")
+        summary_table.add_column("Project", style="bold")
         summary_table.add_column("Ready", style="yellow", justify="right")
         summary_table.add_column("Active", style="green", justify="right")
         summary_table.add_column("Built", style="dim", justify="right")
@@ -1409,8 +1409,8 @@ class ProjectBoardScreen(Screen):
             counts = by_project[proj]
             co_name, co_style = _project_to_company(proj)
             summary_table.add_row(
-                proj,
                 Text(co_name, style=co_style),
+                proj,
                 str(counts["ready"]),
                 str(counts["in_progress"]),
                 str(counts["built"]),
@@ -1426,19 +1426,20 @@ class ProjectBoardScreen(Screen):
         dt.cursor_type = "row"
         dt.zebra_stripes = True
         dt.add_column("#", width=5)
+        dt.add_column("Pri", width=6)
+        dt.add_column("Diff", width=7)
         dt.add_column("Status", width=12)
-        dt.add_column("Project", width=12)
         dt.add_column("Co", width=8)
+        dt.add_column("Project", width=12)
         dt.add_column("Task", width=35)
-        dt.add_column("Phase", width=10)
-        dt.add_column("Order", width=6)
-        dt.add_column("Claimed", width=10)
         dt.add_column("Notes")
 
-        # Sort: in_progress first, then ready, then blocked, then built
+        # Sort: in_progress first, then ready, then blocked, then built; within each, by priority
         status_order = {"in_progress": 0, "ready": 1, "blocked": 2, "built": 3, "archived": 4}
+        priority_order = {"critical": 0, "high": 1, "medium": 2, "low": 3}
         sorted_tasks = sorted(tasks, key=lambda t: (
             status_order.get(t.get("status", ""), 9),
+            priority_order.get((t.get("priority") or "medium").lower(), 9),
             t.get("build_order") or 9999,
         ))
 
@@ -1448,32 +1449,38 @@ class ProjectBoardScreen(Screen):
         built_tasks = [t for t in sorted_tasks if t.get("status") == "built"][:10]
         shown.extend(built_tasks)
 
+        _pri_label = {"critical": "P0", "high": "P1", "medium": "P2", "low": "P3"}
+        _pri_style = {"critical": "bold red", "high": "bold yellow", "medium": "cyan", "low": "dim"}
+        _diff_label = {"quick": "⚡qk", "easy": "📝ez", "medium": "🔨md", "complex": "⚙️cx", "major": "🏗️mj"}
+        _diff_style = {"quick": "green", "easy": "blue", "medium": "yellow", "complex": "bold yellow", "major": "bold red"}
+
         for t in shown:
             tid = str(t.get("id", ""))
             status = t.get("status", "?")
             status_icon = {"in_progress": "●", "ready": "○", "blocked": "◼", "built": "✓", "archived": "—"}.get(status, "?")
             status_style = {"in_progress": "green bold", "ready": "yellow", "blocked": "red", "built": "dim"}.get(status, "")
             co_name, co_style = _project_to_company(t.get("project", ""))
+            pri = (t.get("priority") or "medium").lower()
+            diff = (t.get("difficulty") or "").lower()
 
             dt.add_row(
                 Text(tid, justify="right"),
+                Text(_pri_label.get(pri, "—"), style=_pri_style.get(pri, "dim")),
+                Text(_diff_label.get(diff, "—"), style=_diff_style.get(diff, "dim")),
                 Text(f"{status_icon} {status}", style=status_style),
-                Text(t.get("project", "—"), style="cyan"),
                 Text(co_name, style=co_style),
+                Text(t.get("project", "—"), style="cyan"),
                 Text((t.get("task_name") or "—")[:35]),
-                Text((t.get("phase") or "—")[:10], style="dim"),
-                Text(str(t.get("build_order") or "—"), justify="right"),
-                Text((t.get("claimed_by") or "—")[:10], style="dim"),
                 Text((t.get("notes") or "—")[:30], style="dim"),
             )
 
         if not shown:
-            dt.add_row("", Text("No project tasks found", style="dim"), "", "", "", "", "", "", "")
+            dt.add_row("", "", "", Text("No project tasks found", style="dim"), "", "", "", "")
 
         if built_tasks:
             remaining_built = len([t for t in sorted_tasks if t.get("status") == "built"]) - 10
             if remaining_built > 0:
-                dt.add_row("", Text(f"... and {remaining_built} more built tasks", style="dim"), "", "", "", "", "", "", "")
+                dt.add_row("", "", "", Text(f"... and {remaining_built} more built tasks", style="dim"), "", "", "", "")
 
     def action_pop_screen(self):
         self.app.pop_screen()
