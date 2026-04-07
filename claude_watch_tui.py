@@ -1631,6 +1631,8 @@ class SessionTasksView(LazyView):
         Binding("enter", "toggle_done", "Done"),
         Binding("r", "roll_item", "Roll"),
         Binding("d", "delete_item", "Delete"),
+        Binding("slash", "start_filter", "Filter"),
+        Binding("a", "show_all", "All"),
     ]
 
     def compose(self) -> ComposeResult:
@@ -1659,6 +1661,8 @@ class SessionTasksView(LazyView):
         self._items = []
         self._window_start = ""
         self._editing_id = None
+        self._filtering = False
+        self._filter_text = ""
 
         # Compute window_start from burndown data
         bd = _get_burndown_data()
@@ -1706,16 +1710,26 @@ class SessionTasksView(LazyView):
         # Fetch items
         self._items = _get_cycle_items(self._window_start)
 
+        # Apply filter if active
+        display_items = self._items
+        if self._filter_text:
+            ft = self._filter_text.lower()
+            display_items = [
+                i for i in self._items
+                if ft in (i.get("title") or "").lower()
+                or ft in (i.get("project") or "").lower()
+            ]
+
         # Rebuild table
         dt = self.query_one("#cm-table", DataTable)
         dt.clear()
 
-        open_count = sum(1 for i in self._items if i.get("status") == "open")
-        done_count = sum(1 for i in self._items if i.get("status") == "done")
+        open_count = sum(1 for i in display_items if i.get("status") == "open")
+        done_count = sum(1 for i in display_items if i.get("status") == "done")
 
         # Group by category
         groups = {}
-        for item in self._items:
+        for item in display_items:
             cat = item.get("category", "task")
             groups.setdefault(cat, []).append(item)
 
@@ -1752,7 +1766,7 @@ class SessionTasksView(LazyView):
                     key=f"ci-{item['id']}",
                 )
 
-        if not self._items:
+        if not display_items:
             dt.add_row(
                 Text(""),
                 Text(""),
@@ -1771,10 +1785,11 @@ class SessionTasksView(LazyView):
         cycle = _get_current_cycle()
         stars = cycle.get("stars", "") if cycle else ""
 
+        filter_str = f"  [yellow][filter: \"{self._filter_text}\"][/yellow]" if self._filter_text else ""
         self.query_one("#cm-header", Static).update(
             f"[bold]CYCLE MONITOR[/bold]  resets in {time_str}  {stars}  "
-            f"[green]{open_count} open[/green]  [dim]{done_count} done[/dim]  "
-            f"[dim](n=add  e=edit  Enter=done  r=roll  d=delete  q=back)[/dim]"
+            f"[green]{open_count} open[/green]  [dim]{done_count} done[/dim]{filter_str}  "
+            f"[dim](n=add  /=filter  a=all  e=edit  Enter=done  r=roll  d=delete  q=back)[/dim]"
         )
 
         # Previous cycles
@@ -1810,6 +1825,31 @@ class SessionTasksView(LazyView):
                 return item
         return None
 
+    def action_start_filter(self):
+        from textual.widgets import Input
+        self._filtering = True
+        inp = self.query_one("#cm-add-input", Input)
+        inp.value = self._filter_text
+        inp.placeholder = "Filter items... (Enter=apply, Esc=clear)"
+        inp.focus()
+
+    def action_show_all(self):
+        self._filtering = False
+        self._filter_text = ""
+        from textual.widgets import Input
+        inp = self.query_one("#cm-add-input", Input)
+        inp.placeholder = "Add item... (Tab=cat, Shift+Tab=project, Enter=save)"
+        self._reload()
+        self.query_one("#cm-table", DataTable).focus()
+
+    def on_input_changed(self, event):
+        from textual.widgets import Input
+        if event.input != self.query_one("#cm-add-input", Input):
+            return
+        if self._filtering:
+            self._filter_text = event.value.strip()
+            self._reload()
+
     def action_focus_add(self):
         from textual.widgets import Input
         self.query_one("#cm-add-input", Input).focus()
@@ -1824,6 +1864,16 @@ class SessionTasksView(LazyView):
         from textual.widgets import Input
         inp = self.query_one("#cm-add-input", Input)
         if not inp.has_focus:
+            return
+        if event.key == "escape" and self._filtering:
+            event.prevent_default()
+            event.stop()
+            self._filtering = False
+            self._filter_text = ""
+            inp.value = ""
+            inp.placeholder = "Add item... (Tab=cat, Shift+Tab=project, Enter=save)"
+            self._reload()
+            self.query_one("#cm-table", DataTable).focus()
             return
         if event.key == "tab":
             event.prevent_default()
@@ -1849,6 +1899,13 @@ class SessionTasksView(LazyView):
         from claude_watch_data import _post_cycle_item, _update_cycle_item
         inp = self.query_one("#cm-add-input", Input)
         if event.input != inp:
+            return
+        if self._filtering:
+            self._filtering = False
+            self._filter_text = event.value.strip()
+            inp.placeholder = "Add item... (Tab=cat, Shift+Tab=project, Enter=save)"
+            self._reload()
+            self.query_one("#cm-table", DataTable).focus()
             return
         title = event.value.strip()
         if not title:
