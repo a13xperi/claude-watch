@@ -3,7 +3,9 @@ claude-watch data layer — shared by Rich and Textual versions.
 All data fetching, caching, and computation lives here.
 """
 
+import csv
 import json
+import os
 import re
 import subprocess
 import threading
@@ -1297,6 +1299,115 @@ def _format_cost(cost):
         return f"${cost:.2f}"
     else:
         return f"${cost:.1f}"
+
+
+def export_session_history_csv(filepath):
+    # type: (str) -> int
+    """Export session history to CSV file. Returns number of rows written."""
+    sessions = _get_session_history()
+    count = 0
+    with open(filepath, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            "date", "session_id", "ccid", "source", "company", "project",
+            "model", "duration_min", "five_pct", "output_tokens", "cost_usd",
+            "directive",
+        ])
+        for s in sessions:
+            # Compute duration in minutes
+            try:
+                first_ts = s.get("first_ts")
+                last_ts = s.get("last_ts")
+                if first_ts and last_ts:
+                    secs = int((last_ts - first_ts).total_seconds())
+                    duration_min = round(secs / 60.0, 1)
+                else:
+                    duration_min = ""
+            except Exception:
+                duration_min = ""
+
+            # Derive company from project
+            project = s.get("project", "")
+            p_lower = (project or "").lower().strip()
+            if p_lower in ("atlas", "atlas-be", "atlas-fe"):
+                company = "Delphi"
+            elif p_lower in ("kaa",):
+                company = "KAA"
+            elif p_lower in ("frank",):
+                company = "Frank"
+            elif p_lower in ("openclaw", "paperclip", "claude-watch"):
+                company = "Personal"
+            else:
+                company = ""
+
+            # CCID from index
+            idx_entry = _index_cache.get(s["session_id"], {})
+            ccid = idx_entry.get("ccid", "")
+
+            out_tokens = s.get("output_tokens", 0)
+            cost = _estimate_cost(out_tokens, s.get("model", ""))
+
+            writer.writerow([
+                s.get("date", ""),
+                s["session_id"],
+                ccid,
+                s.get("source", ""),
+                company,
+                project,
+                s.get("model", ""),
+                duration_min,
+                s.get("pct_str", ""),
+                out_tokens,
+                round(cost, 4),
+                s.get("directive", ""),
+            ])
+            count += 1
+    return count
+
+
+# ── system notifications ────────────────────────────────────────────────────
+
+NOTIFICATION_COOLDOWN = 300  # 5 min between repeat notifications
+_last_notified = {}  # type: Dict[str, float]
+
+
+def send_system_notification(title, body):
+    # type: (str, str) -> None
+    """Send a macOS system notification via osascript."""
+    try:
+        escaped_body = body.replace('"', '\\"')
+        escaped_title = title.replace('"', '\\"')
+        subprocess.run(
+            ["osascript", "-e",
+             'display notification "' + escaped_body + '" with title "' + escaped_title + '"'],
+            timeout=3, capture_output=True,
+        )
+    except Exception:
+        pass
+
+
+def check_and_notify(five_pct, seven_pct, burn_rate=None):
+    # type: (float, float, Optional[float]) -> None
+    """Fire system notifications on spike conditions. Respects cooldown per type."""
+    now = time.time()
+
+    if five_pct > 80:
+        key = "five_pct_high"
+        if now - _last_notified.get(key, 0) >= NOTIFICATION_COOLDOWN:
+            send_system_notification("claude-watch", "5h window at {:.0f}%".format(five_pct))
+            _last_notified[key] = now
+
+    if seven_pct > 90:
+        key = "seven_pct_high"
+        if now - _last_notified.get(key, 0) >= NOTIFICATION_COOLDOWN:
+            send_system_notification("claude-watch", "7d window at {:.0f}%".format(seven_pct))
+            _last_notified[key] = now
+
+    if burn_rate is not None and burn_rate > 2.0:
+        key = "burn_rate_high"
+        if now - _last_notified.get(key, 0) >= NOTIFICATION_COOLDOWN:
+            send_system_notification("claude-watch", "High burn rate: {:.1f}%/min".format(burn_rate))
+            _last_notified[key] = now
 
 
 def _get_session_turns(session_id):
@@ -2733,4 +2844,187 @@ def _get_project_tasks(project=None):
         with urllib.request.urlopen(req, timeout=5) as resp:
             return _json.loads(resp.read())
     except Exception:
+        return []  # end of _get_project_tasks
+
+
+# ── Window Scoring (Gamification) ────────────────────────────────────────────
+
+WINDOW_SCORES_FILE = Path.home() / ".claude/logs/window-scores.jsonl"
+
+
+def _score_dimension(value, threshold):
+    if threshold <= 0:
+        return 5.0
+    return round(min(value / threshold, 1.0) * 5.0, 1)
+
+
+def _stars_display(score):
+    full = int(score)
+    half = (score - full) >= 0.25
+    empty = 5 - full - (1 if half else 0)
+    return "★" * full + ("½" if half else "") + "☆" * empty
+
+
+def _score_window(window_start_ts, window_reset_ts):
+    entries = _load_ledger()
+    window_entries = []
+    for e in entries:
+        try:
+            ts = datetime.fromisoformat(e["ts"].replace("Z", "+00:00"))
+            if window_start_ts <= ts <= window_reset_ts:
+                window_entries.append(e)
+        except Exception:
+            pass
+    if not window_entries:
+        return None
+
+    last_five = 0
+    for e in reversed(window_entries):
+        if e.get("five_pct") is not None:
+            last_five = float(e["five_pct"])
+            break
+    burn_score = _score_dimension(last_five, 95.0)
+
+    max_parallel = 0
+    for e in window_entries:
+        if e.get("type") == "tool_drain" and e.get("cli_sessions", 0) > max_parallel:
+            max_parallel = e["cli_sessions"]
+    para_score = _score_dimension(max_parallel, 4)
+
+    _load_index()
+    total_commits = 0
+    window_projects = set()
+    for sid, entry in _index_cache.items():
+        try:
+            lts = entry.get("last_ts", "")
+            if not lts:
+                continue
+            sts = datetime.fromisoformat(lts.replace("Z", "+00:00"))
+            if window_start_ts <= sts <= window_reset_ts + timedelta(minutes=30):
+                total_commits += len(entry.get("accomplishments", {}).get("git_commits", []))
+                proj = entry.get("project", "")
+                if proj and proj != "\u2014":
+                    window_projects.add(proj)
+        except Exception:
+            pass
+    ship_score = _score_dimension(total_commits, 5)
+
+    for e in window_entries:
+        if e.get("type") == "tool_use":
+            d = (e.get("directive") or "").lower()
+            for p in ("atlas", "claude-watch", "paperclip", "openclaw", "frank", "kaa"):
+                if p in d:
+                    window_projects.add(p)
+    breadth_score = _score_dimension(len(window_projects), 4)
+
+    drain_rates = []
+    drain_ts = []
+    for e in window_entries:
+        if e.get("type") == "tool_drain":
+            r = e.get("burn_rate_per_min", 0)
+            if r > 0:
+                drain_rates.append(r)
+            try:
+                drain_ts.append(datetime.fromisoformat(e["ts"].replace("Z", "+00:00")))
+            except Exception:
+                pass
+    avg_rate = sum(drain_rates) / len(drain_rates) if drain_rates else 0
+    idle_gaps = 0
+    drain_ts.sort()
+    for i in range(1, len(drain_ts)):
+        if (drain_ts[i] - drain_ts[i - 1]).total_seconds() > 600:
+            idle_gaps += 1
+    rate_score = _score_dimension(avg_rate, 1.0)
+    vel_score = max(0.0, round(rate_score - min(idle_gaps * 0.5, 3.0), 1))
+
+    overall = round(
+        burn_score * 0.30 + para_score * 0.20 + ship_score * 0.20
+        + breadth_score * 0.15 + vel_score * 0.15, 1)
+    overall = round(overall * 2) / 2
+
+    return {
+        "window_start": window_start_ts.isoformat(),
+        "window_reset": window_reset_ts.isoformat(),
+        "burn": burn_score, "parallelism": para_score,
+        "shipping": ship_score, "breadth": breadth_score,
+        "velocity": vel_score, "overall": overall,
+        "stars": _stars_display(overall),
+        "burn_pct": last_five, "max_parallel": max_parallel,
+        "commits": total_commits, "projects": len(window_projects),
+        "avg_rate": round(avg_rate, 2),
+    }
+
+
+def _save_window_score(score):
+    if not score:
+        return
+    try:
+        WINDOW_SCORES_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with open(WINDOW_SCORES_FILE, "a") as f:
+            f.write(json.dumps(score) + "\n")
+    except Exception:
+        pass
+
+
+def _get_window_scores(limit=20):
+    if not WINDOW_SCORES_FILE.exists():
         return []
+    scores = []
+    try:
+        with open(WINDOW_SCORES_FILE) as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    try:
+                        scores.append(json.loads(line))
+                    except Exception:
+                        pass
+    except Exception:
+        pass
+    scores.reverse()
+    return scores[:limit]
+
+
+def _get_streak(scores=None):
+    if scores is None:
+        scores = _get_window_scores()
+    streak = 0
+    for s in scores:
+        if s.get("overall", 0) >= 4.0:
+            streak += 1
+        else:
+            break
+    return streak
+
+
+_last_scored_window = None
+
+
+def _check_and_score_completed_window():
+    global _last_scored_window
+    try:
+        data = _get_burndown_data()
+        if not data:
+            return None
+        window_start = data["window_start"]
+        window_key = window_start.isoformat()
+        if _last_scored_window == window_key:
+            return None
+        _last_scored_window = window_key
+
+        existing = _get_window_scores(limit=5)
+        for s in existing:
+            if s.get("window_start") == window_key:
+                return None
+
+        prev_reset = window_start
+        prev_start = prev_reset - timedelta(hours=5)
+        score = _score_window(prev_start, prev_reset)
+        if score and score.get("burn_pct", 0) > 1:
+            streak = _get_streak(existing)
+            score["streak"] = (streak + 1) if score["overall"] >= 4.0 else 0
+            _save_window_score(score)
+            return score
+    except Exception:
+        pass
+    return None

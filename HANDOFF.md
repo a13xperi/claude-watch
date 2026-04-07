@@ -3,7 +3,12 @@
 ## What This Is
 Real-time terminal dashboard for monitoring Claude Code token usage. GitHub: a13xperi/claude-watch
 
-## Current State (v0.7 — merged history, MCP stats, agents panel, hot reload)
+## Current State (v0.8 — CSV export, system notifications, cost polish)
+
+**v0.8 features (built on top of v0.7):**
+- **CSV Export (`e`)**: Press `e` to export full session history to `~/Downloads/claude-watch-YYYYMMDD-HHMMSS.csv`. Columns: date, session_id, ccid, source, company, project, model, duration_min, five_pct, output_tokens, cost_usd, directive. Data layer: `export_session_history_csv(filepath) -> int`
+- **System Notifications on Spike**: macOS notifications via osascript fire when 5h > 80%, 7d > 90%, or burn rate > 2.0%/min. 5-minute cooldown per notification type. Data layer: `check_and_notify()`, `send_system_notification()`, called from TUI refresh timer
+- **Cost Column Polish**: Verified cost column in Session History (per-row), drill-down summary bar, and tool call sub-rows — all already present from v0.7.1
 
 **v0.7 features (built on top of v0.6):**
 - **Hot reload**: File watcher auto-restarts TUI when .py files change (exit code 42 restart loop)
@@ -38,7 +43,7 @@ Real-time terminal dashboard for monitoring Claude Code token usage. GitHub: a13
 **Hook:** `~/.claude/hooks/token-tracker.sh` — captures tool_snippet, model, output_tokens
 
 **Keybindings:**
-- `q` quit, `r` refresh, `u` usage metrics, `m` MCP stats, `h` toggle health, `Tab`/`Shift+Tab` focus panels
+- `q` quit, `r` refresh, `e` export CSV, `u` usage metrics, `m` MCP stats, `h` toggle health, `Tab`/`Shift+Tab` focus panels
 - `/` search/filter sessions, `Escape` clear search
 - `Enter`/`f` on Active Sessions → focus that session's Warp terminal
 - `Enter` on Session History → drill-down (accomplishments view)
@@ -51,14 +56,13 @@ Real-time terminal dashboard for monitoring Claude Code token usage. GitHub: a13
 - `python3 claude_watch_tui.py --session 72887 --context` → resume context packet
 - `python3 claude_watch_tui.py --list` → recent sessions table/JSON
 
-## What's Next (v0.8)
+## What's Next (v0.9)
 
 ### Ideas
-- Export session history to CSV
-- Per-session cost estimation ($)
-- Alert notifications (system notification on spike)
 - Nested row expansion in Session History (expand to see full tool call detail)
 - Multi-account capacity view (A/B/C usage side by side)
+- Notification preferences (configurable thresholds, mute toggle)
+- CSV export filtering (date range, project, source)
 
 ## Key Context
 - Python 3.9.6 (no `X | None` type hints)

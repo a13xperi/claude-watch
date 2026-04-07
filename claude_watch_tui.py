@@ -51,6 +51,8 @@ from claude_watch_data import (
     _load_index,
     _load_ledger,
     _shorten_tool,
+    check_and_notify,
+    export_session_history_csv,
     focus_session_terminal,
     lookup_by_ccid,
     make_drain_panel,
@@ -716,6 +718,27 @@ class BurndownChart(Static):
             bm, bs = burn_secs // 60, burn_secs % 60
             burn_title = f"  [bold magenta]BURN {bm}m {bs:02d}s[/bold magenta]"
 
+        # Live window score
+        from claude_watch_data import (
+            _score_window as _sw, _get_window_scores, _get_streak, _stars_display,
+        )
+        live_score = _sw(window_start, window_reset)
+        if live_score:
+            stars = live_score["stars"]
+            ov = live_score["overall"]
+            star_color = "green" if ov >= 4 else ("yellow" if ov >= 3 else "red")
+            score_line = (
+                f"  [{star_color}]{stars} {ov}[/{star_color}]"
+                f"  [dim]B:{live_score['burn']:.0f} P:{live_score['parallelism']:.0f}"
+                f" S:{live_score['shipping']:.0f} Br:{live_score['breadth']:.0f}"
+                f" V:{live_score['velocity']:.0f}[/dim]"
+            )
+            streak = _get_streak()
+            if streak >= 3:
+                score_line += f"  [bold yellow]🔥{streak}-streak[/bold yellow]"
+        else:
+            score_line = ""
+
         # Build right-side lines (aligned with chart rows)
         r = [
             f"  [bold {used_color}]{used_pct:.0f}% Used[/bold {used_color}]  [bold {left_color}]{remaining:.0f}% Left[/bold {left_color}]",
@@ -724,7 +747,7 @@ class BurndownChart(Static):
             f"  [{acct_color}]Acct {label}[/{acct_color}]: {name} [dim]({lane})[/dim]",
             f"  {pace_str}",
             f"  {verdict}",
-            f"  {details_line}",
+            score_line,
         ]
 
         lines = [
@@ -1374,47 +1397,65 @@ class ProjectBoardScreen(Screen):
         total = len(tasks)
         by_status = {}
         by_project = {}
+        total_points = 0
+        done_points = 0
+        dispatch_ready = 0
+        total_tokens_k = 0
         for t in tasks:
             s = t.get("status", "?")
             p = t.get("project", "?")
+            pts = t.get("points") or 0
             by_status[s] = by_status.get(s, 0) + 1
             if p not in by_project:
                 by_project[p] = {"ready": 0, "in_progress": 0, "built": 0, "blocked": 0}
             if s in by_project[p]:
                 by_project[p][s] += 1
+            total_points += pts
+            if s == "built":
+                done_points += pts
+            if s == "ready" and t.get("dispatch_prompt") and (t.get("tier") or "auto") == "auto" and not t.get("blocked_by"):
+                dispatch_ready += 1
+            if s in ("ready", "in_progress"):
+                total_tokens_k += t.get("est_tokens_k") or 0
 
         ready = by_status.get("ready", 0)
         in_prog = by_status.get("in_progress", 0)
         built = by_status.get("built", 0)
         blocked = by_status.get("blocked", 0)
+        remaining_points = total_points - done_points
 
         self.query_one("#pboard-header", Static).update(
             f"[bold]Project Board[/bold]  "
             f"[yellow]{ready} ready[/yellow]  "
-            f"[green]{in_prog} in progress[/green]  "
-            f"[dim]{built} built  {blocked} blocked  {total} total  "
-            f"(Escape / q to go back)[/dim]"
+            f"[green]{in_prog} active[/green]  "
+            f"[dim]{built} built  {blocked} blocked  {total} total[/dim]  "
+            f"│  [bold magenta]{dispatch_ready} dispatchable[/bold magenta]  "
+            f"[cyan]{remaining_points}pts left[/cyan]  "
+            f"[magenta]~{total_tokens_k}kT queued[/magenta]  "
+            f"[dim](q to go back)[/dim]"
         )
 
         # Left panel: project summary
         summary_table = RichTable(show_header=True, show_edge=False, pad_edge=False)
         summary_table.add_column("Co", style="dim")
         summary_table.add_column("Project", style="bold")
-        summary_table.add_column("Ready", style="yellow", justify="right")
-        summary_table.add_column("Active", style="green", justify="right")
-        summary_table.add_column("Built", style="dim", justify="right")
-        summary_table.add_column("Blocked", style="red", justify="right")
+        summary_table.add_column("Rdy", style="yellow", justify="right")
+        summary_table.add_column("Act", style="green", justify="right")
+        summary_table.add_column("Blt", style="dim", justify="right")
+        summary_table.add_column("Pts", style="cyan", justify="right")
 
         for proj in sorted(by_project.keys()):
             counts = by_project[proj]
             co_name, co_style = _project_to_company(proj)
+            proj_pts = sum(t.get("points") or 0 for t in tasks
+                          if t.get("project") == proj and t.get("status") in ("ready", "in_progress"))
             summary_table.add_row(
                 Text(co_name, style=co_style),
                 proj,
                 str(counts["ready"]),
                 str(counts["in_progress"]),
                 str(counts["built"]),
-                str(counts["blocked"]),
+                str(proj_pts) if proj_pts else "—",
             )
 
         self.query_one("#pboard-summary", Static).update(
@@ -1426,13 +1467,15 @@ class ProjectBoardScreen(Screen):
         dt.cursor_type = "row"
         dt.zebra_stripes = True
         dt.add_column("#", width=5)
-        dt.add_column("Pri", width=6)
-        dt.add_column("Diff", width=7)
-        dt.add_column("Status", width=12)
-        dt.add_column("Co", width=8)
-        dt.add_column("Project", width=12)
+        dt.add_column("Pri", width=4)
+        dt.add_column("Diff", width=5)
+        dt.add_column("Pts", width=3)
+        dt.add_column("Tier", width=5)
+        dt.add_column("~kT", width=4)
+        dt.add_column("St", width=12)
+        dt.add_column("Project", width=10)
         dt.add_column("Task", width=35)
-        dt.add_column("Notes")
+        dt.add_column("🚀", width=2)  # dispatch-ready indicator
 
         # Sort: in_progress first, then ready, then blocked, then built; within each, by priority
         status_order = {"in_progress": 0, "ready": 1, "blocked": 2, "built": 3, "archived": 4}
@@ -1451,36 +1494,49 @@ class ProjectBoardScreen(Screen):
 
         _pri_label = {"critical": "P0", "high": "P1", "medium": "P2", "low": "P3"}
         _pri_style = {"critical": "bold red", "high": "bold yellow", "medium": "cyan", "low": "dim"}
-        _diff_label = {"quick": "⚡qk", "easy": "📝ez", "medium": "🔨md", "complex": "⚙️cx", "major": "🏗️mj"}
+        _diff_label = {"quick": "⚡", "easy": "📝", "medium": "🔨", "complex": "⚙️", "major": "🏗️"}
         _diff_style = {"quick": "green", "easy": "blue", "medium": "yellow", "complex": "bold yellow", "major": "bold red"}
+        _tier_style = {"auto": "green bold", "assisted": "yellow", "manual": "red"}
 
         for t in shown:
             tid = str(t.get("id", ""))
             status = t.get("status", "?")
             status_icon = {"in_progress": "●", "ready": "○", "blocked": "◼", "built": "✓", "archived": "—"}.get(status, "?")
             status_style = {"in_progress": "green bold", "ready": "yellow", "blocked": "red", "built": "dim"}.get(status, "")
-            co_name, co_style = _project_to_company(t.get("project", ""))
             pri = (t.get("priority") or "medium").lower()
             diff = (t.get("difficulty") or "").lower()
+            tier = (t.get("tier") or "auto").lower()
+            pts = t.get("points")
+            tok = t.get("est_tokens_k")
+            has_prompt = bool(t.get("dispatch_prompt"))
+            blocked = t.get("blocked_by")
+
+            # Dispatch-ready: has prompt, is auto tier, not blocked
+            dispatch_ready = has_prompt and tier == "auto" and not blocked
+            dispatch_icon = "✓" if dispatch_ready else ("⊘" if blocked else "")
+            dispatch_style = "green bold" if dispatch_ready else ("red" if blocked else "dim")
 
             dt.add_row(
                 Text(tid, justify="right"),
                 Text(_pri_label.get(pri, "—"), style=_pri_style.get(pri, "dim")),
                 Text(_diff_label.get(diff, "—"), style=_diff_style.get(diff, "dim")),
+                Text(str(pts) if pts else "—", justify="right", style="bold" if pts else "dim"),
+                Text(tier[:4], style=_tier_style.get(tier, "dim")),
+                Text(str(tok) if tok else "—", justify="right", style="magenta" if tok else "dim"),
                 Text(f"{status_icon} {status}", style=status_style),
-                Text(co_name, style=co_style),
-                Text(t.get("project", "—"), style="cyan"),
+                Text(t.get("project", "—")[:10], style="cyan"),
                 Text((t.get("task_name") or "—")[:35]),
-                Text((t.get("notes") or "—")[:30], style="dim"),
+                Text(dispatch_icon, style=dispatch_style),
             )
 
         if not shown:
-            dt.add_row("", "", "", Text("No project tasks found", style="dim"), "", "", "", "")
+            dt.add_row(*[""] * 10)
 
         if built_tasks:
             remaining_built = len([t for t in sorted_tasks if t.get("status") == "built"]) - 10
             if remaining_built > 0:
-                dt.add_row("", "", "", Text(f"... and {remaining_built} more built tasks", style="dim"), "", "", "", "")
+                row = ["", "", "", "", "", "", Text(f"... +{remaining_built} built", style="dim"), "", "", ""]
+                dt.add_row(*row)
 
     def action_pop_screen(self):
         self.app.pop_screen()
@@ -1807,6 +1863,7 @@ class ClaudeWatchApp(App):
     BINDINGS = [
         Binding("q", "quit", "Quit"),
         Binding("r", "force_refresh", "Refresh"),
+        Binding("e", "export_csv", "Export CSV"),
         Binding("u", "show_usage", "Usage"),
         Binding("m", "show_mcp", "MCP"),
         Binding("s", "show_session_tasks", "Tasks"),
@@ -1883,9 +1940,39 @@ class ClaudeWatchApp(App):
         # CallHistoryTable removed — merged into SessionHistoryTable sub-rows
         self.query_one("#drain", DrainPanel).update_content()
 
+        # System notifications on spike
+        try:
+            five_f = float(five)
+            seven_f = float(seven)
+            burndown = _get_burndown_data()
+            burn_rate = burndown.get("current_rate") if burndown else None
+            check_and_notify(five_f, seven_f, burn_rate)
+        except (ValueError, TypeError):
+            pass
+
     def action_force_refresh(self):
         self.build_index()
         self.refresh_data()
+
+    def action_export_csv(self):
+        filename = os.path.expanduser(
+            "~/Downloads/claude-watch-{}.csv".format(
+                datetime.now().strftime("%Y%m%d-%H%M%S")
+            )
+        )
+        try:
+            count = export_session_history_csv(filename)
+            self.notify(
+                "{} rows exported to {}".format(count, filename),
+                severity="information",
+                timeout=5,
+            )
+        except Exception as exc:
+            self.notify(
+                "Export failed: {}".format(exc),
+                severity="error",
+                timeout=5,
+            )
 
     def action_show_usage(self):
         self.push_screen(UsageMetricsScreen())
