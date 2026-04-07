@@ -132,6 +132,24 @@ Screen {
     max-height: 12;
 }
 
+/* ── Token Attribution ── */
+#attribution {
+    height: auto;
+    max-height: 6;
+}
+
+#attr-header {
+    height: auto;
+    max-height: 3;
+    padding: 0 1;
+}
+
+#attr-table {
+    height: 1fr;
+    border: solid yellow;
+    border-title-color: white;
+}
+
 /* ── Search input ── */
 #search-input {
     height: auto;
@@ -203,17 +221,51 @@ DataTable > .datatable--header {
     text-style: bold;
 }
 
-/* ── Session Tasks screen ── */
-#stasks-header {
+/* -- Cycle Monitor screen -- */
+#cm-header {
     height: auto;
-    max-height: 2;
+    max-height: 3;
     padding: 0 1;
 }
 
-#stasks-table {
+#cm-add-row {
+    height: 3;
+    padding: 0 1;
+}
+
+#cm-add-input {
+    width: 1fr;
+    height: 3;
+    border: solid cyan;
+}
+
+.cm-cat {
+    min-width: 8;
+    height: 3;
+    margin: 0 0 0 1;
+}
+
+#cm-project-row {
+    height: 3;
+    padding: 0 1;
+}
+
+.cm-proj {
+    min-width: 6;
+    height: 3;
+    margin: 0 0 0 1;
+}
+
+#cm-table {
     height: 1fr;
     border: solid green;
     border-title-color: white;
+}
+
+#cm-prev {
+    height: auto;
+    max-height: 6;
+    padding: 0 1;
 }
 
 /* ── Project Board screen ── */

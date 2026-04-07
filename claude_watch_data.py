@@ -8,6 +8,7 @@ import json
 import os
 import re
 import subprocess
+import tempfile
 import threading
 import time
 from collections import defaultdict
@@ -186,6 +187,52 @@ def _active_sessions():
 def _active_pids():
     """Return set of active cc-{PID} session IDs."""
     return {f"cc-{item[0]}" for item in _active_sessions()}
+
+
+# ── peer sessions (Supabase session_locks) ────────────────────────────────
+
+_peer_cache = None  # type: Optional[Tuple[float, List[Dict[str, Any]]]]
+_PEER_CACHE_TTL = 10  # seconds
+
+
+def _get_peer_sessions():
+    # type: () -> List[Dict[str, Any]]
+    """Fetch active sessions from Supabase session_locks table.
+
+    Returns list of dicts with: session_id, tool, repo, task_name, account,
+    claimed_at, heartbeat_at, files_touched.  Cached for 10 seconds.
+    """
+    global _peer_cache
+    now = time.time()
+    if _peer_cache is not None:
+        cached_at, cached_data = _peer_cache
+        if now - cached_at < _PEER_CACHE_TTL:
+            return cached_data
+
+    import urllib.request
+    import json as _json
+
+    url = (
+        "{base}/session_locks"
+        "?status=eq.active"
+        "&order=claimed_at.desc"
+        "&select=session_id,tool,repo,task_name,account,claimed_at,heartbeat_at,files_touched"
+    ).format(base=_SUPABASE_URL)
+
+    req = urllib.request.Request(url, headers={
+        "apikey": _SUPABASE_KEY,
+        "Authorization": "Bearer " + _SUPABASE_KEY,
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            rows = _json.loads(resp.read())
+        _peer_cache = (now, rows)
+        return rows
+    except Exception:
+        # On error, return stale cache if available, else empty
+        if _peer_cache is not None:
+            return _peer_cache[1]
+        return []
 
 
 def _get_conversation_title(pid):
@@ -2135,6 +2182,181 @@ def _get_burndown_data():
     }  # type: Dict[str, Any]
     _burndown_cache = result
     _burndown_cache_time = now
+    return result
+
+
+# ── token attribution ──────────────────────────────────────────────────────
+
+_attribution_cache = None  # type: Optional[Dict]
+_attribution_cache_time = 0.0
+
+_ATTR_COLORS = ["red", "dodgerblue", "green", "yellow", "magenta", "cyan", "dark_orange", "deep_pink"]
+
+
+def _get_token_attribution():
+    # type: () -> Dict[str, Any]
+    """Compute per-session token consumption breakdown for current 5h window."""
+    global _attribution_cache, _attribution_cache_time
+    now = time.time()
+    if _attribution_cache and now - _attribution_cache_time < 30:
+        return _attribution_cache
+
+    five, _, five_reset_ts, _ = _current_pct()
+    if five == "?" or not five_reset_ts:
+        return {}
+
+    try:
+        reset = datetime.fromisoformat(five_reset_ts.replace("Z", "+00:00"))
+        now_utc = datetime.now(timezone.utc)
+        window_start = reset - timedelta(hours=5)
+        current_five_pct = float(five)
+    except Exception:
+        return {}
+
+    # Load ledger entries in window, filter to tool_use
+    entries = _load_ledger()
+    window_entries = []  # type: List[Dict]
+    for e in entries:
+        if e.get("type") != "tool_use":
+            continue
+        pct = e.get("five_pct")
+        if pct is None:
+            continue
+        try:
+            ts = datetime.fromisoformat(e["ts"].replace("Z", "+00:00"))
+            if ts < window_start:
+                continue
+            window_entries.append({
+                "ts": ts,
+                "session": e.get("session", ""),
+                "directive": e.get("directive", ""),
+                "five_pct": float(pct),
+                "output_tokens": e.get("output_tokens", 0),
+                "model": e.get("model", ""),
+                "tool": e.get("tool", ""),
+            })
+        except Exception:
+            continue
+
+    if not window_entries:
+        return {}
+
+    # Backfill empty session IDs using _index_cache
+    for we in window_entries:
+        if we["session"]:
+            continue
+        ts = we["ts"]
+        directive = we["directive"]
+        # Try directive + timestamp match
+        matched = False
+        if directive:
+            for sid, entry in _index_cache.items():
+                try:
+                    ft = datetime.fromisoformat(entry["first_ts"].replace("Z", "+00:00"))
+                    lt = datetime.fromisoformat(entry["last_ts"].replace("Z", "+00:00"))
+                    if ft.tzinfo is None:
+                        ft = ft.replace(tzinfo=timezone.utc)
+                    if lt.tzinfo is None:
+                        lt = lt.replace(tzinfo=timezone.utc)
+                    if ft <= ts <= lt + timedelta(minutes=5):
+                        e_dir = entry.get("directive", "") or entry.get("gravity", "")
+                        if e_dir and directive.lower() in e_dir.lower():
+                            we["session"] = sid
+                            matched = True
+                            break
+                except Exception:
+                    continue
+        # Fallback: timestamp overlap only
+        if not matched:
+            for sid, entry in _index_cache.items():
+                try:
+                    ft = datetime.fromisoformat(entry["first_ts"].replace("Z", "+00:00"))
+                    lt = datetime.fromisoformat(entry["last_ts"].replace("Z", "+00:00"))
+                    if ft.tzinfo is None:
+                        ft = ft.replace(tzinfo=timezone.utc)
+                    if lt.tzinfo is None:
+                        lt = lt.replace(tzinfo=timezone.utc)
+                    if ft <= ts <= lt + timedelta(minutes=5):
+                        we["session"] = sid
+                        break
+                except Exception:
+                    continue
+
+    # Group remaining unmatched by directive
+    for we in window_entries:
+        if not we["session"]:
+            d = we["directive"] or "unknown"
+            we["session"] = "unknown-" + d
+
+    # Sort by timestamp
+    window_entries.sort(key=lambda e: e["ts"])
+
+    # Compute per-session consumption using consecutive-delta method
+    session_deltas = defaultdict(float)  # type: Dict[str, float]
+    session_meta = {}  # type: Dict[str, Dict]
+
+    for we in window_entries:
+        sid = we["session"]
+        if sid not in session_meta:
+            session_meta[sid] = {
+                "directive": we["directive"],
+                "first_ts": we["ts"],
+                "last_ts": we["ts"],
+                "output_tokens": 0,
+                "model_counts": defaultdict(int),
+                "tool_count": 0,
+            }
+        meta = session_meta[sid]
+        meta["last_ts"] = we["ts"]
+        meta["output_tokens"] += we.get("output_tokens", 0)
+        if we["model"]:
+            meta["model_counts"][we["model"]] += 1
+        meta["tool_count"] += 1
+
+    # Consecutive deltas
+    for i in range(1, len(window_entries)):
+        prev = window_entries[i - 1]
+        curr = window_entries[i]
+        delta = curr["five_pct"] - prev["five_pct"]
+        if delta > 0:
+            session_deltas[curr["session"]] += delta
+
+    # Build session list
+    total_attributed = sum(session_deltas.values())
+    unaccounted = max(0, current_five_pct - total_attributed)
+
+    sessions = []  # type: List[Dict]
+    color_idx = 0
+    for sid, meta in session_meta.items():
+        pct_used = session_deltas.get(sid, 0)
+        model_counts = meta["model_counts"]
+        dominant_model = max(model_counts, key=model_counts.get) if model_counts else "?"
+        sessions.append({
+            "session_id": sid,
+            "directive": meta["directive"],
+            "first_ts": meta["first_ts"],
+            "last_ts": meta["last_ts"],
+            "pct_used": round(pct_used, 1),
+            "output_tokens": meta["output_tokens"],
+            "model": _abbrev_model(dominant_model),
+            "tool_count": meta["tool_count"],
+            "color": _ATTR_COLORS[color_idx % len(_ATTR_COLORS)],
+        })
+        color_idx += 1
+
+    # Sort by pct_used descending
+    sessions.sort(key=lambda s: s["pct_used"], reverse=True)
+    # Re-assign colors after sort so top consumers get first colors
+    for i, s in enumerate(sessions):
+        s["color"] = _ATTR_COLORS[i % len(_ATTR_COLORS)]
+
+    result = {
+        "total_used_pct": round(current_five_pct, 1),
+        "unaccounted_pct": round(unaccounted, 1),
+        "sessions": sessions,
+    }  # type: Dict[str, Any]
+    _attribution_cache = result
+    _attribution_cache_time = now
     return result
 
 
