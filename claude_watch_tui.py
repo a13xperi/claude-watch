@@ -35,6 +35,7 @@ from claude_watch_data import (
     _extract_accomplishments,
     _get_agent_stats,
     _get_burndown_data,
+    _get_call_data_map,
     _get_call_history,
     _get_daily_usage,
     _get_mcp_stats,
@@ -1127,7 +1128,7 @@ class SessionHistoryTable(DataTable):
 
     def on_mount(self):
         self.cursor_type = "row"
-        self.zebra_stripes = True
+        self.zebra_stripes = False
         self.add_column("When", width=9)
         self.add_column("Session", width=10)
         self.add_column("Src", width=10)
@@ -1143,6 +1144,12 @@ class SessionHistoryTable(DataTable):
         sessions = _get_session_history()
         pid_map = _build_pid_map()
         active = _active_pids()
+
+        call_map = _get_call_data_map()
+        call_by_uuid = {}
+        for uuid, pid in pid_map.items():
+            if pid in call_map:
+                call_by_uuid[uuid] = call_map[pid]
 
         # Get filter text from app
         filter_text = ""
@@ -1243,6 +1250,26 @@ class SessionHistoryTable(DataTable):
                 key=s["session_id"],
             )
 
+            # Sub-row: tool call summary
+            cd = call_by_uuid.get(s["session_id"])
+            if cd:
+                calls_str = f"{cd['calls']} calls"
+                tools_detail = cd['tools_str'][:40]
+                last_tool = cd.get('recent_str', '')[:30]
+            else:
+                calls_str = ""
+                tools_detail = ""
+                last_tool = ""
+
+            self.add_row(
+                Text(""), Text(""), Text(""), Text(""), Text(""),
+                Text(calls_str, style="dim italic"),
+                Text(""), Text(""),
+                Text(""),
+                Text(f"{tools_detail}  {last_tool}" if tools_detail else "", style="dim"),
+                key=f"sub-{s['session_id']}",
+            )
+
         try:
             if cur_row < self.row_count:
                 self.move_cursor(row=cur_row)
@@ -1251,7 +1278,7 @@ class SessionHistoryTable(DataTable):
 
     def on_data_table_row_selected(self, event):
         key = event.row_key
-        if key and key.value and not key.value.startswith("sep-"):
+        if key and key.value and not key.value.startswith("sep-") and not key.value.startswith("sub-"):
             session_id = key.value
             # Find directive from index
             sessions = _get_session_history()
@@ -1271,7 +1298,7 @@ class CallHistoryTable(DataTable):
 
     def on_mount(self):
         self.cursor_type = "row"
-        self.zebra_stripes = True
+        self.zebra_stripes = False
         self.add_column("When", width=9)
         self.add_column("Session", width=10)
         self.add_column("Src", width=10)
@@ -1354,6 +1381,20 @@ class CallHistoryTable(DataTable):
                 Text(pct, style=pct_style),
                 Text((h["directive"] or "—")[:40]),
                 key=f"ch-{h['session']}",
+            )
+
+            # Sub-row: recent tool detail
+            recent = h.get("recent_str", "")
+            tools = h.get("tools_str", "")
+            self.add_row(
+                Text(""), Text(""), Text(""), Text(""), Text(""),
+                Text(""),
+                Text(""),
+                Text(tools[:20], style="dim italic") if tools else Text(""),
+                Text(recent[:22], style="dim italic") if recent else Text(""),
+                Text(""),
+                Text(""),
+                key=f"chsub-{h['session']}",
             )
 
         try:

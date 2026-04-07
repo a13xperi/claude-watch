@@ -1731,6 +1731,44 @@ def _get_call_history():
     return result
 
 
+def _get_call_data_map():
+    """Return {cc_pid: {calls, tools_str, recent_str}} for merging into session history sub-rows."""
+    entries = _load_ledger(last_n=5000)
+    tool_events = [e for e in entries if e.get("type") == "tool_use"]
+    if not tool_events:
+        return {}
+
+    sessions = {}  # type: Dict[str, Dict]
+    for e in tool_events:
+        sid = e.get("session", "?")
+        if sid not in sessions:
+            sessions[sid] = {
+                "calls": 0,
+                "tools": defaultdict(int),
+                "recent_tools": [],
+            }
+        s = sessions[sid]
+        s["calls"] += 1
+        tool = _shorten_tool(e.get("tool", "?"))
+        s["tools"][tool] += 1
+        snippet = e.get("tool_snippet", "")
+        s["recent_tools"].append(f"{tool}: {snippet[:20]}" if snippet else tool)
+        if len(s["recent_tools"]) > 3:
+            s["recent_tools"] = s["recent_tools"][-3:]
+
+    result = {}
+    for sid, s in sessions.items():
+        top_tools = sorted(s["tools"].items(), key=lambda x: x[1], reverse=True)[:3]
+        tools_str = ", ".join(f"{t}({c})" for t, c in top_tools)
+        recent_str = s["recent_tools"][-1] if s["recent_tools"] else ""
+        result[sid] = {
+            "calls": s["calls"],
+            "tools_str": tools_str,
+            "recent_str": recent_str,
+        }
+    return result
+
+
 # ── tool feed rows ───────────────────────────────────────────────────────────
 
 def _shorten_tool(tool):
