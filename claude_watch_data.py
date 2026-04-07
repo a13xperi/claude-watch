@@ -5,6 +5,7 @@ All data fetching, caching, and computation lives here.
 
 import csv
 import json
+import logging
 import os
 import re
 import subprocess
@@ -18,6 +19,13 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from rich.panel import Panel
 from rich.table import Table
+
+(Path.home() / ".claude/logs").mkdir(parents=True, exist_ok=True)
+_log = logging.getLogger("claude_watch")
+_log_handler = logging.FileHandler(Path.home() / ".claude/logs/claude-watch.log")
+_log_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+_log.addHandler(_log_handler)
+_log.setLevel(logging.WARNING)
 
 # ── constants ────────────────────────────────────────────────────────────────
 
@@ -50,7 +58,8 @@ def _load_paperclip_map():
             company = proj_info.get("company", "?")
             for agent_uuid, name in proj_info.get("agents", {}).items():
                 _paperclip_agents_flat[agent_uuid] = (company, name)
-    except Exception:
+    except Exception as e:
+        _log.warning("Failed to load paperclip map: %s", e)
         _paperclip_map = {}
         _paperclip_agents_flat = {}
 
@@ -81,8 +90,8 @@ def _current_pct():
             five_reset = _ts(rl.get("five_hour", {}).get("resets_at", ""))
             seven_reset = _ts(rl.get("seven_day", {}).get("resets_at", ""))
             return five, seven, five_reset, seven_reset
-    except Exception:
-        pass
+    except Exception as e:
+        _log.warning("Failed to read rate limits: %s", e)
     return "?", "?", "", ""
 
 
@@ -469,10 +478,10 @@ def _load_ledger(last_n=None):
                     if line:
                         try:
                             entries.append(json.loads(line))
-                        except Exception:
-                            pass
-        except Exception:
-            pass
+                        except Exception as e:
+                            _log.debug("Malformed ledger line: %s", e)
+        except Exception as e:
+            _log.warning("Failed to load ledger: %s", e)
         _ledger_cache = entries
         _ledger_cache_time = mtime
     if last_n is not None:
@@ -980,10 +989,10 @@ def _load_index():
                         sid = obj.get("session_id")
                         if sid:
                             cache[sid] = obj
-                    except Exception:
-                        pass
-        except Exception:
-            pass
+                    except Exception as e:
+                        _log.debug("Malformed index line: %s", e)
+        except Exception as e:
+            _log.warning("Failed to load session index: %s", e)
     _index_cache = cache
     _index_loaded = True
     _rebuild_ccid_index()
@@ -1015,7 +1024,8 @@ def _parse_transcript(f):
                     continue
                 try:
                     obj = json.loads(line)
-                except Exception:
+                except Exception as e:
+                    _log.debug("Transcript parse error: %s", e)
                     continue
                 t = obj.get("type", "")
                 ts_str = obj.get("timestamp", "")
@@ -1237,8 +1247,8 @@ def _build_or_update_index():
                 raise
             _index_cache = dict(known)
             _rebuild_ccid_index()
-    except Exception:
-        pass
+    except Exception as e:
+        _log.exception("Index build failed")
     finally:
         _index_building = False
 
