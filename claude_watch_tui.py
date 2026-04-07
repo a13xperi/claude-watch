@@ -46,6 +46,7 @@ from claude_watch_data import (
     _get_session_turns,
     _get_system_health,
     _get_usage_metrics,
+    _gravity_center,
     _index_building,
     _index_cache,
     _load_index,
@@ -192,6 +193,9 @@ class ActiveSessionsTable(DataTable):
         entries = _load_ledger(last_n=500)
         now_utc = datetime.now(timezone.utc)
         now_local = datetime.now()
+
+        n = len(sessions)
+        self.border_title = f"Active Sessions (live) — {n}" if n else "Active Sessions (live)"
 
         try:
             cur_row = self.cursor_row
@@ -461,6 +465,97 @@ class AgentsPanel(Static):
             title="[bold]Agent Spawns[/bold]  [dim](7d)[/dim]",
             border_style="yellow",
         ))
+
+
+class SessionNarrativePanel(Static):
+    """Compact narrative of what was built in the current 5h window, grouped by project."""
+
+    def update_content(self):
+        # Get current 5h window bounds
+        _, _, five_reset_ts, _ = _current_pct()
+        window_start = None
+        if five_reset_ts:
+            try:
+                reset_dt = datetime.fromisoformat(five_reset_ts.replace("Z", "+00:00"))
+                window_start = reset_dt - timedelta(hours=5)
+            except Exception:
+                pass
+
+        # Filter session history to current window
+        sessions = _get_session_history()
+        if window_start:
+            sessions = [s for s in sessions if s["last_ts"] >= window_start]
+
+        if not sessions:
+            self.update("")
+            self.display = False
+            return
+
+        # Group by project
+        from collections import defaultdict
+        project_sessions = defaultdict(list)
+        for s in sessions:
+            project = s.get("project", "\u2014")
+            project_sessions[project].append(s)
+
+        # Build narrative lines
+        lines = []
+        # Color map for known projects
+        color_map = {
+            "atlas": "blue",
+            "claude-watch": "cyan",
+            "paperclip": "green",
+            "openclaw": "magenta",
+            "frank": "magenta",
+            "kaa": "green",
+        }
+
+        for project, proj_sessions in sorted(project_sessions.items(), key=lambda x: len(x[1]), reverse=True):
+            descriptions = []
+            for s in proj_sessions:
+                # Prefer directive as summary
+                directive = s.get("directive", "")
+                if directive and directive != "\u2014":
+                    descriptions.append(directive)
+                else:
+                    # Fall back to gravity center from accomplishments
+                    acc = _extract_accomplishments(s["session_id"])
+                    gc = _gravity_center(acc, fallback="")
+                    if gc:
+                        descriptions.append(gc)
+
+            if not descriptions:
+                continue
+
+            # Deduplicate while preserving order
+            seen = set()
+            unique = []
+            for d in descriptions:
+                d_lower = d.lower().strip()
+                if d_lower not in seen:
+                    seen.add(d_lower)
+                    unique.append(d)
+
+            # Build the description string — join with commas, truncate if needed
+            desc_str = ", ".join(unique)
+            if len(desc_str) > 100:
+                desc_str = desc_str[:97] + "..."
+
+            p_color = color_map.get(project.lower(), "white")
+            lines.append(f"[bold {p_color}]{project}[/bold {p_color}]: {desc_str}")
+
+        if not lines:
+            self.update("")
+            self.display = False
+            return
+
+        content = "\n".join(lines)
+        self.update(Panel(
+            content,
+            title="[bold]Session Narrative[/bold]",
+            border_style="green",
+        ))
+        self.display = True
 
 
 class DrainPanel(Static):
@@ -1794,6 +1889,21 @@ class SessionHistoryTable(DataTable):
             if pid in call_map:
                 call_by_uuid[uuid] = call_map[pid]
 
+        # Filter to current 5h window
+        _, _, five_reset_ts, _ = _current_pct()
+        window_start = None
+        if five_reset_ts:
+            try:
+                reset_dt = datetime.fromisoformat(five_reset_ts.replace("Z", "+00:00"))
+                window_start = reset_dt - timedelta(hours=5)
+            except Exception:
+                pass
+        if window_start:
+            sessions = [s for s in sessions if s["last_ts"] >= window_start]
+
+        n = len(sessions)
+        self.border_title = f"Session History — {n}" if n else "Session History"
+
         # Get filter text from app
         filter_text = ""
         try:
@@ -1811,7 +1921,7 @@ class SessionHistoryTable(DataTable):
         if not sessions:
             self.add_row(
                 "...", "", "", "", "", "", "", "", "", "",
-                Text("building index..." if _index_building else "no sessions", style="dim"),
+                Text("building index..." if _index_building else "no sessions in this window", style="dim"),
             )
             return
 
@@ -2061,13 +2171,89 @@ class CallHistoryTable(DataTable):
 # ── Nav Bar ──────────────────────────────────────────────────────────────────
 
 
+class LeaderboardScreen(Screen):
+    """Multiplayer leaderboard — team competition on window scores."""
+    BINDINGS = [
+        Binding("escape", "pop_screen", "Back"),
+        Binding("q", "pop_screen", "Back"),
+    ]
+
+    def compose(self) -> ComposeResult:
+        yield Static(id="lb-header")
+        yield DataTable(id="lb-table")
+
+    def on_mount(self):
+        from claude_watch_data import _get_leaderboard, _get_battlestation_config
+        config = _get_battlestation_config()
+        my_id = config.get("user_id", "")
+        lb = _get_leaderboard(days=7)
+
+        total_windows = sum(u.get("windows", 0) for u in lb)
+        self.query_one("#lb-header", Static).update(
+            f"[bold]Leaderboard — Last 7 Days[/bold]  "
+            f"[dim]{len(lb)} users  {total_windows} windows  "
+            f"(Escape / q to go back)[/dim]"
+        )
+
+        dt = self.query_one("#lb-table", DataTable)
+        dt.cursor_type = "row"
+        dt.zebra_stripes = True
+        dt.add_column("#", width=4)
+        dt.add_column("User", width=18)
+        dt.add_column("Avg Stars", width=10)
+        dt.add_column("Avg", width=5)
+        dt.add_column("Windows", width=8)
+        dt.add_column("Best", width=8)
+        dt.add_column("Burn", width=6)
+        dt.add_column("Ship", width=6)
+        dt.add_column("Velocity", width=9)
+        dt.add_column("Streak")
+
+        for rank, u in enumerate(lb, 1):
+            is_me = u["user_id"] == my_id
+            ov = u["avg_overall"]
+            ov_color = "green" if ov >= 4 else ("yellow" if ov >= 3 else "red")
+
+            def _sc(v):
+                return "green" if v >= 4 else ("yellow" if v >= 2.5 else "red")
+
+            name_style = "bold cyan" if is_me else ""
+            dot = "[bold green]● [/bold green]" if is_me else "  "
+            streak = u.get("streak", 0)
+            streak_str = f"🔥{streak}" if streak >= 3 else str(streak)
+
+            dt.add_row(
+                Text(str(rank), justify="right"),
+                Text.from_markup(f"{dot}[{name_style}]{u['display_name']}[/{name_style}]") if name_style else Text.from_markup(f"{dot}{u['display_name']}"),
+                Text(u["avg_stars"], style=ov_color),
+                Text(f"{ov}", style=ov_color, justify="right"),
+                Text(str(u["windows"]), justify="right"),
+                Text(u.get("best_stars", ""), style="dim"),
+                Text(f"{u['avg_burn']}", style=_sc(u['avg_burn']), justify="right"),
+                Text(f"{u['avg_ship']}", style=_sc(u['avg_ship']), justify="right"),
+                Text(f"{u['avg_velocity']}", style=_sc(u['avg_velocity']), justify="right"),
+                Text(streak_str),
+            )
+
+        if not lb:
+            dt.add_row(
+                "", Text("No scores yet — complete a 5h window to appear here", style="dim"),
+                "", "", "", "", "", "", "", "",
+            )
+
+    def action_pop_screen(self):
+        self.app.pop_screen()
+
+
 class NavBar(Horizontal):
     """Top navigation bar with clickable buttons."""
 
     def compose(self) -> ComposeResult:
         yield Button("Dashboard", id="nav-dashboard", variant="primary")
+        yield Button("Health", id="nav-health", variant="default")
         yield Button("Sessions", id="nav-sessions", variant="default")
         yield Button("Projects", id="nav-projects", variant="default")
+        yield Button("Leaderboard", id="nav-leaderboard", variant="default")
         yield Button("Usage", id="nav-usage", variant="default")
         yield Button("MCP", id="nav-mcp", variant="default")
 
@@ -2087,6 +2273,7 @@ class ClaudeWatchApp(App):
         Binding("m", "show_mcp", "MCP"),
         Binding("s", "show_session_tasks", "Tasks"),
         Binding("p", "show_project_board", "Board"),
+        Binding("l", "show_leaderboard", "Leaderboard"),
         Binding("a", "toggle_accounts", "Accounts"),
         Binding("c", "show_capacity", "Capacity"),
         Binding("h", "toggle_health", "Health"),
@@ -2108,6 +2295,7 @@ class ClaudeWatchApp(App):
             yield UrgentAlerts(id="urgent")
             yield SystemHealthPanel(id="system-health")
             yield ActiveSessionsTable(id="active-sessions")
+            yield SessionNarrativePanel(id="session-narrative")
             yield SessionHistoryTable(id="session-history")
             yield DrainPanel(id="drain")
             with Horizontal(id="feed-row"):
@@ -2150,9 +2338,8 @@ class ClaudeWatchApp(App):
         self.query_one("#burndown", BurndownChart).update_content()
         self.query_one("#urgent", UrgentAlerts).update_content()
         self.query_one("#active-sessions", ActiveSessionsTable).refresh_rows()
-        health = self.query_one("#system-health", SystemHealthPanel)
-        if health.display:
-            health.update_content()
+        self.query_one("#session-narrative", SessionNarrativePanel).update_content()
+        self.query_one("#system-health", SystemHealthPanel).update_content()
         self.query_one("#session-history", SessionHistoryTable).refresh_rows()
         self.query_one("#tool-freq", ToolFrequency).update_content()
         self.query_one("#skills", SkillsPanel).update_content()
@@ -2214,19 +2401,25 @@ class ClaudeWatchApp(App):
     def action_show_project_board(self):
         self.push_screen(ProjectBoardScreen())
 
+    def action_show_leaderboard(self):
+        self.push_screen(LeaderboardScreen())
+
     def action_show_capacity(self):
         self.push_screen(AccountCapacityScreen())
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         btn_id = event.button.id or ""
         if btn_id == "nav-dashboard":
-            # Already on dashboard — pop any overlay screens
             while len(self.screen_stack) > 1:
                 self.pop_screen()
+        elif btn_id == "nav-health":
+            self.action_toggle_health()
         elif btn_id == "nav-sessions":
             self.action_show_session_tasks()
         elif btn_id == "nav-projects":
             self.action_show_project_board()
+        elif btn_id == "nav-leaderboard":
+            self.action_show_leaderboard()
         elif btn_id == "nav-usage":
             self.action_show_usage()
         elif btn_id == "nav-mcp":
@@ -2242,11 +2435,7 @@ class ClaudeWatchApp(App):
 
     def action_toggle_health(self):
         health = self.query_one("#system-health", SystemHealthPanel)
-        if health.display:
-            health.display = False
-        else:
-            health.display = True
-            health.update_content()
+        health.scroll_visible(animate=True)
 
     def action_start_search(self):
         from textual.widgets import Input

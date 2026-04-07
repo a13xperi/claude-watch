@@ -2694,9 +2694,12 @@ def make_sessions_panel():
     t.add_column("Used", width=11, no_wrap=True)
     t.add_column("Directive", overflow="ellipsis", no_wrap=True)
 
+    n = len(sessions)
+    title = f"[bold]Active Sessions[/bold]  [dim](live)[/dim] — {n}" if n else "[bold]Active Sessions[/bold]  [dim](live)[/dim]"
+
     if not sessions:
         t.add_row("", "[dim]—[/dim]", "", "", "", "", "", "[dim]no active sessions[/dim]")
-        return Panel(t, title="[bold]Active Sessions[/bold]  [dim](live)[/dim]", border_style="cyan")
+        return Panel(t, title=title, border_style="cyan")
 
     # Single-pass ledger scan: build model, last call, first output per session
     model_map = {}    # type: Dict[str, str]
@@ -2826,7 +2829,7 @@ def make_sessions_panel():
         )
 
 
-    return Panel(t, title="[bold]Active Sessions[/bold]  [dim](live)[/dim]", border_style="cyan")
+    return Panel(t, title=title, border_style="cyan")
 
 
 def _get_pid_cpu(pid):
@@ -3069,6 +3072,62 @@ def _score_window(window_start_ts, window_reset_ts):
     }
 
 
+BATTLESTATION_FILE = Path.home() / ".claude/battlestation.json"
+_SUPABASE_URL = "https://zoirudjyqfqvpxsrxepr.supabase.co/rest/v1"
+_SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InpvaXJ1ZGp5cWZxdnB4c3J4ZXByIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjgwMzE4MjgsImV4cCI6MjA4MzYwNzgyOH0.6W6OzRfJ-nmKN_23z1OBCS4Cr-ODRq9DJmF_yMwOCfo"
+
+
+def _get_battlestation_config():
+    try:
+        if BATTLESTATION_FILE.exists():
+            with open(BATTLESTATION_FILE) as f:
+                return json.loads(f.read())
+    except Exception:
+        pass
+    return {"user_id": "unknown", "display_name": "Unknown", "team": ""}
+
+
+def _post_score_to_supabase(score):
+    """POST a window score to the shared Supabase leaderboard."""
+    import urllib.request
+    config = _get_battlestation_config()
+    payload = {
+        "user_id": config["user_id"],
+        "user_display": config.get("display_name", config["user_id"]),
+        "window_start": score["window_start"],
+        "window_reset": score["window_reset"],
+        "burn": score.get("burn", 0),
+        "parallelism": score.get("parallelism", 0),
+        "shipping": score.get("shipping", 0),
+        "breadth": score.get("breadth", 0),
+        "velocity": score.get("velocity", 0),
+        "overall": score.get("overall", 0),
+        "stars": score.get("stars", ""),
+        "burn_pct": score.get("burn_pct", 0),
+        "max_parallel": score.get("max_parallel", 0),
+        "commits": score.get("commits", 0),
+        "projects": score.get("projects", 0),
+        "avg_rate": score.get("avg_rate", 0),
+        "streak": score.get("streak", 0),
+    }
+    try:
+        data = json.dumps(payload).encode()
+        req = urllib.request.Request(
+            f"{_SUPABASE_URL}/window_scores",
+            data=data,
+            headers={
+                "apikey": _SUPABASE_KEY,
+                "Authorization": f"Bearer {_SUPABASE_KEY}",
+                "Content-Type": "application/json",
+                "Prefer": "resolution=merge-duplicates",
+            },
+            method="POST",
+        )
+        urllib.request.urlopen(req, timeout=5)
+    except Exception:
+        pass
+
+
 def _save_window_score(score):
     if not score:
         return
@@ -3078,6 +3137,8 @@ def _save_window_score(score):
             f.write(json.dumps(score) + "\n")
     except Exception:
         pass
+    # Also publish to shared leaderboard
+    _post_score_to_supabase(score)
 
 
 def _get_window_scores(limit=20):
@@ -3142,3 +3203,433 @@ def _check_and_score_completed_window():
     except Exception:
         pass
     return None
+
+
+def _get_leaderboard(days=7):
+    """Fetch leaderboard from Supabase, aggregated by user."""
+    import urllib.request
+    import json as _json
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    url = (
+        f"{_SUPABASE_URL}/window_scores"
+        f"?window_start=gte.{cutoff}"
+        f"&order=created_at.desc&limit=500"
+    )
+    try:
+        req = urllib.request.Request(url, headers={
+            "apikey": _SUPABASE_KEY,
+            "Authorization": f"Bearer {_SUPABASE_KEY}",
+        })
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            rows = _json.loads(resp.read())
+    except Exception:
+        return []
+
+    # Aggregate by user
+    users = {}
+    for r in rows:
+        uid = r.get("user_id", "?")
+        if uid not in users:
+            users[uid] = {
+                "user_id": uid,
+                "display_name": r.get("user_display", uid),
+                "scores": [],
+            }
+        users[uid]["scores"].append(r)
+
+    leaderboard = []
+    for uid, u in users.items():
+        scores = u["scores"]
+        n = len(scores)
+        avg_overall = sum(s.get("overall", 0) for s in scores) / n if n else 0
+        avg_burn = sum(s.get("burn", 0) for s in scores) / n if n else 0
+        avg_ship = sum(s.get("shipping", 0) for s in scores) / n if n else 0
+        avg_vel = sum(s.get("velocity", 0) for s in scores) / n if n else 0
+        best = max((s.get("overall", 0) for s in scores), default=0)
+        best_stars = _stars_display(best)
+        # Current streak = streak of most recent score
+        latest = max(scores, key=lambda s: s.get("window_start", ""))
+        streak = latest.get("streak", 0)
+
+        leaderboard.append({
+            "user_id": uid,
+            "display_name": u["display_name"],
+            "windows": n,
+            "avg_overall": round(avg_overall, 1),
+            "avg_stars": _stars_display(round(avg_overall * 2) / 2),
+            "best": best,
+            "best_stars": best_stars,
+            "avg_burn": round(avg_burn, 1),
+            "avg_ship": round(avg_ship, 1),
+            "avg_velocity": round(avg_vel, 1),
+            "streak": streak,
+        })
+
+    leaderboard.sort(key=lambda x: x["avg_overall"], reverse=True)
+    return leaderboard
+
+
+# ── Cycles (5h Window Analytics + Planning) ─────────────────────────────────
+
+CYCLE_PLANS_FILE = Path.home() / ".claude/logs/cycle-plans.jsonl"
+
+_cycles_cache = None  # type: Optional[List[dict]]
+_cycles_cache_ts = 0.0
+
+
+def _get_cycle_boundaries(limit=20):
+    # type: (int) -> List[Tuple[datetime, datetime]]
+    """Return list of (start, end) datetime pairs for detected cycles, newest first."""
+    boundaries = []  # type: List[Tuple[datetime, datetime, bool]]
+    # bool = authoritative (from window-scores)
+
+    # 1. Window-scores entries (authoritative)
+    for ws in _get_window_scores(limit=50):
+        try:
+            start = datetime.fromisoformat(ws["window_start"].replace("Z", "+00:00"))
+            end = datetime.fromisoformat(ws["window_reset"].replace("Z", "+00:00"))
+            boundaries.append((start, end, True))
+        except Exception:
+            pass
+
+    # 2. Current cycle from live rate-limit data
+    try:
+        five, _seven, five_reset_ts, _seven_reset_ts = _current_pct()
+        if five_reset_ts and five != "?":
+            if isinstance(five_reset_ts, str) and five_reset_ts:
+                end_dt = datetime.fromisoformat(five_reset_ts.replace("Z", "+00:00"))
+            elif isinstance(five_reset_ts, (int, float)):
+                end_dt = datetime.fromtimestamp(five_reset_ts, tz=timezone.utc)
+            else:
+                end_dt = None
+            if end_dt:
+                start_dt = end_dt - timedelta(hours=5)
+                boundaries.append((start_dt, end_dt, False))
+    except Exception:
+        pass
+
+    # 3. Gap-fill from ledger: detect five_pct resets
+    try:
+        ledger = _load_ledger()
+        prev_pct = None
+        for entry in ledger:
+            cur_pct = entry.get("five_pct")
+            if cur_pct is None:
+                continue
+            try:
+                cur_pct = float(cur_pct)
+            except (ValueError, TypeError):
+                continue
+            if prev_pct is not None and prev_pct > 15 and cur_pct < 5:
+                # Reset detected — this entry starts a new cycle
+                try:
+                    ts = datetime.fromisoformat(entry["ts"].replace("Z", "+00:00"))
+                    cycle_start = ts
+                    cycle_end = ts + timedelta(hours=5)
+                    boundaries.append((cycle_start, cycle_end, False))
+                except Exception:
+                    pass
+            prev_pct = cur_pct
+    except Exception:
+        pass
+
+    # 4. Deduplicate: if two overlap within 30 min, keep authoritative
+    deduped = []  # type: List[Tuple[datetime, datetime]]
+    # Sort by start time
+    boundaries.sort(key=lambda x: x[0])
+    for start, end, auth in boundaries:
+        merged = False
+        for i, (es, ee) in enumerate(deduped):
+            # Check overlap within 30 min of start
+            if abs((start - es).total_seconds()) < 1800:
+                # Keep existing if authoritative already captured, or replace with authoritative
+                if auth:
+                    deduped[i] = (start, end)
+                merged = True
+                break
+        if not merged:
+            deduped.append((start, end))
+
+    # 5. Sort newest first, limit
+    deduped.sort(key=lambda x: x[0], reverse=True)
+    return deduped[:limit]
+
+
+def _build_cycle_record(start_ts, end_ts, is_current=False):
+    # type: (datetime, datetime, bool) -> dict
+    """Build a full cycle record from boundaries."""
+    cycle_id = start_ts.isoformat()
+
+    # Filter sessions within this cycle
+    all_sessions = _get_session_history()
+    cycle_sessions = []
+    for s in all_sessions:
+        try:
+            first = s["first_ts"]
+            if not isinstance(first, datetime):
+                first = datetime.fromisoformat(str(first).replace("Z", "+00:00"))
+            if first.tzinfo is None:
+                first = first.replace(tzinfo=timezone.utc)
+            if start_ts <= first < end_ts:
+                cycle_sessions.append(s)
+        except Exception:
+            pass
+
+    # Filter ledger entries within this cycle
+    ledger = _load_ledger()
+    cycle_ledger = []
+    for entry in ledger:
+        try:
+            ts = datetime.fromisoformat(entry["ts"].replace("Z", "+00:00"))
+            if start_ts <= ts <= end_ts:
+                cycle_ledger.append(entry)
+        except Exception:
+            pass
+
+    # Peak five_pct
+    peak_five = 0
+    for entry in cycle_ledger:
+        try:
+            pct = float(entry.get("five_pct", 0))
+            if pct > peak_five:
+                peak_five = pct
+        except (ValueError, TypeError):
+            pass
+
+    # Token sum and cost
+    total_tokens = 0
+    total_cost = 0.0
+    for s in cycle_sessions:
+        tok = s.get("output_tokens", 0) or 0
+        total_tokens += tok
+        model = s.get("model", "")
+        total_cost += _estimate_cost(tok, model)
+
+    # Aggregate accomplishments
+    merged_acc = {
+        "files_edited": [],
+        "files_created": [],
+        "git_commits": [],
+        "git_pushes": [],
+        "skills": [],
+        "mcp_ops": [],
+        "bash_notable": [],
+        "user_prompts": [],
+        "errors": 0,
+        "turn_count": 0,
+    }
+    for s in cycle_sessions:
+        try:
+            acc = _extract_accomplishments(s["session_id"])
+            if not acc:
+                continue
+            for key in ("files_edited", "files_created", "git_commits",
+                        "git_pushes", "bash_notable", "user_prompts"):
+                merged_acc[key].extend(acc.get(key, []))
+            for key in ("mcp_ops", "skills"):
+                # Union
+                existing = set(merged_acc[key])
+                for item in acc.get(key, []):
+                    if item not in existing:
+                        merged_acc[key].append(item)
+                        existing.add(item)
+            merged_acc["errors"] += acc.get("errors", 0)
+            merged_acc["turn_count"] += acc.get("turn_count", 0)
+        except Exception:
+            pass
+
+    # Window score lookup
+    window_score = None
+    for ws in _get_window_scores(limit=50):
+        try:
+            ws_start = datetime.fromisoformat(ws["window_start"].replace("Z", "+00:00"))
+            if abs((ws_start - start_ts).total_seconds()) < 1800:
+                window_score = ws
+                break
+        except Exception:
+            pass
+
+    # Gravity label
+    gravity_label = _gravity_center(merged_acc, fallback="")
+
+    return {
+        "cycle_id": cycle_id,
+        "start_ts": start_ts.isoformat(),
+        "end_ts": end_ts.isoformat(),
+        "is_current": is_current,
+        "session_count": len(cycle_sessions),
+        "peak_five_pct": peak_five,
+        "total_output_tokens": total_tokens,
+        "total_cost": total_cost,
+        "cost_str": _format_cost(total_cost),
+        "accomplishments": merged_acc,
+        "gravity_label": gravity_label,
+        "window_score": window_score,
+        "stars": _stars_display(window_score["overall"]) if window_score else "",
+        "overall_score": window_score.get("overall", 0) if window_score else 0,
+        "sessions": [s["session_id"] for s in cycle_sessions],
+    }
+
+
+def _get_all_cycles(limit=20):
+    # type: (int) -> List[dict]
+    """Get all cycle records with 30s cache TTL."""
+    global _cycles_cache, _cycles_cache_ts
+    now = time.time()
+    if _cycles_cache is not None and (now - _cycles_cache_ts) < 30:
+        return _cycles_cache[:limit]
+
+    boundaries = _get_cycle_boundaries(limit=limit)
+    if not boundaries:
+        _cycles_cache = []
+        _cycles_cache_ts = now
+        return []
+
+    # Determine which is the current cycle
+    current_end = None
+    try:
+        _five, _seven, five_reset_ts, _seven_reset_ts = _current_pct()
+        if five_reset_ts:
+            if isinstance(five_reset_ts, str) and five_reset_ts:
+                current_end = datetime.fromisoformat(five_reset_ts.replace("Z", "+00:00"))
+            elif isinstance(five_reset_ts, (int, float)):
+                current_end = datetime.fromtimestamp(five_reset_ts, tz=timezone.utc)
+    except Exception:
+        pass
+
+    cycles = []
+    for start, end in boundaries:
+        is_current = False
+        if current_end and abs((end - current_end).total_seconds()) < 1800:
+            is_current = True
+        try:
+            record = _build_cycle_record(start, end, is_current=is_current)
+            cycles.append(record)
+        except Exception:
+            pass
+
+    _cycles_cache = cycles
+    _cycles_cache_ts = now
+    return cycles[:limit]
+
+
+def _get_current_cycle():
+    # type: () -> Optional[dict]
+    """Return the current (is_current=True) cycle, or None."""
+    for c in _get_all_cycles():
+        if c.get("is_current"):
+            return c
+    return None
+
+
+def _get_cycle_sessions(cycle_id):
+    # type: (str) -> List[dict]
+    """Return full session history entries for sessions within a cycle."""
+    # Find matching cycle boundaries
+    boundaries = _get_cycle_boundaries()
+    target_start = None
+    target_end = None
+    for start, end in boundaries:
+        if start.isoformat() == cycle_id:
+            target_start = start
+            target_end = end
+            break
+
+    if target_start is None or target_end is None:
+        return []
+
+    all_sessions = _get_session_history()
+    result = []
+    for s in all_sessions:
+        try:
+            first = s["first_ts"]
+            if not isinstance(first, datetime):
+                first = datetime.fromisoformat(str(first).replace("Z", "+00:00"))
+            if first.tzinfo is None:
+                first = first.replace(tzinfo=timezone.utc)
+            if target_start <= first < target_end:
+                result.append(s)
+        except Exception:
+            pass
+    return result
+
+
+# ── Cycle Planning ───────────────────────────────────────────────────────────
+
+def _load_cycle_plans():
+    # type: () -> Dict[str, dict]
+    """Read CYCLE_PLANS_FILE. Return dict keyed by cycle_id, last entry wins."""
+    if not CYCLE_PLANS_FILE.exists():
+        return {}
+    plans = {}  # type: Dict[str, dict]
+    try:
+        with open(CYCLE_PLANS_FILE) as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    try:
+                        entry = json.loads(line)
+                        cid = entry.get("cycle_id")
+                        if cid:
+                            plans[cid] = entry
+                    except Exception:
+                        pass
+    except Exception:
+        pass
+    return plans
+
+
+def _get_cycle_plan(cycle_id):
+    # type: (str) -> Optional[dict]
+    """Get plan for a specific cycle."""
+    plans = _load_cycle_plans()
+    return plans.get(cycle_id)
+
+
+def _save_cycle_plan(plan):
+    # type: (dict) -> None
+    """Append plan to CYCLE_PLANS_FILE with updated_at timestamp."""
+    plan["updated_at"] = datetime.now(timezone.utc).isoformat()
+    try:
+        CYCLE_PLANS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with open(CYCLE_PLANS_FILE, "a") as f:
+            f.write(json.dumps(plan) + "\n")
+    except Exception:
+        pass
+
+
+def _get_plannable_tasks():
+    # type: () -> List[dict]
+    """Get tasks ready for cycle planning, enriched with est_pct."""
+    tasks = _get_project_tasks()
+    ready = [t for t in tasks if t.get("status") == "ready"]
+    # Sort by priority (nulls last), then build_order (nulls last)
+    def _sort_key(t):
+        pri = t.get("priority")
+        bo = t.get("build_order")
+        return (
+            pri if pri is not None else 9999,
+            bo if bo is not None else 9999,
+        )
+    ready.sort(key=_sort_key)
+    # Enrich with est_pct
+    for t in ready:
+        tok_k = t.get("est_tokens_k")
+        if tok_k is not None:
+            try:
+                t["est_pct"] = _estimate_pct_for_tokens(float(tok_k))
+            except (ValueError, TypeError):
+                t["est_pct"] = 0.0
+        else:
+            t["est_pct"] = 0.0
+    return ready
+
+
+def _estimate_pct_for_tokens(tokens_k):
+    # type: (float) -> float
+    """Convert estimated tokens (thousands) to estimated % of 5h window.
+
+    Baseline: ~5500 output tokens ~ 1% of 5h window.
+    """
+    pct = tokens_k * 1000 / 5500
+    return round(pct, 1)

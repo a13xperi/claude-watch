@@ -64,11 +64,21 @@ Screen {
     border: tall $accent;
 }
 
+/* ── Session Narrative (what was built in this 5h window) ── */
+#session-narrative {
+    height: auto;
+    max-height: 12;
+    border: solid green;
+    border-title-color: white;
+    border-title-style: bold;
+    padding: 0 1;
+}
+
 /* ── Session History (Call History merged in) ── */
 #session-history {
     width: 1fr;
     height: 1fr;
-    min-height: 14;
+    min-height: 24;
     border: solid dodgerblue;
     border-title-color: white;
     border-title-style: bold;
@@ -236,4 +246,17 @@ DataTable > .datatable--header {
     height: auto;
     max-height: 2;
     padding: 0 1;
+}
+
+/* ── Leaderboard screen ── */
+#lb-header {
+    height: auto;
+    max-height: 2;
+    padding: 0 1;
+}
+
+#lb-table {
+    height: 1fr;
+    border: solid yellow;
+    border-title-color: white;
 }
