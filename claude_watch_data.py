@@ -268,7 +268,7 @@ def _get_conversation_title(pid):
     if not session_id or not project_dir:
         # Fallback: scan recent transcript files for this PID
         # Active sessions may not be indexed yet
-        project_dirs = _project_dirs()
+        project_dirs = [p for p in ALL_PROJECT_DIRS.iterdir() if p.is_dir()]
         candidates = []  # type: list
         for pd in project_dirs:
             try:
@@ -1366,6 +1366,29 @@ _MODEL_OUTPUT_COST_PER_MTOK = {
     "sonnet": 15.0,
     "haiku": 1.25,
 }
+
+_MODEL_INPUT_COST_PER_MTOK = {
+    "opus": 15.0,
+    "sonnet": 3.0,
+    "haiku": 0.25,
+}
+
+
+def _estimate_turn_cost(tokens_in, tokens_out, model_str):
+    # type: (int, int, str) -> float
+    """Estimate full turn cost (input + output) in USD."""
+    model_lower = (model_str or "").lower()
+    in_rate = 3.0
+    out_rate = 15.0
+    for key, rate in _MODEL_INPUT_COST_PER_MTOK.items():
+        if key in model_lower:
+            in_rate = rate
+            break
+    for key, rate in _MODEL_OUTPUT_COST_PER_MTOK.items():
+        if key in model_lower:
+            out_rate = rate
+            break
+    return (tokens_in * in_rate + tokens_out * out_rate) / 1_000_000
 
 
 def _estimate_cost(output_tokens, model_str):
@@ -3928,17 +3951,26 @@ def _estimate_pct_for_tokens(tokens_k):
 # -- Cycle Monitor (Supabase-backed freeform items per 5h window) -----------
 
 
-def _get_cycle_items(window_start):
-    # type: (str) -> List[dict]
-    """GET cycle_items for a given window_start."""
+def _get_cycle_items(window_start, all_windows=False):
+    # type: (str, bool) -> List[dict]
+    """GET cycle_items for a given window_start (or all windows)."""
     import urllib.request
+    from urllib.parse import quote
     config = _get_battlestation_config()
-    url = (
-        f"{_SUPABASE_URL}/cycle_items"
-        f"?user_id=eq.{config['user_id']}"
-        f"&window_start=eq.{window_start}"
-        f"&order=created_at.asc"
-    )
+    if all_windows:
+        url = (
+            f"{_SUPABASE_URL}/cycle_items"
+            f"?user_id=eq.{config['user_id']}"
+            f"&order=created_at.desc"
+            f"&limit=200"
+        )
+    else:
+        url = (
+            f"{_SUPABASE_URL}/cycle_items"
+            f"?user_id=eq.{config['user_id']}"
+            f"&window_start=eq.{quote(window_start)}"
+            f"&order=created_at.asc"
+        )
     try:
         req = urllib.request.Request(url, headers={
             "apikey": _SUPABASE_KEY,

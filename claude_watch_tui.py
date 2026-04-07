@@ -36,6 +36,7 @@ from claude_watch_data import (
     _estimate_cost,
     _extract_accomplishments,
     _format_cost,
+    _get_active_account,
     _get_agent_stats,
     _get_burndown_data,
     _get_token_attribution,
@@ -46,6 +47,7 @@ from claude_watch_data import (
     _get_peer_sessions,
     _get_pid_cpu,
     _get_session_history,
+    _estimate_turn_cost,
     _get_session_turns,
     _get_system_health,
     _get_usage_metrics,
@@ -55,7 +57,9 @@ from claude_watch_data import (
     _index_lock,
     _load_index,
     _load_ledger,
+    _reset_day,
     _shorten_tool,
+    _token_pacing,
     check_and_notify,
     _get_test_queue,
     _add_test_item,
@@ -148,8 +152,17 @@ def _restore_backup_files():
     return restored
 
 
-def _project_to_company(project: str) -> tuple[str, str]:
-    """Return (company_name, style) from a project string."""
+def _project_to_company(project: str, company: str = "") -> tuple[str, str]:
+    """Return (company_name, style) from company field or project string."""
+    if company:
+        c = company.lower().strip()
+        if "delphi" in c: return "Delphi", "blue"
+        if "kaa" in c: return "KAA", "green"
+        if "frank" in c: return "Frank", "magenta"
+        if "sage" in c: return "SAGE", "yellow"
+        if "adinkra" in c: return "Adinkra", "purple"
+        if "personal" in c: return "Personal", "dim"
+        return company[:12], "dim"
     p = (project or "").lower().strip()
     if p in ("atlas", "atlas-be", "atlas-fe"):
         return "Delphi", "blue"
@@ -278,8 +291,10 @@ class ActiveSessionsTable(DataTable):
 
         try:
             cur_row = self.cursor_row
+            saved_y = self.scroll_y
         except Exception:
             cur_row = 0
+            saved_y = 0
 
         self.clear()
 
@@ -513,7 +528,11 @@ class ActiveSessionsTable(DataTable):
 
         try:
             if cur_row < self.row_count:
-                self.move_cursor(row=cur_row)
+                self.move_cursor(row=cur_row, scroll=False)
+        except Exception:
+            pass
+        try:
+            self.scroll_to(y=saved_y, animate=False)
         except Exception:
             pass
 
@@ -1373,23 +1392,27 @@ class SessionDrillDown(Screen):
         self.session_id = session_id
         self.session_directive = directive
         self.session_project = project
-        self.showing_tokens = False
+        self.showing_tokens = True
 
     def compose(self) -> ComposeResult:
         yield NavBar(active="nav-sessions")
-        yield Static(
-            f"[bold]Session:[/bold] {self.session_id}  "
-            f"[bold]Project:[/bold] {self.session_project}  "
-            f"[bold]Directive:[/bold] {self.session_directive}  "
-            "[dim](t=toggle view)[/dim]",
-            id="drilldown-header",
-        )
+        yield Static(id="drilldown-header")
         yield Static(id="accomplishments-view")
         yield DataTable(id="drilldown-table")
 
+    def _update_header(self):
+        hint = "[dim](t=accomplishments)[/dim]" if self.showing_tokens else "[dim](t=token usage)[/dim]"
+        self.query_one("#drilldown-header", Static).update(
+            f"[bold]Session:[/bold] {self.session_id}  "
+            f"[bold]Project:[/bold] {self.session_project}  "
+            f"[bold]Directive:[/bold] {self.session_directive}  "
+            + hint
+        )
+
     def on_mount(self):
-        self._show_accomplishments()
-        self.query_one("#drilldown-table", DataTable).display = False
+        self._update_header()
+        self.query_one("#accomplishments-view", Static).display = False
+        self._show_tokens()
 
     def _show_accomplishments(self):
         acc = _extract_accomplishments(self.session_id)
@@ -1496,19 +1519,20 @@ class SessionDrillDown(Screen):
         table.cursor_type = "row"
         table.zebra_stripes = True
         table.add_column("#", width=4)
-        table.add_column("In", width=8)
-        table.add_column("Out", width=8)
-        table.add_column("~5h%", width=6)
-        table.add_column("Model", width=7)
-        table.add_column("Tools", width=25)
-        table.add_column("Prompt")
+        table.add_column("In", width=7)
+        table.add_column("Out", width=7)
+        table.add_column("Cost", width=7)
+        table.add_column("5h%", width=5)
+        table.add_column("Mdl", width=6)
+        table.add_column("Tools", width=28)
+        table.add_column("User Prompt")
 
         turns = _get_session_turns(self.session_id)
         if not turns:
-            table.add_row("—", "", "", "", "", "", Text("no turns found", style="dim"))
+            table.add_row("—", "", "", "", "", "", "", Text("no turns found", style="dim"))
             return
 
-        total_in = total_out = total_pct = 0
+        total_in = total_out = total_pct = total_cost = 0
         for t in turns:
             tokens_in = t["tokens_in"]
             tokens_out = t["tokens_out"]
@@ -1516,27 +1540,35 @@ class SessionDrillDown(Screen):
             total_out += tokens_out
             total_pct += t["pct_est"]
 
+            turn_cost = _estimate_turn_cost(tokens_in, tokens_out, t["model"])
+            total_cost += turn_cost
+
             in_str = f"{tokens_in/1000:.1f}k" if tokens_in >= 1000 else str(tokens_in)
             out_str = f"{tokens_out/1000:.1f}k" if tokens_out >= 1000 else str(tokens_out)
+            cost_str = _format_cost(turn_cost)
 
             pct = t["pct_est"]
             pct_style = "red" if pct > 1 else ("yellow" if pct > 0.3 else "dim")
+            cost_style = "red" if turn_cost >= 0.20 else ("yellow" if turn_cost >= 0.05 else "green")
             mdl_style = "magenta" if t["model"] == "opus" else ("cyan" if t["model"] == "sonnet" else "dim")
 
             table.add_row(
                 str(t["turn"]),
                 Text(in_str, style="dim"),
                 Text(out_str),
+                Text(cost_str, style=cost_style),
                 Text(f"{pct:.1f}%", style=pct_style),
                 Text(t["model"], style=mdl_style),
-                Text(t["tools"][:25], style="dim"),
-                Text(t["prompt"][:50]),
+                Text(t["tools"][:28], style="dim"),
+                Text(t["prompt"][:60]),
             )
 
+        total_cost_str = f"${total_cost:.2f}" if total_cost >= 0.01 else "<$0.01"
         table.add_row(
             Text("Σ", style="bold"),
             Text(f"{total_in/1000:.0f}k", style="bold"),
             Text(f"{total_out/1000:.0f}k", style="bold"),
+            Text(total_cost_str, style="bold red" if total_cost >= 1.0 else "bold yellow"),
             Text(f"{total_pct:.1f}%", style="bold yellow"),
             "",
             "",
@@ -1547,6 +1579,7 @@ class SessionDrillDown(Screen):
         self.showing_tokens = not self.showing_tokens
         acc_view = self.query_one("#accomplishments-view", Static)
         table = self.query_one("#drilldown-table", DataTable)
+        self._update_header()
 
         if self.showing_tokens:
             acc_view.display = False
@@ -1555,6 +1588,7 @@ class SessionDrillDown(Screen):
         else:
             table.display = False
             acc_view.display = True
+            self._show_accomplishments()
 
     def action_pop_screen(self):
         self.app.pop_screen()
@@ -1943,7 +1977,7 @@ class SessionTasksView(LazyView):
         filter_str = f"  [yellow][filter: \"{self._filter_text}\"][/yellow]" if self._filter_text else ""
         mode_label = "[bold yellow]ALL CYCLES[/bold yellow]" if self._show_all_windows else f"resets in {time_str}  {stars}"
         self.query_one("#cm-header", Static).update(
-            f"[bold]CYCLE MONITOR v2[/bold]  {mode_label}  "
+            f"[bold]CYCLE MONITOR[/bold]  {mode_label}  "
             f"[green]{open_count} open[/green]  [dim]{done_count} done[/dim]{filter_str}  "
             f"[dim](n=add  /=filter  a=all  Enter=edit  x=done  r=roll  d=delete  q=back)[/dim]"
         )
@@ -2259,7 +2293,9 @@ class ProjectBoardView(LazyView):
 
         for proj in sorted(by_project.keys()):
             counts = by_project[proj]
-            co_name, co_style = _project_to_company(proj)
+            proj_companies = [t.get("company", "") for t in tasks if t.get("project") == proj and t.get("company")]
+            company_val = max(set(proj_companies), key=proj_companies.count) if proj_companies else ""
+            co_name, co_style = _project_to_company(proj, company_val)
             proj_pts = sum(t.get("points") or 0 for t in tasks
                           if t.get("project") == proj and t.get("status") in ("ready", "in_progress"))
             summary_table.add_row(
@@ -2286,8 +2322,11 @@ class ProjectBoardView(LazyView):
         dt.add_column("Tier", width=5)
         dt.add_column("~kT", width=4)
         dt.add_column("St", width=12)
+        dt.add_column("Co", width=8)
         dt.add_column("Project", width=10)
-        dt.add_column("Task", width=35)
+        dt.add_column("Task", width=30)
+        dt.add_column("Created", width=12)
+        dt.add_column("Sess", width=7)
         dt.add_column("🚀", width=2)  # dispatch-ready indicator
 
         # Sort: in_progress first, then ready, then blocked, then built; within each, by priority
@@ -2329,6 +2368,13 @@ class ProjectBoardView(LazyView):
             dispatch_icon = "✓" if dispatch_ready else ("⊘" if blocked else "")
             dispatch_style = "green bold" if dispatch_ready else ("red" if blocked else "dim")
 
+            created_at = t.get("created_at", "")
+            created_display = created_at[5:16].replace("T", " ") if created_at else "—"
+            company_raw = t.get("company", "")
+            co_name, co_style = _project_to_company(t.get("project", ""), company_raw)
+            session_raw = t.get("created_by_session", "")
+            session_display = session_raw.replace("cc-", "") if session_raw else "—"
+
             dt.add_row(
                 Text(tid, justify="right"),
                 Text(_pri_label.get(pri, "—"), style=_pri_style.get(pri, "dim")),
@@ -2337,18 +2383,21 @@ class ProjectBoardView(LazyView):
                 Text(tier[:4], style=_tier_style.get(tier, "dim")),
                 Text(str(tok) if tok else "—", justify="right", style="magenta" if tok else "dim"),
                 Text(f"{status_icon} {status}", style=status_style),
+                Text(co_name[:8], style=co_style),
                 Text(t.get("project", "—")[:10], style="cyan"),
-                Text((t.get("task_name") or "—")[:35]),
+                Text((t.get("task_name") or "—")[:30]),
+                Text(created_display, style="dim"),
+                Text(session_display[:7], style="dim"),
                 Text(dispatch_icon, style=dispatch_style),
             )
 
         if not shown:
-            dt.add_row(*[""] * 10)
+            dt.add_row(*[""] * 13)
 
         if built_tasks:
             remaining_built = len([t for t in sorted_tasks if t.get("status") == "built"]) - 10
             if remaining_built > 0:
-                row = ["", "", "", "", "", "", Text(f"... +{remaining_built} built", style="dim"), "", "", ""]
+                row = ["", "", "", "", "", "", Text(f"... +{remaining_built} built", style="dim"), "", "", "", "", "", ""]
                 dt.add_row(*row)
 
 
@@ -2560,8 +2609,10 @@ class SessionHistoryTable(DataTable):
 
         try:
             cur_row = self.cursor_row
+            saved_y = self.scroll_y
         except Exception:
             cur_row = 0
+            saved_y = 0
 
         self.clear()
 
@@ -2685,7 +2736,11 @@ class SessionHistoryTable(DataTable):
 
         try:
             if cur_row < self.row_count:
-                self.move_cursor(row=cur_row)
+                self.move_cursor(row=cur_row, scroll=False)
+        except Exception:
+            pass
+        try:
+            self.scroll_to(y=saved_y, animate=False)
         except Exception:
             pass
 
@@ -2730,8 +2785,10 @@ class CallHistoryTable(DataTable):
 
         try:
             cur_row = self.cursor_row
+            saved_y = self.scroll_y
         except Exception:
             cur_row = 0
+            saved_y = 0
 
         self.clear()
 
@@ -2812,7 +2869,11 @@ class CallHistoryTable(DataTable):
 
         try:
             if cur_row < self.row_count:
-                self.move_cursor(row=cur_row)
+                self.move_cursor(row=cur_row, scroll=False)
+        except Exception:
+            pass
+        try:
+            self.scroll_to(y=saved_y, animate=False)
         except Exception:
             pass
 
@@ -3867,7 +3928,7 @@ class ClaudeWatchApp(App):
         self._signal_files_changed()
 
     def _signal_files_changed(self):
-        """Called from watcher thread when source files change."""
+        """Called from watcher thread when source files change. Auto-validates and restarts."""
         import time as _time
         if _time.time() < self._revert_cooldown_until:
             return
@@ -3876,6 +3937,8 @@ class ClaudeWatchApp(App):
             self.query_one("#reload-banner", ReloadBanner).show_pending()
         except Exception:
             pass
+        # Auto-validate and restart after brief delay
+        self.set_timer(1.0, self.action_reload_build)
 
     def action_reload_build(self):
         """Validate new code and restart if safe, or revert if broken."""
@@ -4207,6 +4270,204 @@ def _cli_list_sessions(args):
             ))
 
 
+def _snapshot_health_indicator(five, seven, alert_count):
+    """Return (color, label) for health dot."""
+    try:
+        f, s = float(five), float(seven)
+    except (ValueError, TypeError):
+        return "yellow", "UNKNOWN"
+    if f > 80 or s > 90 or alert_count > 0:
+        return "red", "RED"
+    if f > 50 or s > 70:
+        return "yellow", "YELLOW"
+    return "green", "GREEN"
+
+
+def _cli_snapshot():
+    """Print compact Rich-formatted token capacity snapshot and exit."""
+    from rich.console import Console
+
+    five, seven, five_reset_ts, seven_reset_ts = _current_pct()
+
+    # Gather all data
+    five_cd = _countdown(five_reset_ts)
+    seven_rd = _reset_day(seven_reset_ts)
+    acct_label, acct_name, acct_lane = _get_active_account()
+    pacing = _token_pacing()
+    sessions = _active_sessions()
+    daily = _get_daily_usage(days=1)
+    capacities = get_account_capacity_display()
+
+    # Compute daily tokens and cost
+    if daily and len(daily) > 0:
+        day_tokens = daily[0][1] if len(daily[0]) > 1 else 0
+    else:
+        day_tokens = 0
+    day_cost = _estimate_cost(day_tokens, "opus")
+    day_cost_str = _format_cost(day_cost)
+    if day_tokens >= 1_000_000:
+        tok_str = f"{day_tokens / 1_000_000:.1f}M"
+    elif day_tokens >= 1000:
+        tok_str = f"{day_tokens / 1000:.0f}k"
+    else:
+        tok_str = str(day_tokens)
+
+    session_count = len(sessions)
+    no_data = five == "?" and seven == "?"
+    health_color, health_label = _snapshot_health_indicator(five, seven, 0)
+
+    # JSON mode for piped output
+    if not sys.stdout.isatty():
+        import json as _json
+        payload = {
+            "account": {"label": acct_label, "name": acct_name, "lane": acct_lane},
+            "five_pct": five, "seven_pct": seven,
+            "five_reset": five_cd, "seven_reset": seven_rd,
+            "health": health_label,
+            "pacing": pacing,
+            "sessions_active": session_count,
+            "today_tokens": day_tokens,
+            "today_cost": day_cost,
+            "capacities": capacities,
+        }
+        print(_json.dumps(payload, default=str))
+        return
+
+    console = Console()
+
+    def _bar(pct_val, width=20):
+        try:
+            p = float(pct_val)
+        except (ValueError, TypeError):
+            return " " * width
+        p = max(0, min(100, p))
+        filled = int(p / 100 * width)
+        empty = width - filled
+        if p > 80:
+            color = "red"
+        elif p > 50:
+            color = "yellow"
+        else:
+            color = "green"
+        bar_text = Text()
+        bar_text.append("█" * filled, style=color)
+        bar_text.append("░" * empty, style="dim")
+        return bar_text
+
+    # Build content
+    content = Text()
+
+    # Account line
+    content.append(f"Account {acct_label}", style="bold")
+    content.append(f" ({acct_name}) ", style="")
+    content.append(acct_lane, style="dim")
+    content.append("\n\n")
+
+    if no_data:
+        content.append("No rate data", style="dim")
+        content.append("\n")
+    else:
+        # 5h bar
+        content.append("5h  ")
+        content.append_text(_bar(five))
+        try:
+            content.append(f"  {int(float(five)):>3}%", style="bold")
+        except (ValueError, TypeError):
+            content.append("    ?%")
+        # Extract just the time part from countdown
+        reset_short = five_cd.split(" (")[0] if " (" in five_cd else five_cd
+        content.append("  resets ", style="dim")
+        content.append(reset_short, style="dim")
+        content.append("\n")
+
+        # 7d bar
+        content.append("7d  ")
+        content.append_text(_bar(seven))
+        try:
+            content.append(f"  {int(float(seven)):>3}%", style="bold")
+        except (ValueError, TypeError):
+            content.append("    ?%")
+        content.append("  resets ", style="dim")
+        # Extract just day/month/date (e.g. "Mon Apr 13")
+        rd_parts = seven_rd.split(" ")
+        reset_day_short = " ".join(rd_parts[:3]) if len(rd_parts) >= 3 else seven_rd
+        content.append(reset_day_short, style="dim")
+        content.append("\n")
+
+    content.append("\n")
+
+    # Pacing line
+    if pacing is not None:
+        avg_burn = pacing.get("avg_burn", 0)
+        mins_to_100 = pacing.get("mins_to_100", 0)
+        mins_to_reset = pacing.get("mins_to_reset", 0)
+        burn_style = "bold" if avg_burn > 1.0 else ""
+        content.append("Burn: ", style="")
+        content.append(f"{avg_burn:.1f}%/min", style=burn_style)
+        hrs = int(mins_to_100 // 60)
+        mins = int(mins_to_100 % 60)
+        if mins_to_100 < mins_to_reset:
+            content.append(f" — 100% in ~{hrs}h{mins:02d}m")
+        else:
+            content.append(f" — 100% in ~{hrs}h{mins:02d}m (resets first)")
+        content.append("\n")
+
+    # Sessions + cost line
+    content.append(f"Sessions: {session_count} active", style="")
+    content.append(f"  Today: {tok_str} tok (~{day_cost_str})", style="")
+    content.append("\n")
+
+    # Other accounts footer
+    other_accts = [c for c in capacities if not c.get("is_active")]
+    if other_accts:
+        content.append("\n")
+        parts = []
+        for c in other_accts:
+            lbl = c.get("label", "?")
+            fp = c.get("five_pct")
+            sp = c.get("seven_pct")
+            if fp is None:
+                fp_str = "—"
+            else:
+                try:
+                    fp_str = f"{int(float(fp))}%"
+                except (ValueError, TypeError):
+                    fp_str = str(fp)
+            if sp is None:
+                sp_str = "—"
+            else:
+                try:
+                    sp_str = f"{int(float(sp))}%"
+                except (ValueError, TypeError):
+                    sp_str = str(sp)
+            parts.append(f"{lbl}: 5h:{fp_str} 7d:{sp_str}")
+        content.append("  ".join(parts), style="dim")
+        content.append("\n")
+
+    # Health indicator for title
+    health_dot = Text()
+    health_dot.append("● ", style=health_color)
+    health_dot.append(health_label, style=health_color)
+
+    title = Text()
+    title.append(" Token Capacity ")
+
+    subtitle_text = Text()
+    subtitle_text.append(" ")
+    subtitle_text.append_text(health_dot)
+    subtitle_text.append(" ")
+
+    panel = Panel(
+        content,
+        title=title,
+        subtitle=subtitle_text,
+        border_style="bright_cyan",
+        width=56,
+        padding=(0, 1),
+    )
+    console.print(panel)
+
+
 def main():
     import argparse
     import sys
@@ -4214,6 +4475,7 @@ def main():
     parser.add_argument("-s", "--session", help="Look up session by CCID or UUID prefix")
     parser.add_argument("-l", "--list", action="store_true", help="List recent sessions")
     parser.add_argument("--context", action="store_true", help="Include resume context (with --session)")
+    parser.add_argument("--snapshot", action="store_true", help="Print compact capacity snapshot and exit")
     args = parser.parse_args()
 
     if args.session:
@@ -4222,12 +4484,17 @@ def main():
     if args.list:
         _cli_list_sessions(args)
         return
+    if args.snapshot:
+        _cli_snapshot()
+        return
 
     while True:
         app = ClaudeWatchApp()
         result = app.run()
         if result != ClaudeWatchApp._RESTART_EXIT_CODE:
             break
+        # Full process restart so Python re-imports all modules from disk
+        os.execv(sys.executable, [sys.executable] + sys.argv)
 
 
 if __name__ == "__main__":
