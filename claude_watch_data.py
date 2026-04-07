@@ -2373,6 +2373,120 @@ def _get_all_account_capacities():
     return result
 
 
+def _get_supabase_account_capacity():
+    # type: () -> List[Dict[str, Any]]
+    """Fetch account capacity snapshots from Supabase.
+
+    Returns list of dicts with columns: account, account_name,
+    five_hour_used_pct, five_hour_resets_at, seven_day_used_pct,
+    seven_day_resets_at, snapshot_at, is_active.
+    """
+    import urllib.request
+    import json as _json
+
+    url = (
+        "https://zoirudjyqfqvpxsrxepr.supabase.co/rest/v1/account_capacity"
+        "?order=account.asc"
+    )
+    key = (
+        "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9."
+        "eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InpvaXJ1ZGp5cWZxdnB4c3J4ZXByIiwi"
+        "cm9sZSI6ImFub24iLCJpYXQiOjE3NjgwMzE4MjgsImV4cCI6MjA4MzYwNzgyOH0."
+        "6W6OzRfJ-nmKN_23z1OBCS4Cr-ODRq9DJmF_yMwOCfo"
+    )
+
+    req = urllib.request.Request(url, headers={
+        "apikey": key,
+        "Authorization": "Bearer " + key,
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            return _json.loads(resp.read())
+    except Exception:
+        return []
+
+
+def get_account_capacity_display():
+    # type: () -> List[Dict[str, Any]]
+    """Combine Supabase capacity data, live data for active account, and
+    accounts.json metadata.  Returns list of dicts ready for display:
+
+        label, name, lane, repos, is_active, five_pct, seven_pct,
+        five_reset, seven_reset, snapshot_age_min
+    """
+    # 1. Live data for active account
+    five_live, seven_live, five_reset_live, seven_reset_live = _current_pct()
+
+    # 2. accounts.json metadata
+    try:
+        accts_json = json.loads(
+            (Path.home() / ".claude/accounts.json").read_text()
+        )
+        active_label = accts_json.get("active", "?")
+        accounts_meta = {
+            a.get("label", "?"): a for a in accts_json.get("accounts", [])
+        }
+    except Exception:
+        active_label = "?"
+        accounts_meta = {}
+
+    # 3. Supabase snapshots
+    sb_rows = _get_supabase_account_capacity()
+    sb_map = {}  # type: Dict[str, Dict[str, Any]]
+    for row in sb_rows:
+        sb_map[row.get("account", "?")] = row
+
+    # Build result for A, B, C
+    result = []  # type: List[Dict[str, Any]]
+    for label in ("A", "B", "C"):
+        meta = accounts_meta.get(label, {})
+        sb = sb_map.get(label, {})
+        is_active = label == active_label
+
+        # Compute snapshot age in minutes
+        snap_age = None  # type: Optional[float]
+        snap_at = sb.get("snapshot_at")
+        if snap_at:
+            try:
+                snap_dt = datetime.fromisoformat(
+                    snap_at.replace("Z", "+00:00")
+                )
+                snap_age = (
+                    datetime.now(timezone.utc) - snap_dt
+                ).total_seconds() / 60.0
+            except Exception:
+                snap_age = None
+
+        if is_active:
+            # Use live data — it is fresher
+            five_pct = five_live
+            seven_pct = seven_live
+            five_reset = five_reset_live
+            seven_reset = seven_reset_live
+            age_min = 0.0
+        else:
+            five_pct = sb.get("five_hour_used_pct", "—")
+            seven_pct = sb.get("seven_day_used_pct", "—")
+            five_reset = sb.get("five_hour_resets_at", "")
+            seven_reset = sb.get("seven_day_resets_at", "")
+            age_min = snap_age if snap_age is not None else -1.0
+
+        result.append({
+            "label": label,
+            "name": meta.get("name", sb.get("account_name", "?")),
+            "lane": meta.get("lane", "?"),
+            "repos": meta.get("repos", []),
+            "is_active": is_active,
+            "five_pct": five_pct,
+            "seven_pct": seven_pct,
+            "five_reset": five_reset,
+            "seven_reset": seven_reset,
+            "snapshot_age_min": age_min,
+        })
+
+    return result
+
+
 def _burn_mode():
     """Return burn mode state: (active, remaining_secs) or (False, 0)."""
     burn_file = Path("~/.claude/burn-mode.json").expanduser()

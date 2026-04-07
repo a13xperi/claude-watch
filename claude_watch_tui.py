@@ -54,6 +54,7 @@ from claude_watch_data import (
     check_and_notify,
     export_session_history_csv,
     focus_session_terminal,
+    get_account_capacity_display,
     lookup_by_ccid,
     make_drain_panel,
     make_header,
@@ -727,11 +728,16 @@ class BurndownChart(Static):
             stars = live_score["stars"]
             ov = live_score["overall"]
             star_color = "green" if ov >= 4 else ("yellow" if ov >= 3 else "red")
+            def _dim_c(val):
+                return "green" if val >= 4 else ("yellow" if val >= 2.5 else "red")
+            b, p, sh, br, ve = live_score['burn'], live_score['parallelism'], live_score['shipping'], live_score['breadth'], live_score['velocity']
             score_line = (
                 f"  [{star_color}]{stars} {ov}[/{star_color}]"
-                f"  [dim]B:{live_score['burn']:.0f} P:{live_score['parallelism']:.0f}"
-                f" S:{live_score['shipping']:.0f} Br:{live_score['breadth']:.0f}"
-                f" V:{live_score['velocity']:.0f}[/dim]"
+                f"  [dim]Burn:[/dim][{_dim_c(b)}]{b:.0f}[/{_dim_c(b)}]"
+                f" [dim]Parallel:[/dim][{_dim_c(p)}]{p:.0f}[/{_dim_c(p)}]"
+                f" [dim]Ship:[/dim][{_dim_c(sh)}]{sh:.0f}[/{_dim_c(sh)}]"
+                f" [dim]Breadth:[/dim][{_dim_c(br)}]{br:.0f}[/{_dim_c(br)}]"
+                f" [dim]Velocity:[/dim][{_dim_c(ve)}]{ve:.0f}[/{_dim_c(ve)}]"
             )
             streak = _get_streak()
             if streak >= 3:
@@ -1153,6 +1159,8 @@ class UsageMetricsScreen(Screen):
         yield DailySparklinePanel(id="metrics-sparkline")
         yield DataTable(id="metrics-table")
         yield Static(id="metrics-summary")
+        yield Static(id="scores-header")
+        yield DataTable(id="scores-table")
 
     def on_mount(self):
         metrics, total = _get_usage_metrics(days=7)
@@ -1208,6 +1216,61 @@ class UsageMetricsScreen(Screen):
             f"[dim]Sessions above represent all indexed transcripts from the last 7 days. "
             f"7d account budget usage ({seven}%) is account-level and not split per source.[/dim]"
         )
+
+        # Window Scores
+        from claude_watch_data import _get_window_scores, _get_streak, _stars_display
+        scores = _get_window_scores(limit=10)
+        streak = _get_streak(scores)
+
+        streak_str = f"  [bold yellow]🔥 {streak}-window streak[/bold yellow]" if streak >= 3 else ""
+        self.query_one("#scores-header", Static).update(
+            f"[bold]Window Scores[/bold]  [dim]{len(scores)} scored windows[/dim]{streak_str}"
+        )
+
+        st = self.query_one("#scores-table", DataTable)
+        st.cursor_type = "row"
+        st.zebra_stripes = True
+        st.add_column("Window", width=18)
+        st.add_column("Stars", width=8)
+        st.add_column("Overall", width=8)
+        st.add_column("Burn", width=6)
+        st.add_column("Para", width=6)
+        st.add_column("Ship", width=6)
+        st.add_column("Breadth", width=8)
+        st.add_column("Vel", width=6)
+        st.add_column("Details")
+
+        for s in scores:
+            try:
+                ws = datetime.fromisoformat(s["window_start"].replace("Z", "+00:00"))
+                window_label = ws.astimezone().strftime("%b %d %H:%M")
+            except Exception:
+                window_label = "?"
+            ov = s.get("overall", 0)
+            ov_color = "green" if ov >= 4 else ("yellow" if ov >= 3 else "red")
+            details = (
+                f"{s.get('burn_pct', 0):.0f}% burn, "
+                f"{s.get('max_parallel', 0)} parallel, "
+                f"{s.get('commits', 0)} commits, "
+                f"{s.get('projects', 0)} projects"
+            )
+            st.add_row(
+                Text(window_label, style="dim"),
+                Text(s.get("stars", "?"), style=ov_color),
+                Text(f"{ov}", style=ov_color, justify="right"),
+                Text(f"{s.get('burn', 0):.0f}", justify="right"),
+                Text(f"{s.get('parallelism', 0):.0f}", justify="right"),
+                Text(f"{s.get('shipping', 0):.0f}", justify="right"),
+                Text(f"{s.get('breadth', 0):.0f}", justify="right"),
+                Text(f"{s.get('velocity', 0):.0f}", justify="right"),
+                Text(details, style="dim"),
+            )
+
+        if not scores:
+            st.add_row(
+                Text("No scored windows yet", style="dim"),
+                "", "", "", "", "", "", "", "",
+            )
 
     def action_pop_screen(self):
         self.app.pop_screen()
@@ -1386,9 +1449,8 @@ class ProjectBoardScreen(Screen):
 
     def compose(self) -> ComposeResult:
         yield Static(id="pboard-header")
-        with Horizontal(id="pboard-body"):
-            yield Static(id="pboard-summary")
-            yield DataTable(id="pboard-table")
+        yield Static(id="pboard-summary")
+        yield DataTable(id="pboard-table")
 
     def on_mount(self):
         from claude_watch_data import _get_project_tasks
@@ -1435,8 +1497,8 @@ class ProjectBoardScreen(Screen):
             f"[dim](q to go back)[/dim]"
         )
 
-        # Left panel: project summary
-        summary_table = RichTable(show_header=True, show_edge=False, pad_edge=False)
+        # Top panel: project summary
+        summary_table = RichTable(show_header=True, show_edge=False, pad_edge=False, expand=True)
         summary_table.add_column("Co", style="dim")
         summary_table.add_column("Project", style="bold")
         summary_table.add_column("Rdy", style="yellow", justify="right")
@@ -1462,7 +1524,7 @@ class ProjectBoardScreen(Screen):
             Panel(summary_table, title="[bold]Summary[/bold]", border_style="cyan")
         )
 
-        # Right panel: task list (in_progress first, then ready)
+        # Bottom panel: task list (in_progress first, then ready)
         dt = self.query_one("#pboard-table", DataTable)
         dt.cursor_type = "row"
         dt.zebra_stripes = True
@@ -1537,6 +1599,163 @@ class ProjectBoardScreen(Screen):
             if remaining_built > 0:
                 row = ["", "", "", "", "", "", Text(f"... +{remaining_built} built", style="dim"), "", "", ""]
                 dt.add_row(*row)
+
+    def action_pop_screen(self):
+        self.app.pop_screen()
+
+
+class AccountCapacityScreen(Screen):
+    """Full-screen multi-account capacity view (A / B / C)."""
+    BINDINGS = [
+        Binding("escape", "pop_screen", "Back"),
+        Binding("q", "pop_screen", "Back"),
+    ]
+
+    def compose(self) -> ComposeResult:
+        yield Static(id="cap-header")
+        with Horizontal(id="cap-panels"):
+            yield Static(id="cap-panel-a")
+            yield Static(id="cap-panel-b")
+            yield Static(id="cap-panel-c")
+        yield Static(id="cap-footer")
+
+    def on_mount(self):
+        accounts = get_account_capacity_display()
+
+        # Header — highlight active account
+        labels = []
+        for a in accounts:
+            color = {"A": "cyan", "B": "magenta", "C": "yellow"}.get(a["label"], "white")
+            if a["is_active"]:
+                labels.append("[bold {c}][ {l} ][/bold {c}]".format(c=color, l=a["label"]))
+            else:
+                labels.append("[dim]{l}[/dim]".format(l=a["label"]))
+
+        self.query_one("#cap-header", Static).update(
+            "[bold]Account Capacity[/bold]  {joined}  "
+            "[dim](Escape / q to go back)[/dim]".format(joined="  /  ".join(labels))
+        )
+
+        # Build each panel
+        panel_ids = {"A": "#cap-panel-a", "B": "#cap-panel-b", "C": "#cap-panel-c"}
+        colors = {"A": "cyan", "B": "magenta", "C": "yellow"}
+
+        total_five = 0.0
+        total_seven = 0.0
+        healthy = 0
+
+        for a in accounts:
+            label = a["label"]
+            color = colors.get(label, "white")
+            panel_widget = self.query_one(panel_ids[label], Static)
+
+            # Active indicator
+            if a["is_active"]:
+                title_line = "[green]●[/green] [bold {c}]Account {l}[/bold {c}] [dim]({n})[/dim]".format(
+                    c=color, l=label, n=a["name"]
+                )
+            else:
+                title_line = "[dim]○[/dim] [{c}]Account {l}[/{c}] [dim]({n})[/dim]".format(
+                    c=color, l=label, n=a["name"]
+                )
+
+            # Lane
+            lane_style = {"builder": "blue", "operator": "green", "overflow": "yellow"}.get(a["lane"], "dim")
+            lane_line = "[dim]Lane:[/dim] [{s}]{v}[/{s}]".format(s=lane_style, v=a["lane"])
+
+            # Repos
+            repos = a.get("repos", [])
+            if repos:
+                repos_line = "[dim]Repos:[/dim] " + ", ".join(repos)
+            else:
+                repos_line = "[dim]Repos: any[/dim]"
+
+            # Usage bars
+            five_bar = self._bar(a["five_pct"])
+            seven_bar = self._bar(a["seven_pct"])
+
+            # Reset countdowns
+            five_cd = _countdown(a["five_reset"]) if a["five_reset"] else "---"
+            seven_cd = _countdown(a["seven_reset"]) if a["seven_reset"] else "---"
+
+            # Data freshness
+            age = a["snapshot_age_min"]
+            if a["is_active"]:
+                freshness = "[green]live[/green]"
+            elif age < 0:
+                freshness = "[dim]no data[/dim]"
+            elif age < 2:
+                freshness = "[green]<2m ago[/green]"
+            elif age < 60:
+                freshness = "[yellow]{:.0f}m ago[/yellow]".format(age)
+            else:
+                freshness = "[red]{:.0f}h ago[/red]".format(age / 60)
+
+            # Track totals for footer
+            try:
+                total_five += float(a["five_pct"])
+                total_seven += float(a["seven_pct"])
+            except (ValueError, TypeError):
+                pass
+            try:
+                if float(a["seven_pct"]) < 70:
+                    healthy += 1
+            except (ValueError, TypeError):
+                pass
+
+            # Compose the panel content
+            lines = [
+                title_line,
+                lane_line,
+                repos_line,
+                "",
+                "[bold]5h usage:[/bold]  " + five_bar,
+                "[dim]  resets:[/dim] " + five_cd,
+                "",
+                "[bold]7d usage:[/bold]  " + seven_bar,
+                "[dim]  resets:[/dim] " + seven_cd,
+                "",
+                "[dim]data:[/dim] " + freshness,
+            ]
+
+            border_style = "bold " + color if a["is_active"] else "dim"
+            panel_widget.update(
+                Panel(
+                    "\n".join(lines),
+                    title="[bold {c}]{l}[/bold {c}]".format(c=color, l=label),
+                    border_style=border_style,
+                    expand=True,
+                )
+            )
+
+        # Footer: capacity health summary
+        avg_five = total_five / 3
+        avg_seven = total_seven / 3
+        health_color = "green" if healthy >= 2 else ("yellow" if healthy >= 1 else "red")
+        self.query_one("#cap-footer", Static).update(
+            "[dim]Avg 5h: {five:.0f}%  Avg 7d: {seven:.0f}%  "
+            "[/dim][{hc}]{h}/3 accounts healthy (<70% weekly)[/{hc}]".format(
+                five=avg_five, seven=avg_seven, hc=health_color, h=healthy,
+            )
+        )
+
+    @staticmethod
+    def _bar(pct_val, width=20):
+        # type: (Any, int) -> str
+        """Render a usage bar from a percentage value."""
+        try:
+            pct_f = float(pct_val)
+            filled = int(pct_f * width / 100)
+            bar_color = "green" if pct_f < 50 else ("yellow" if pct_f < 75 else "red")
+            pct_display = "{:.1f}".format(pct_f) if pct_f != int(pct_f) else str(int(pct_f))
+            return "[{c}]{f}{e}[/{c}] {p}%".format(
+                c=bar_color,
+                f="█" * filled,
+                e="░" * (width - filled),
+                p=pct_display,
+            )
+        except (ValueError, TypeError):
+            return "[dim]{e}[/dim]  ---".format(e="░" * width)
 
     def action_pop_screen(self):
         self.app.pop_screen()
@@ -1869,6 +2088,7 @@ class ClaudeWatchApp(App):
         Binding("s", "show_session_tasks", "Tasks"),
         Binding("p", "show_project_board", "Board"),
         Binding("a", "toggle_accounts", "Accounts"),
+        Binding("c", "show_capacity", "Capacity"),
         Binding("h", "toggle_health", "Health"),
         Binding("slash", "start_search", "Search"),
         Binding("tab", "focus_next", "Next panel", show=False),
@@ -1940,6 +2160,14 @@ class ClaudeWatchApp(App):
         # CallHistoryTable removed — merged into SessionHistoryTable sub-rows
         self.query_one("#drain", DrainPanel).update_content()
 
+        # Auto-score completed windows
+        from claude_watch_data import _check_and_score_completed_window
+        new_score = _check_and_score_completed_window()
+        if new_score:
+            stars = new_score.get("stars", "")
+            ov = new_score.get("overall", 0)
+            self.notify(f"Window scored: {stars} ({ov})", severity="information", timeout=10)
+
         # System notifications on spike
         try:
             five_f = float(five)
@@ -1985,6 +2213,9 @@ class ClaudeWatchApp(App):
 
     def action_show_project_board(self):
         self.push_screen(ProjectBoardScreen())
+
+    def action_show_capacity(self):
+        self.push_screen(AccountCapacityScreen())
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         btn_id = event.button.id or ""

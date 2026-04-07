@@ -106,7 +106,7 @@ Screen {
 /* ── Burndown chart ── */
 #burndown {
     height: auto;
-    max-height: 10;
+    max-height: 12;
 }
 
 /* ── Search input ── */
@@ -158,6 +158,19 @@ Screen {
     padding: 0 1;
 }
 
+/* ── Window Scores (Usage Metrics screen) ── */
+#scores-header {
+    height: auto;
+    max-height: 2;
+    padding: 0 1;
+}
+
+#scores-table {
+    height: 1fr;
+    border: solid yellow;
+    border-title-color: white;
+}
+
 /* ── DataTable styling ── */
 DataTable {
     scrollbar-size: 1 1;
@@ -187,21 +200,40 @@ DataTable > .datatable--header {
     padding: 0 1;
 }
 
-#pboard-body {
+#pboard-summary {
+    width: 1fr;
+    height: auto;
+    max-height: 12;
+    padding: 0 1;
+}
+
+#pboard-table {
+    width: 1fr;
+    height: 1fr;
+    border: solid yellow;
+    border-title-color: white;
+}
+
+/* ── Account Capacity screen ── */
+#cap-header {
+    height: auto;
+    max-height: 2;
+    padding: 0 1;
+}
+
+#cap-panels {
     layout: horizontal;
     height: 1fr;
 }
 
-#pboard-summary {
+#cap-panel-a, #cap-panel-b, #cap-panel-c {
     width: 1fr;
-    max-width: 40;
     height: auto;
-    max-height: 20;
+    padding: 0 1;
 }
 
-#pboard-table {
-    width: 3fr;
-    height: 1fr;
-    border: solid yellow;
-    border-title-color: white;
+#cap-footer {
+    height: auto;
+    max-height: 2;
+    padding: 0 1;
 }
