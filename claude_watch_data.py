@@ -175,12 +175,174 @@ def _active_sessions():
                 sessions.append((pid, etime, directive or "—", delta, source))
     except Exception:
         pass
+    # Sort newest first (shortest etime = most recently spawned)
+    sessions.sort(key=lambda s: _etime_to_secs(s[1]) or 0)
     return sessions
 
 
 def _active_pids():
     """Return set of active cc-{PID} session IDs."""
     return {f"cc-{item[0]}" for item in _active_sessions()}
+
+
+def _get_conversation_title(pid):
+    # type: (str) -> Optional[str]
+    """Get the conversation title (first user message) for a session PID.
+
+    Warp shows the conversation title in its window title bar, not the directive.
+    We find it by looking up the session transcript via the session index.
+    """
+    ccid = f"cc-{pid}"
+    # Find the most recent index entry for this ccid (index is dict: session_id → entry)
+    idx = _load_index()
+    session_id = None
+    project_dir = None
+    best_mtime = 0.0
+    for sid, entry in idx.items():
+        if entry.get("ccid") == ccid:
+            mtime = entry.get("file_mtime", 0)
+            if mtime > best_mtime:
+                best_mtime = mtime
+                session_id = sid
+                project_dir = entry.get("project_dir")
+
+    if not session_id or not project_dir:
+        # Fallback: scan recent transcript files for this PID
+        # Active sessions may not be indexed yet
+        project_dirs = _project_dirs()
+        candidates = []  # type: list
+        for pd in project_dirs:
+            try:
+                for f in Path(pd).glob("*.jsonl"):
+                    candidates.append((f.stat().st_mtime, f))
+            except Exception:
+                continue
+        candidates.sort(key=lambda x: x[0], reverse=True)
+        for _, fpath in candidates[:10]:  # check 10 most recent
+            try:
+                with open(fpath) as fh:
+                    first_line = fh.readline()
+                    meta = json.loads(first_line)
+                    file_sid = meta.get("sessionId", "")
+                    if not file_sid:
+                        continue
+                    # Check if this session's ccid matches by looking at index
+                    # or just try to extract the title and check later
+                    title = _extract_first_user_message(fpath)
+                    if title:
+                        # Verify this file belongs to our PID by checking the index
+                        entry = idx.get(file_sid)
+                        if entry and entry.get("ccid") == ccid:
+                            return title
+            except Exception:
+                continue
+        # Last resort: check the very recent files without ccid verification
+        for _, fpath in candidates[:5]:
+            try:
+                with open(fpath) as fh:
+                    first_line = fh.readline()
+                    meta = json.loads(first_line)
+                    file_sid = meta.get("sessionId", "")
+                    if file_sid and file_sid not in idx:
+                        # Unindexed file — might be our active session
+                        title = _extract_first_user_message(fpath)
+                        if title:
+                            # Can't confirm PID match, but it's a recent unindexed session
+                            # Return it only if we have just one active unindexed session
+                            return title
+            except Exception:
+                continue
+        return None
+
+    # Read the transcript and find the first user message
+    transcript = Path(project_dir) / f"{session_id}.jsonl"
+    if not transcript.exists():
+        return None
+    return _extract_first_user_message(transcript)
+
+
+def _extract_first_user_message(fpath):
+    # type: (Path) -> Optional[str]
+    """Extract the first user message from a transcript file."""
+    try:
+        with open(fpath) as f:
+            for line in f:
+                try:
+                    e = json.loads(line)
+                    if e.get("type") == "user":
+                        content = e.get("message", {}).get("content", "")
+                        if isinstance(content, str):
+                            return content.split("\n")[0].strip()[:80]
+                        elif isinstance(content, list):
+                            for block in content:
+                                if isinstance(block, dict) and block.get("type") == "text":
+                                    return block["text"].split("\n")[0].strip()[:80]
+                except Exception:
+                    continue
+    except Exception:
+        pass
+    return None
+
+
+def _raise_warp_window(search_text):
+    # type: (str) -> bool
+    """Try to raise a Warp window whose title contains search_text (case-insensitive)."""
+    escaped = search_text.replace("\\", "\\\\").replace('"', '\\"')
+    # AppleScript 'contains' is case-insensitive by default
+    script = (
+        'tell application "System Events"\n'
+        '  tell application process "stable"\n'
+        '    set frontmost to true\n'
+        '    set wl to every window whose name contains "' + escaped + '"\n'
+        '    if (count of wl) > 0 then\n'
+        '      perform action "AXRaise" of item 1 of wl\n'
+        '      return "found"\n'
+        '    end if\n'
+        '  end tell\n'
+        'end tell'
+    )
+    try:
+        r = subprocess.run(
+            ["osascript", "-e", script],
+            timeout=3, capture_output=True, text=True,
+        )
+        return "found" in r.stdout
+    except Exception:
+        return False
+
+
+def focus_session_terminal(pid):
+    # type: (str) -> bool
+    """Bring the Warp window for a claude session to the front.
+
+    Tries multiple strategies to match the right Warp window:
+    1. Conversation title (first user message) — matches Warp's tab title
+    2. Directive text — fallback
+    3. Generic Warp activation — last resort
+    """
+    # Strategy 1: match by conversation title (what Warp actually shows)
+    title = _get_conversation_title(pid)
+    if title and _raise_warp_window(title):
+        return True
+
+    # Strategy 2: match by directive
+    directive = ""
+    try:
+        directive = Path(f"/tmp/claude-directive-{pid}").read_text().strip()
+    except Exception:
+        pass
+    if directive and directive != "\u2014" and _raise_warp_window(directive):
+        return True
+
+    # Strategy 3: just activate Warp
+    try:
+        subprocess.run(
+            ["osascript", "-e", 'tell application "Warp" to activate'],
+            timeout=3, capture_output=True,
+        )
+    except Exception:
+        pass
+    return False
 
 
 def _session_last_activity(session_id):
@@ -502,19 +664,65 @@ def _extract_accomplishments(session_id):
     return _extract_accomplishments_from_file(f)
 
 
+_MERGE_COMMIT_RE = re.compile(
+    r"^Merge (pull request|branch|remote-tracking branch|tag)",
+    re.IGNORECASE,
+)
+_CONVENTIONAL_COMMIT_RE = re.compile(
+    r"^(feat|fix|chore|docs|style|refactor|perf|test|ci|build|revert)"
+    r"(?:\([^)]+\))?!?:\s+(.+)",
+    re.IGNORECASE,
+)
+_GENERIC_COMMIT_WORDS = frozenset({
+    "wip", "fix", "update", "fixes", "updates", "misc", "cleanup",
+    "clean up", "temp", "test", "testing", "checkpoint", "progress",
+    "working", "save", "draft", "todo", "fixup", "squash", "merge",
+    "revert", "typo", "nit",
+})
+
+
+def _normalize_commit(msg):
+    # type: (str) -> Optional[str]
+    """Return a cleaned commit message, or None if too generic to be informative."""
+    if not msg:
+        return None
+    stripped = msg.strip()
+    # Drop merge commits
+    if _MERGE_COMMIT_RE.match(stripped):
+        return None
+    # Strip conventional commit prefix: "feat(auth): Add login" → "Add login"
+    m = _CONVENTIONAL_COMMIT_RE.match(stripped)
+    if m:
+        body = m.group(2).strip()
+        if not body:
+            return None
+        stripped = body
+    # Drop very short
+    if len(stripped) < 5:
+        return None
+    # Drop single/double-word generic messages
+    words = stripped.lower().split()
+    if words and len(words) <= 2 and words[0] in _GENERIC_COMMIT_WORDS:
+        return None
+    return stripped
+
+
 def _gravity_center(accomplishments, fallback=""):
     # type: (Dict[str, Any], str) -> str
     """Synthesize a short label from accomplishments."""
     if not accomplishments:
         return fallback
 
-    # 1. Git commits — use first commit message
+    # 1. Git commits — use first informative commit message
     commits = accomplishments.get("git_commits", [])
     if commits:
-        msg = commits[0]
-        if len(commits) > 1:
-            return f"{msg[:50]} (+{len(commits)-1} commits)"
-        return msg[:60]
+        good = [n for n in (_normalize_commit(c) for c in commits) if n]
+        if good:
+            extras = len(good) - 1
+            if extras > 0:
+                return f"{good[0][:50]} (+{extras} more)"
+            return good[0][:60]
+        # All commits were generic — fall through to other signals
 
     # 2. Files edited — group by top-level dir
     edited = accomplishments.get("files_edited", [])
@@ -1179,6 +1387,107 @@ def _get_usage_metrics(days=7):
     return metrics, total_output
 
 
+def _safe_date(ts_str):
+    # type: (Optional[str]) -> Optional[object]
+    """Parse an ISO timestamp string to a date object, or None on failure."""
+    if not ts_str:
+        return None
+    try:
+        dt = datetime.fromisoformat(ts_str)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone().date()
+    except Exception:
+        return None
+
+
+def _get_daily_usage(days=7):
+    # type: (int) -> List[Tuple[str, int]]
+    """Return (day_label, total_output_tokens) for each of the last N days, oldest first.
+    Labels: 'Today' for today, abbreviated weekday name otherwise.
+    """
+    _ensure_index()
+    today = datetime.now().astimezone().date()
+    result = []
+    for offset in range(days - 1, -1, -1):
+        day = today - timedelta(days=offset)
+        total = sum(
+            e.get("output_tokens", 0)
+            for e in _index_cache.values()
+            if _safe_date(e.get("last_ts")) == day
+        )
+        label = "Today" if offset == 0 else day.strftime("%a")
+        result.append((label, total))
+    return result
+
+
+def _get_mcp_stats(days=7):
+    # type: (int) -> Dict[str, Any]
+    """Aggregate MCP tool calls from ledger for the last N days.
+    Returns dict with by_server, top_actions, total_calls, sessions_with_mcp.
+    """
+    _ensure_index()
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+
+    by_server = defaultdict(lambda: {"calls": 0, "actions": defaultdict(int)})  # type: Dict
+    total_calls = 0
+
+    for e in _load_ledger():
+        if e.get("type") != "tool_use":
+            continue
+        tool = e.get("tool", "")
+        if not tool.startswith("mcp__"):
+            continue
+        try:
+            ts = datetime.fromisoformat(e["ts"].replace("Z", "+00:00"))
+            if ts < cutoff:
+                continue
+        except Exception:
+            continue
+        parsed = _parse_mcp_tool(tool)
+        if not parsed:
+            continue
+        server, _, action = parsed.partition(":")
+        by_server[server]["calls"] += 1
+        by_server[server]["actions"][action] += 1
+        total_calls += 1
+
+    # Count sessions with any MCP usage from index
+    sessions_with_mcp = 0
+    for entry in _index_cache.values():
+        try:
+            last_ts = datetime.fromisoformat(entry.get("last_ts", ""))
+            if last_ts.tzinfo is None:
+                last_ts = last_ts.replace(tzinfo=timezone.utc)
+            if last_ts < cutoff:
+                continue
+        except Exception:
+            continue
+        if entry.get("accomplishments", {}).get("mcp_ops"):
+            sessions_with_mcp += 1
+
+    sorted_servers = []
+    for server, data in sorted(by_server.items(), key=lambda x: x[1]["calls"], reverse=True):
+        sorted_servers.append({
+            "server": server,
+            "calls": data["calls"],
+            "actions": sorted(data["actions"].items(), key=lambda x: x[1], reverse=True),
+        })
+
+    all_actions = []  # type: List[Tuple[str, int]]
+    for server, data in by_server.items():
+        for action, count in data["actions"].items():
+            all_actions.append((f"{server}:{action}", count))
+    top_actions = sorted(all_actions, key=lambda x: x[1], reverse=True)[:20]
+
+    return {
+        "by_server": sorted_servers,
+        "top_actions": top_actions,
+        "total_calls": total_calls,
+        "sessions_with_mcp": sessions_with_mcp,
+    }
+
+
 # ── skill stats ──────────────────────────────────────────────────────────────
 
 def _get_skill_stats():
@@ -1205,6 +1514,42 @@ def _get_skill_stats():
     result = []
     for name, count in sorted(skill_counts.items(), key=lambda x: x[1], reverse=True):
         result.append((name, count, skill_last.get(name, "?")))
+    return result
+
+
+def _get_agent_stats(days=7):
+    # type: (int) -> List[Tuple[str, int, str]]
+    """Return (description_prefix, spawn_count, last_seen_str) from session index,
+    aggregated over last N days, sorted by count descending.
+    """
+    _ensure_index()
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+    counts = defaultdict(int)  # type: Dict[str, int]
+    last_seen = {}  # type: Dict[str, str]
+
+    for sid, entry in _index_cache.items():
+        try:
+            last_ts_str = entry.get("last_ts", "")
+            last_ts = datetime.fromisoformat(last_ts_str)
+            if last_ts.tzinfo is None:
+                last_ts = last_ts.replace(tzinfo=timezone.utc)
+            if last_ts < cutoff:
+                continue
+            time_str = last_ts.astimezone().strftime("%m/%d")
+        except Exception:
+            continue
+        acc = entry.get("accomplishments", {})
+        for item in acc.get("bash_notable", []):
+            if not item.startswith("agent: "):
+                continue
+            desc = item[7:].strip()
+            key = desc[:40]
+            counts[key] += 1
+            last_seen[key] = time_str
+
+    result = []
+    for key, count in sorted(counts.items(), key=lambda x: x[1], reverse=True):
+        result.append((key, count, last_seen.get(key, "?")))
     return result
 
 
@@ -1651,7 +1996,7 @@ def _get_system_health():
     # Get all processes
     try:
         r = subprocess.run(
-            ["ps", "-eo", "pid,pcpu,rss,comm"],
+            ["ps", "-eo", "pid,pcpu,rss,etime,comm"],
             capture_output=True, text=True, timeout=3,
         )
     except Exception:
@@ -1660,23 +2005,34 @@ def _get_system_health():
     # Get active session info for cross-referencing
     active = _active_sessions()
     active_pids = {item[0]: item[2] for item in active}  # pid → directive
+    active_sources = {item[0]: (item[4] if len(item) > 4 else "?") for item in active}  # pid → source
 
     claude_sessions = []  # type: List[Dict]
     infra_raw = defaultdict(lambda: {"cpu": 0.0, "mem_mb": 0.0, "pids": [], "count": 0})
     total_cpu = 0.0
     total_mem = 0.0
 
+    now_dt = datetime.now()
+
     for line in r.stdout.splitlines()[1:]:  # skip header
-        parts = line.strip().split(None, 3)
-        if len(parts) < 4:
+        parts = line.strip().split(None, 4)
+        if len(parts) < 5:
             continue
         try:
             pid = parts[0]
             cpu = float(parts[1])
             mem_kb = int(parts[2])
-            comm = parts[3].strip()
+            etime_str = parts[3]
+            comm = parts[4].strip()
         except Exception:
             continue
+
+        # Parse etime (formats: MM:SS, HH:MM:SS, D-HH:MM:SS)
+        try:
+            elapsed_secs = _etime_to_secs(etime_str)
+            start_time = (now_dt - timedelta(seconds=elapsed_secs)).strftime("%H:%M:%S") if elapsed_secs else "?"
+        except Exception:
+            start_time = "?"
 
         mem_mb = mem_kb / 1024.0
 
@@ -1691,9 +2047,11 @@ def _get_system_health():
                 secs, _ = _session_last_activity(pid)
                 if secs and secs > 300:
                     status = "runaway"
+            source = active_sources.get(pid, "?")
             claude_sessions.append({
                 "pid": pid, "cpu": cpu, "mem_mb": round(mem_mb),
                 "directive": directive, "status": status,
+                "start_time": start_time, "source": source,
             })
             total_cpu += cpu
             total_mem += mem_mb
@@ -1722,8 +2080,8 @@ def _get_system_health():
         }  # type: Dict[str, Any]
         infrastructure.append(entry)
 
-    # Sort claude sessions by CPU desc
-    claude_sessions.sort(key=lambda x: x["cpu"], reverse=True)
+    # Sort claude sessions by memory desc
+    claude_sessions.sort(key=lambda x: x["mem_mb"], reverse=True)
 
     # Alerts
     alerts = []  # type: List[str]
@@ -1833,7 +2191,7 @@ def make_header(five, seven, five_reset_ts, seven_reset_ts):
     label, name, lane = _get_active_account()
     acct_color = "cyan" if label == "A" else ("magenta" if label == "B" else "yellow")
     t.add_row(
-        f"[dim]Updated: {datetime.now().strftime('%H:%M:%S')}[/dim]",
+        f"[cyan]{datetime.now().strftime('%H:%M:%S')}[/cyan]  [dim]Last updated[/dim]",
         f"[{acct_color}]Account {label}[/{acct_color}]: {name} [dim]({lane})[/dim]",
     )
     # Token pacing prediction

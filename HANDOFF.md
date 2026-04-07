@@ -3,11 +3,22 @@
 ## What This Is
 Real-time terminal dashboard for monitoring Claude Code token usage. GitHub: a13xperi/claude-watch
 
-## Current State (v0.5 — gravity center + project + accomplishments + CCID)
+## Current State (v0.6 — fully featured)
 
-**Changes since v0.4:**
+**v0.6 features (built on top of v0.5):**
+- **Click-to-focus**: Active Sessions converted from Static panel to interactive DataTable. Enter or `f` key on any active session brings its Warp terminal window to front via AppleScript/AXRaise. Matches by conversation title or directive text.
+- **Usage sparkline**: Press `u` for 7-day daily sparkline + per-day token breakdown table
+- **MCP Stats screen**: Press `m` for MCP server usage and top actions over 7 days
+- **Agent Spawns panel**: Shows subagent types spawned in last 7 days with count and last seen
+- **Hot reload**: File watcher auto-restarts TUI when .py files change (exit code 42 restart loop)
+- **Gravity center quality**: Normalizes commit messages (strips conventional prefixes, filters generic/merge commits)
+- **Company column**: All tables show Co (company) derived from project
+- **Dynamic burndown chart**: Width adapts to terminal, stats moved below chart
+- **System Health enriched**: Start time, source, model, company columns added
+
+**v0.5 features:**
 - **Gravity center directives**: Completed sessions show what was accomplished (first commit message, files edited, skills used) instead of "unnamed session"
-- **Project column**: New column in all tables (Session History, Call History, Active Sessions) showing which project a session worked on (atlas, claude-watch, openclaw, etc.)
+- **Project column**: New column in all tables showing which project a session worked on
 - **Accomplishments drill-down**: Enter on a session shows structured view: git commits, files edited/created, skills, MCP ops, notable commands, user prompts
 - **Token view toggle**: Press `t` in drill-down to switch between accomplishments and per-turn token breakdown
 - **CCID persistence**: cc-PID → UUID mapping stored in session-index.jsonl, survives process death
@@ -20,10 +31,10 @@ Real-time terminal dashboard for monitoring Claude Code token usage. GitHub: a13
 2. Search bar (hidden, press `/` to show)
 3. Urgent Alerts (token expiry, runaway burn — actionable with kill PID)
 4. Active Sessions with inline sub-rows (state, ago, tokens, cpu per session) + Project column
-5. Call History (all sessions from ledger, with model + last tool + project)
-6. Session History (indexed transcripts, PID-mapped, green dot, project, gravity center)
+5. Call History (all sessions from ledger, with model + last tool + project + company)
+6. Session History (indexed transcripts, PID-mapped, green dot, project, company, gravity center)
 7. Passive Drain
-8. Tool Frequency + Skills (side by side)
+8. Tool Frequency + Skills + Agent Spawns (side by side)
 
 **Two versions:**
 - `claude-watch` → Textual TUI (symlink: `~/bin/claude-watch`)
@@ -33,8 +44,9 @@ Real-time terminal dashboard for monitoring Claude Code token usage. GitHub: a13
 **Hook:** `~/.claude/hooks/token-tracker.sh` — captures tool_snippet, model, output_tokens
 
 **Keybindings:**
-- `q` quit, `r` refresh, `u` usage metrics, `Tab`/`Shift+Tab` focus panels
+- `q` quit, `r` refresh, `u` usage metrics, `m` MCP stats, `h` toggle health, `Tab`/`Shift+Tab` focus panels
 - `/` search/filter sessions, `Escape` clear search
+- `Enter`/`f` on Active Sessions → focus that session's Warp terminal
 - `Enter` on Session History → drill-down (accomplishments view)
 - `t` in drill-down → toggle token breakdown
 - Mouse wheel / arrow keys to scroll full dashboard
@@ -44,25 +56,13 @@ Real-time terminal dashboard for monitoring Claude Code token usage. GitHub: a13
 - `python3 claude_watch_tui.py --session 72887 --context` → resume context packet
 - `python3 claude_watch_tui.py --list` → recent sessions table/JSON
 
-## What's Next (v0.6)
+## What's Next (v0.7)
 
-### Click-to-focus session terminal
-Alex wants to click (or press a key on) an active session and have it bring that terminal window to the front. Sessions run in Warp.
-
-**Implementation approach (from v0.5 handoff):**
-- `ps -p {PID} -o tty=` returns the TTY (e.g., ttys015)
-- Parent process chain leads to `/Applications/Warp.app/...`
-- Use AppleScript via `osascript` to activate the Warp window/tab containing that TTY
-- Trigger: convert Active Sessions to DataTable for row selection, or use 1/2/3 keys
-- Need to investigate Warp's AppleScript/accessibility support for tab focusing
-
-### Other v0.6 ideas
-- Hot reload (no restart needed after code changes)
-- Usage metrics: per-day breakdown, trend sparkline
-- Rich version parity with new features
-- Agent tracking panel (which subagent types spawned, how often)
-- MCP call tracking (tools starting with `mcp__`)
-- Gravity center quality: handle more commit message formats (squash commits, conventional commits)
+### Ideas
+- Nested row expansion in Call History and Session History (same parent/sub-row pattern as Active Sessions)
+- Export session history to CSV
+- Per-session cost estimation
+- Alert notifications (system notification on spike)
 
 ## Key Context
 - Python 3.9.6 (no `X | None` type hints)

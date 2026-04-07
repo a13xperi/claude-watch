@@ -5,7 +5,10 @@ Scrollable panels, keyboard navigation, no dead space.
 """
 
 import json
+import os
 import sys
+import time
+import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -23,13 +26,19 @@ from claude_watch_data import (
     make_urgent_panel,
     _abbrev_model,
     _active_pids,
+    _active_sessions,
     _build_or_update_index,
     _build_pid_map,
     _countdown,
     _current_pct,
+    _etime_to_secs,
     _extract_accomplishments,
+    _get_agent_stats,
     _get_burndown_data,
     _get_call_history,
+    _get_daily_usage,
+    _get_mcp_stats,
+    _get_pid_cpu,
     _get_session_history,
     _get_session_turns,
     _get_system_health,
@@ -37,6 +46,9 @@ from claude_watch_data import (
     _index_building,
     _index_cache,
     _load_index,
+    _load_ledger,
+    _shorten_tool,
+    focus_session_terminal,
     lookup_by_ccid,
     make_drain_panel,
     make_header,
@@ -44,6 +56,44 @@ from claude_watch_data import (
     make_skills_panel,
     make_tool_stats,
 )
+
+def _start_hot_reload_watcher(app):
+    # type: (Any) -> None
+    """Watch *.py files in the same directory. On any mtime change, restart the process."""
+    watch_dir = Path(__file__).parent
+
+    def _snapshot():
+        # type: () -> Dict[Path, float]
+        result = {}
+        for p in watch_dir.glob("*.py"):
+            try:
+                result[p] = p.stat().st_mtime
+            except Exception:
+                pass
+        return result
+
+    mtimes = _snapshot()
+    while True:
+        time.sleep(2)
+        current = _snapshot()
+        if current != mtimes:
+            app.call_from_thread(app._trigger_reload)
+            return
+
+
+def _project_to_company(project: str) -> tuple[str, str]:
+    """Return (company_name, style) from a project string."""
+    p = (project or "").lower().strip()
+    if p in ("atlas", "atlas-be", "atlas-fe"):
+        return "Delphi", "blue"
+    if p in ("kaa",):
+        return "KAA", "green"
+    if p in ("frank",):
+        return "Frank", "magenta"
+    if p in ("openclaw", "paperclip", "claude-watch"):
+        return "Personal", "dim"
+    return "—", "dim"
+
 
 # ── Static widgets (wrap existing Rich renderables) ──────────────────────────
 
@@ -64,9 +114,258 @@ class TokenHeader(Static):
         self.update(make_header(five, seven, fr, sr))
 
 
-class ActiveSessions(Static):
-    def update_content(self):
-        self.update(make_sessions_panel())
+class ActiveSessionsTable(DataTable):
+    """Interactive active sessions table — Enter/f to focus the terminal."""
+
+    BORDER_TITLE = "Active Sessions (live)"
+    BORDER_SUBTITLE = "Enter/f to focus terminal"
+
+    BINDINGS = [
+        Binding("f", "focus_selected", "Focus terminal", show=True),
+    ]
+
+    def on_mount(self):
+        self.cursor_type = "row"
+        self.zebra_stripes = False
+        self.add_column("When", width=9, key="when")
+        self.add_column("Session", width=10, key="session")
+        self.add_column("Src", width=10, key="src")
+        self.add_column("Co", width=8, key="co")
+        self.add_column("Project", width=12, key="project")
+        self.add_column("Mdl", width=10, key="mdl")
+        self.add_column("Dur", width=12, key="dur")
+        self.add_column("Used", width=11, key="used")
+        self.add_column("Directive", key="directive")
+
+    def refresh_rows(self):
+        """Rebuild the table from live session data."""
+        from claude_watch_data import _detect_source
+
+        sessions = _active_sessions()
+        entries = _load_ledger(last_n=500)
+        now_utc = datetime.now(timezone.utc)
+        now_local = datetime.now()
+
+        try:
+            cur_row = self.cursor_row
+        except Exception:
+            cur_row = 0
+
+        self.clear()
+
+        if not sessions:
+            self.add_row(
+                "", Text("--", style="dim"), "", "", "", "", "", "",
+                Text("no active sessions", style="dim"),
+                key="empty",
+            )
+            return
+
+        # Single-pass ledger scan: build model, last call, first output per session
+        model_map = {}    # type: dict
+        last_call = {}    # type: dict
+        first_out = {}    # type: dict
+        for e in entries:
+            sid = e.get("session", "")
+            if not sid:
+                continue
+            mdl = e.get("model")
+            if mdl and mdl != "?":
+                model_map[sid] = mdl
+            if e.get("type") == "tool_use":
+                if sid not in first_out:
+                    first_out[sid] = e.get("output_tokens", 0)
+                try:
+                    ts = datetime.fromisoformat(e["ts"].replace("Z", "+00:00"))
+                    tool = _shorten_tool(e.get("tool", "?"))
+                    out = e.get("output_tokens", 0)
+                    last_call[sid] = (ts, tool, out)
+                except Exception:
+                    pass
+
+        for item in sessions:
+            pid, age, directive, delta = item[0], item[1], item[2], item[3]
+            source = item[4] if len(item) > 4 else "?"
+            sid = f"cc-{pid}"
+
+            # Header row
+            elapsed_s = _etime_to_secs(age)
+            start_str = (
+                (now_local - timedelta(seconds=elapsed_s)).strftime("%H:%M:%S")
+                if elapsed_s else "?"
+            )
+
+            color = "green"
+            if delta == "new":
+                color = "dim"
+            else:
+                try:
+                    val = float(delta.strip("+%"))
+                    color = "red" if val > 10 else ("yellow" if val > 5 else "green")
+                except Exception:
+                    pass
+
+            mdl = _abbrev_model(model_map.get(sid, "?"))
+            mdl_style = "magenta" if "opus" in mdl else ("cyan" if "sonnet" in mdl else "dim")
+            src_color = (
+                "yellow" if ("/" in source or source == "paperclip")
+                else ("green" if source == "cli"
+                       else ("cyan" if "atlas" in source else "dim"))
+            )
+
+            # Derive project
+            project = "\u2014"
+            if source in ("atlas-be", "atlas-fe"):
+                project = "atlas"
+            elif source == "openclaw":
+                project = "openclaw"
+            elif source == "frank":
+                project = "frank"
+            elif "/" in source:
+                parts = source.split("/", 1)
+                project = parts[1] if len(parts) > 1 else parts[0]
+            else:
+                d_lower = directive.lower() if directive else ""
+                for p in ("claude-watch", "atlas", "paperclip", "openclaw", "frank"):
+                    if p in d_lower:
+                        project = p
+                        break
+
+            if "/" in source:
+                co_name = source.split("/", 1)[0]
+                co_style = "yellow"
+            else:
+                co_name, co_style = _project_to_company(project)
+
+            self.add_row(
+                Text(start_str, style="dim"),
+                Text.from_markup(f"[bold green]● [/bold green][cyan]{sid}[/cyan]"),
+                Text(source, style=src_color),
+                Text(co_name, style=co_style),
+                Text(project, style="dim"),
+                Text(mdl, style=mdl_style),
+                Text(age, style="dim"),
+                Text(delta, style=color),
+                Text(directive),
+                key=f"active-{pid}",
+            )
+
+            # Sub-row: live call state
+            cpu = _get_pid_cpu(pid)
+            lc = last_call.get(sid)
+            if lc:
+                secs_since = int((now_utc - lc[0]).total_seconds())
+                tool_name = lc[1]
+                token_delta = lc[2] - first_out.get(sid, 0)
+            else:
+                secs_since = None
+                tool_name = "?"
+                token_delta = 0
+
+            # State detection
+            if secs_since is not None and secs_since < 15:
+                state_txt = Text(f">> {tool_name[:12]}", style="bold green")
+            elif cpu > 20:
+                state_txt = Text("thinking...", style="bold yellow")
+            elif secs_since is not None and secs_since < 120:
+                state_txt = Text(f"~ {tool_name[:12]}", style="dim")
+            else:
+                state_txt = Text("idle", style="dim")
+
+            # Elapsed
+            if secs_since is not None:
+                m, s = divmod(secs_since, 60)
+                elapsed_str = f"{m}m{s:02d}s" if m else f"{s}s"
+            else:
+                elapsed_str = "\u2014"
+
+            # Tokens
+            tok_str = (
+                f"{token_delta / 1000:.1f}k" if token_delta >= 1000
+                else str(token_delta)
+            )
+
+            # CPU
+            cpu_str = f"{cpu:.0f}%"
+            cpu_style = "bold yellow" if cpu > 50 else ("dim" if cpu < 5 else "")
+
+            self.add_row(
+                Text(""),
+                Text(""),
+                Text(""),
+                Text(""),
+                Text(""),
+                state_txt,
+                Text(f"ago: {elapsed_str}", style="dim"),
+                Text(f"tok: {tok_str}", style="dim"),
+                Text(f"cpu: {cpu_str}", style=cpu_style or ""),
+                key=f"sub-{pid}",
+            )
+
+        try:
+            if cur_row < self.row_count:
+                self.move_cursor(row=cur_row)
+        except Exception:
+            pass
+
+    def _get_pid_from_cursor(self):
+        # type: () -> Optional[str]
+        """Extract PID from the currently selected row key."""
+        try:
+            key = self.get_row_at(self.cursor_row)
+            # key is the row data, we need the row_key
+            row_key = None
+            for rk in self.rows:
+                if rk == self.cursor_row:
+                    row_key = rk
+                    break
+        except Exception:
+            pass
+
+        # Use the rows mapping: iterate to find current cursor row's key
+        try:
+            keys = list(self.rows.keys())
+            if self.cursor_row < len(keys):
+                row_key = keys[self.cursor_row]
+                key_str = row_key.value if hasattr(row_key, "value") else str(row_key)
+                if key_str.startswith("active-"):
+                    return key_str.replace("active-", "")
+                elif key_str.startswith("sub-"):
+                    return key_str.replace("sub-", "")
+        except Exception:
+            pass
+        return None
+
+    def on_data_table_row_selected(self, event):
+        """Handle Enter key — focus the terminal for the selected session."""
+        self._focus_terminal_for_row(event.row_key)
+
+    def action_focus_selected(self):
+        """Handle 'f' key — focus the terminal for the currently highlighted session."""
+        pid = self._get_pid_from_cursor()
+        if pid:
+            ok = focus_session_terminal(pid)
+            if ok:
+                self.app.notify("Focused terminal", severity="information", timeout=2)
+            else:
+                self.app.notify("No matching window", severity="warning", timeout=2)
+
+    def _focus_terminal_for_row(self, row_key):
+        """Extract PID from row key and focus the corresponding terminal."""
+        if not row_key:
+            return
+        key_str = row_key.value if hasattr(row_key, "value") else str(row_key)
+        pid = None
+        if key_str.startswith("active-"):
+            pid = key_str.replace("active-", "")
+        elif key_str.startswith("sub-"):
+            pid = key_str.replace("sub-", "")
+        if pid and pid != "empty":
+            ok = focus_session_terminal(pid)
+            if ok:
+                self.app.notify("Focused terminal", severity="information", timeout=2)
+            else:
+                self.app.notify("No matching window", severity="warning", timeout=2)
 
 
 class ToolFrequency(Static):
@@ -77,6 +376,33 @@ class ToolFrequency(Static):
 class SkillsPanel(Static):
     def update_content(self):
         self.update(make_skills_panel())
+
+
+class AgentsPanel(Static):
+    def update_content(self):
+        from claude_watch_data import _get_agent_stats
+        stats = _get_agent_stats(days=7)
+        t = RichTable(
+            show_header=True, header_style="bold yellow",
+            box=None, padding=(0, 1), expand=True,
+        )
+        t.add_column("Agent Description", overflow="ellipsis", no_wrap=True, ratio=3)
+        t.add_column("Spawns", min_width=7, justify="right", no_wrap=True)
+        t.add_column("Last", min_width=6, no_wrap=True)
+        if not stats:
+            t.add_row(Text("no agent spawns yet", style="dim"), "", "")
+        else:
+            for desc, count, last in stats[:10]:
+                t.add_row(
+                    Text(desc, overflow="ellipsis"),
+                    Text(str(count), justify="right"),
+                    Text(last, style="dim"),
+                )
+        self.update(Panel(
+            t,
+            title="[bold]Agent Spawns[/bold]  [dim](7d)[/dim]",
+            border_style="yellow",
+        ))
 
 
 class DrainPanel(Static):
@@ -108,7 +434,12 @@ class BurndownChart(Static):
         window_reset = data["window_reset"]
 
         # Chart spans the FULL 5h window, edge to edge
-        chart_width = 70
+        # Dynamic width: subtract frame (panel border + "100%│" prefix + "│" suffix)
+        try:
+            available = self.size.width - 10  # 2 border + 5 label + 2 bars + 1 pad
+            chart_width = max(20, min(available, 70))
+        except Exception:
+            chart_width = 50
         now_col = int(mins_elapsed / mins_total * chart_width)
         now_col = max(1, min(now_col, chart_width - 1))
 
@@ -248,11 +579,12 @@ class BurndownChart(Static):
         border_str = "".join(border)
 
         lines = [
-            f"100%│{rows[0]}│ [{remaining_color}]{remaining:.0f}% left[/{remaining_color}]",
-            f"    │{rows[1]}│ [{rate_color}]{rate:.1f}%/min[/{rate_color}]  {proj_str}",
-            f"  0%│{rows[2]}│ [{budget_color}]Budget: {budget_per_10:.1f}%/10m[/{budget_color}]",
-            f"    └{border_str}┘ [dim]Resets in {reset_str}[/dim]",
+            f"100%│{rows[0]}│",
+            f"    │{rows[1]}│",
+            f"  0%│{rows[2]}│",
+            f"    └{border_str}┘",
             f"     [dim]{axis_str}[/dim]",
+            f"[{remaining_color}]{remaining:.0f}% left[/{remaining_color}]  [{rate_color}]{rate:.1f}%/min[/{rate_color}]  {proj_str}  [{budget_color}]Budget: {budget_per_10:.1f}%/10m[/{budget_color}]  [dim]Resets in {reset_str}[/dim]",
         ]
 
         content = "\n".join(lines)
@@ -273,11 +605,23 @@ class SystemHealthPanel(Static):
             return
 
         t = RichTable(show_header=True, header_style="bold", box=None, padding=(0, 1), expand=True)
-        t.add_column("Process", width=16, no_wrap=True)
-        t.add_column("CPU%", width=6, justify="right", no_wrap=True)
+        t.add_column("When", width=9, no_wrap=True)
+        t.add_column("Process", width=10, no_wrap=True)
+        t.add_column("Src", width=10, no_wrap=True)
+        t.add_column("Co", width=8, no_wrap=True)
+        t.add_column("Project", width=12, no_wrap=True)
+        t.add_column("Mdl", width=10, no_wrap=True)
         t.add_column("Mem", width=8, justify="right", no_wrap=True)
-        t.add_column("PID", width=6, justify="right", no_wrap=True)
         t.add_column("Status", overflow="ellipsis", no_wrap=True)
+
+        # Build model map from ledger
+        entries = _load_ledger(last_n=500)
+        model_map = {}  # type: dict
+        for e in entries:
+            sid = e.get("session", "")
+            mdl = e.get("model")
+            if sid and mdl and mdl != "?":
+                model_map[sid] = mdl
 
         # Claude sessions
         for s in health.get("claude_sessions", []):
@@ -286,21 +630,52 @@ class SystemHealthPanel(Static):
             mem = s["mem_mb"]
             directive = s["directive"]
             st = s["status"]
+            source = s.get("source", "?")
 
-            cpu_color = "red" if cpu > 50 else ("yellow" if cpu > 20 else "green")
+            # Derive project and company
+            project = "—"
+            if source in ("atlas-be", "atlas-fe"):
+                project = "atlas"
+            elif source in ("openclaw", "frank", "paperclip"):
+                project = source
+            elif "/" in source:
+                project = source.split("/")[0].lower()
+            else:
+                d_lower = directive.lower() if directive else ""
+                for p in ("claude-watch", "atlas", "paperclip", "openclaw", "frank"):
+                    if p in d_lower:
+                        project = p
+                        break
+            co_name, co_style = _project_to_company(project)
+
+            src_color = (
+                "yellow" if ("/" in source or source == "paperclip")
+                else ("green" if source == "cli"
+                       else ("cyan" if "atlas" in source else "dim"))
+            )
+
             mem_str = f"{mem/1024:.1f}GB" if mem >= 1024 else f"{mem}MB"
             if st == "runaway":
-                status_str = f"[bold red]⚠ runaway[/bold red] ({directive[:25]})"
+                dot = "[bold red]⚠ [/bold red]"
+                status_str = f"[bold red]runaway[/bold red] ({directive[:20]})"
             elif st == "active":
-                status_str = f"[green]● active[/green] ({directive[:25]})"
+                dot = "[bold green]● [/bold green]"
+                status_str = f"[green]active[/green] ({directive[:20]})"
             else:
-                status_str = f"[dim]○ {st}[/dim]"
+                dot = "  "
+                status_str = f"[dim]{st}[/dim]"
 
+            start_time = s.get("start_time", "?")
+            mdl = _abbrev_model(model_map.get(f"cc-{pid}", "?"))
+            mdl_style = "magenta" if "opus" in mdl else ("cyan" if "sonnet" in mdl else "dim")
             t.add_row(
-                f"[cyan]cc-{pid}[/cyan]",
-                f"[{cpu_color}]{cpu:.1f}%[/{cpu_color}]",
+                f"[dim]{start_time}[/dim]",
+                f"{dot}[cyan]cc-{pid}[/cyan]",
+                f"[{src_color}]{source}[/{src_color}]",
+                f"[{co_style}]{co_name}[/{co_style}]",
+                f"[dim]{project}[/dim]",
+                f"[{mdl_style}]{mdl}[/{mdl_style}]",
                 mem_str,
-                str(pid),
                 status_str,
             )
 
@@ -312,7 +687,6 @@ class SystemHealthPanel(Static):
             count = inf["count"]
             pid = inf["pid"]
 
-            cpu_color = "red" if cpu > 50 else ("yellow" if cpu > 20 else "dim")
             mem_str = f"{mem/1024:.1f}GB" if mem >= 1024 else f"{mem:.0f}MB"
             display_name = f"{name} (x{count})" if count > 1 else name
 
@@ -322,10 +696,13 @@ class SystemHealthPanel(Static):
                 alert = " [red]← hog[/red]"
 
             t.add_row(
+                "",
                 f"[dim]{display_name}[/dim]",
-                f"[{cpu_color}]{cpu:.1f}%[/{cpu_color}]",
+                "",
+                "",
+                "",
+                "",
                 mem_str,
-                str(pid) if pid != "—" else "[dim]—[/dim]",
                 f"[dim]infra[/dim]{alert}",
             )
 
@@ -340,10 +717,13 @@ class SystemHealthPanel(Static):
         mem_pct_color = "red" if mem_pct > 80 else ("yellow" if mem_pct > 60 else "green")
 
         t.add_row(
-            "[bold]Total AI stack[/bold]",
-            f"[bold]{total_cpu:.0f}%[/bold]",
-            f"[bold]{total_mem_str}[/bold]",
             "",
+            "[bold]Total AI stack[/bold]",
+            "",
+            "",
+            "",
+            "",
+            f"[bold]{total_mem_str}[/bold]",
             f"[{mem_pct_color}]{mem_pct:.0f}% of {sys_mem/1024:.0f}GB[/{mem_pct_color}]",
         )
 
@@ -544,6 +924,44 @@ class SessionDrillDown(Screen):
         self.app.pop_screen()
 
 
+class DailySparklinePanel(Static):
+    _SPARKS = " ▁▂▃▄▅▆▇█"
+
+    def update_content(self):
+        from claude_watch_data import _get_daily_usage
+        data = _get_daily_usage(days=7)
+        if not data:
+            self.update(Panel("[dim]No data yet[/dim]", title="7-Day Output Tokens", border_style="cyan"))
+            return
+
+        values = [v for _, v in data]
+        max_val = max(values) if any(v > 0 for v in values) else 1
+
+        spark_chars = []
+        for v in values:
+            idx = int(v / max_val * 8) if max_val else 0
+            spark_chars.append(self._SPARKS[min(idx, 8)])
+
+        # Align: each column is 5 chars wide (3 label + 2 separator)
+        spark_line = "  ".join(f"  {c}  " for c in spark_chars)
+        label_line = "  ".join(f"{label[:5]:5}" for label, _ in data)
+        count_line = "  ".join(
+            f"{v // 1000:3}k " if v >= 1000 else f" ~0  "
+            for _, v in data
+        )
+
+        content = "\n".join([
+            f"[bold cyan]{spark_line}[/bold cyan]",
+            f"[dim]{label_line}[/dim]",
+            f"[dim]{count_line}[/dim]",
+        ])
+        self.update(Panel(
+            content,
+            title="[bold]7-Day Output Tokens[/bold]",
+            border_style="cyan",
+        ))
+
+
 class UsageMetricsScreen(Screen):
     BINDINGS = [
         Binding("escape", "pop_screen", "Back"),
@@ -552,11 +970,13 @@ class UsageMetricsScreen(Screen):
 
     def compose(self) -> ComposeResult:
         yield Static(id="metrics-header")
+        yield DailySparklinePanel(id="metrics-sparkline")
         yield DataTable(id="metrics-table")
         yield Static(id="metrics-summary")
 
     def on_mount(self):
         metrics, total = _get_usage_metrics(days=7)
+        self.query_one("#metrics-sparkline", DailySparklinePanel).update_content()
         _, seven, _, _ = _current_pct()
 
         self.query_one("#metrics-header", Static).update(
@@ -606,6 +1026,63 @@ class UsageMetricsScreen(Screen):
         self.app.pop_screen()
 
 
+class MCPStatsScreen(Screen):
+    BINDINGS = [
+        Binding("escape", "pop_screen", "Back"),
+        Binding("q", "pop_screen", "Back"),
+    ]
+
+    def compose(self) -> ComposeResult:
+        yield Static(id="mcp-header")
+        with Horizontal(id="mcp-body"):
+            yield DataTable(id="mcp-servers-table")
+            yield DataTable(id="mcp-actions-table")
+
+    def on_mount(self):
+        from claude_watch_data import _get_mcp_stats
+        stats = _get_mcp_stats(days=7)
+
+        self.query_one("#mcp-header", Static).update(
+            f"[bold]MCP Tool Usage — last 7 days[/bold]  "
+            f"[dim]Total calls: {stats['total_calls']}  "
+            f"Sessions using MCP: {stats['sessions_with_mcp']}  "
+            f"(Escape / q to go back)[/dim]"
+        )
+
+        st = self.query_one("#mcp-servers-table", DataTable)
+        st.cursor_type = "row"
+        st.zebra_stripes = True
+        st.add_column("Server", width=18)
+        st.add_column("Calls", width=7)
+        st.add_column("Top Actions")
+        for s in stats["by_server"]:
+            top3 = ", ".join(a for a, _ in s["actions"][:3])
+            st.add_row(
+                Text(s["server"], style="cyan"),
+                Text(str(s["calls"]), justify="right"),
+                Text(top3, style="dim"),
+            )
+        if not stats["by_server"]:
+            st.add_row(Text("no MCP calls in last 7 days", style="dim"), "", "")
+
+        at = self.query_one("#mcp-actions-table", DataTable)
+        at.cursor_type = "row"
+        at.zebra_stripes = True
+        at.add_column("Action", width=40)
+        at.add_column("Count", width=7)
+        for action, count in stats["top_actions"]:
+            server, _, act = action.partition(":")
+            at.add_row(
+                Text.from_markup(f"[cyan]{server}[/cyan][dim]:{act}[/dim]"),
+                Text(str(count), justify="right"),
+            )
+        if not stats["top_actions"]:
+            at.add_row(Text("no data", style="dim"), "")
+
+    def action_pop_screen(self):
+        self.app.pop_screen()
+
+
 # ── DataTable widgets (scrollable) ───────────────────────────────────────────
 
 
@@ -619,6 +1096,7 @@ class SessionHistoryTable(DataTable):
         self.add_column("When", width=9)
         self.add_column("Session", width=10)
         self.add_column("Src", width=10)
+        self.add_column("Co", width=8)
         self.add_column("Project", width=12)
         self.add_column("Mdl", width=10)
         self.add_column("Dur", width=7)
@@ -647,7 +1125,7 @@ class SessionHistoryTable(DataTable):
 
         if not sessions:
             self.add_row(
-                "...", "", "", "", "", "", "", "",
+                "...", "", "", "", "", "", "", "", "",
                 Text("building index..." if _index_building else "no sessions", style="dim"),
             )
             return
@@ -667,14 +1145,14 @@ class SessionHistoryTable(DataTable):
 
             if group != current_group:
                 sep = f"— {group} —"
-                self.add_row(Text(sep, style="dim"), "", "", "", "", "", "", "", "", key=f"sep-{group}")
+                self.add_row(Text(sep, style="dim"), "", "", "", "", "", "", "", "", "", key=f"sep-{group}")
                 current_group = group
 
             when_str = s["last_ts"].astimezone().strftime("%H:%M:%S")
 
             # Show cc-PID if we can match, otherwise short UUID
             session_display = pid_map.get(s["session_id"], s["session_id"][:10])
-            is_active = session_display in active
+            is_active = s["session_id"] in pid_map and pid_map[s["session_id"]] in active
 
             # Apply search filter
             if filter_text:
@@ -708,11 +1186,19 @@ class SessionHistoryTable(DataTable):
             src = s.get("source", "?")
             src_style = "yellow" if ("/" in src or src == "paperclip") else ("green" if src == "cli" else ("cyan" if "atlas" in src else "dim"))
 
+            if "/" in src:
+                co_name = src.split("/", 1)[0]
+                co_style = "yellow"
+                project = src.split("/", 1)[1]
+            else:
+                co_name, co_style = _project_to_company(project)
+
             dot = "[bold green]● [/bold green]" if is_active else "  "
             self.add_row(
                 Text(when_str, style="dim"),
                 Text.from_markup(f"{dot}[cyan]{session_display}[/cyan]"),
                 Text(src, style=src_style),
+                Text(co_name, style=co_style),
                 Text(project, style="dim"),
                 Text(mdl, style=mdl_style),
                 Text(s["dur_str"], style="dim"),
@@ -754,6 +1240,7 @@ class CallHistoryTable(DataTable):
         self.add_column("When", width=9)
         self.add_column("Session", width=10)
         self.add_column("Src", width=10)
+        self.add_column("Co", width=8)
         self.add_column("Project", width=12)
         self.add_column("Mdl", width=10)
         self.add_column("#", width=4)
@@ -774,7 +1261,7 @@ class CallHistoryTable(DataTable):
         self.clear()
 
         if not history:
-            self.add_row("...", "", "", "", "", "", "", "", "", Text("no data", style="dim"))
+            self.add_row("...", "", "", "", "", "", "", "", "", "", Text("no data", style="dim"))
             return
 
         today = datetime.now(timezone.utc).astimezone().date()
@@ -791,7 +1278,7 @@ class CallHistoryTable(DataTable):
 
             if group != current_group:
                 sep = f"— {group} —"
-                self.add_row(Text(sep, style="dim"), "", "", "", "", "", "", "", "", "", key=f"ch-sep-{group}")
+                self.add_row(Text(sep, style="dim"), "", "", "", "", "", "", "", "", "", "", key=f"ch-sep-{group}")
                 current_group = group
 
             src = h["source"]
@@ -812,11 +1299,18 @@ class CallHistoryTable(DataTable):
             dot = "[bold green]● [/bold green]" if sid in active else "  "
 
             project = h.get("project", "—")
+            if "/" in src:
+                co_name = src.split("/", 1)[0]
+                co_style = "yellow"
+                project = src.split("/", 1)[1]
+            else:
+                co_name, co_style = _project_to_company(project)
 
             self.add_row(
                 Text(h["when"], style="dim"),
                 Text.from_markup(f"{dot}[cyan]{sid[:10]}[/cyan]"),
                 Text(src, style=src_style),
+                Text(co_name, style=co_style),
                 Text(project, style="dim"),
                 Text(mdl, style=mdl_style),
                 Text(str(h["calls"]), justify="right"),
@@ -845,6 +1339,7 @@ class ClaudeWatchApp(App):
         Binding("q", "quit", "Quit"),
         Binding("r", "force_refresh", "Refresh"),
         Binding("u", "show_usage", "Usage"),
+        Binding("m", "show_mcp", "MCP"),
         Binding("h", "toggle_health", "Health"),
         Binding("slash", "start_search", "Search"),
         Binding("tab", "focus_next", "Next panel", show=False),
@@ -861,7 +1356,7 @@ class ClaudeWatchApp(App):
             yield Input(placeholder="Search sessions (ccid, project, directive)...", id="search-input")
             yield UrgentAlerts(id="urgent")
             yield SystemHealthPanel(id="system-health")
-            yield ActiveSessions(id="active-sessions")
+            yield ActiveSessionsTable(id="active-sessions")
             with Horizontal(id="history-row"):
                 yield CallHistoryTable(id="call-history")
             yield SessionHistoryTable(id="session-history")
@@ -869,6 +1364,7 @@ class ClaudeWatchApp(App):
             with Horizontal(id="feed-row"):
                 yield ToolFrequency(id="tool-freq")
                 yield SkillsPanel(id="skills")
+                yield AgentsPanel(id="agents")
 
     def on_mount(self):
         _load_index()
@@ -877,6 +1373,16 @@ class ClaudeWatchApp(App):
         self.query_one("#search-input").display = False
         self.set_interval(1.0, self.refresh_data)
         self.refresh_data()
+        # Start hot-reload watcher in background
+        import threading
+        threading.Thread(target=_start_hot_reload_watcher, args=(self,), daemon=True).start()
+
+    _RESTART_EXIT_CODE = 42
+
+    def _trigger_reload(self):
+        """Restart the process when source files change."""
+        self.notify("Reloading...", severity="warning", timeout=1)
+        self.set_timer(0.5, lambda: self.exit(return_code=self._RESTART_EXIT_CODE))
 
     def build_index(self):
         import threading
@@ -888,13 +1394,14 @@ class ClaudeWatchApp(App):
         self.query_one("#header", TokenHeader).update_content(five, seven, fr, sr)
         self.query_one("#burndown", BurndownChart).update_content()
         self.query_one("#urgent", UrgentAlerts).update_content()
-        self.query_one("#active-sessions", ActiveSessions).update_content()
+        self.query_one("#active-sessions", ActiveSessionsTable).refresh_rows()
         health = self.query_one("#system-health", SystemHealthPanel)
         if health.display:
             health.update_content()
         self.query_one("#session-history", SessionHistoryTable).refresh_rows()
         self.query_one("#tool-freq", ToolFrequency).update_content()
         self.query_one("#skills", SkillsPanel).update_content()
+        self.query_one("#agents", AgentsPanel).update_content()
         self.query_one("#call-history", CallHistoryTable).refresh_rows()
         self.query_one("#drain", DrainPanel).update_content()
 
@@ -904,6 +1411,9 @@ class ClaudeWatchApp(App):
 
     def action_show_usage(self):
         self.push_screen(UsageMetricsScreen())
+
+    def action_show_mcp(self):
+        self.push_screen(MCPStatsScreen())
 
     def action_toggle_health(self):
         health = self.query_one("#system-health", SystemHealthPanel)
@@ -1051,8 +1561,11 @@ def main():
         _cli_list_sessions(args)
         return
 
-    app = ClaudeWatchApp()
-    app.run()
+    while True:
+        app = ClaudeWatchApp()
+        result = app.run()
+        if result != ClaudeWatchApp._RESTART_EXIT_CODE:
+            break
 
 
 if __name__ == "__main__":

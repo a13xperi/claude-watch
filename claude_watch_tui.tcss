@@ -18,17 +18,24 @@ Screen {
     max-height: 7;
 }
 
-/* ── Active Sessions (shrunk — scrollable panels need the space) ── */
+/* ── Active Sessions (interactive DataTable — Enter/f to focus terminal) ── */
 #active-sessions {
     height: auto;
     max-height: 14;
+    border: solid cyan;
+    border-title-color: white;
+    border-title-style: bold;
+}
+
+#active-sessions:focus {
+    border: tall $accent;
 }
 
 /* ── History row: Call History + Session History side-by-side ── */
 #history-row {
     layout: horizontal;
     height: 2fr;
-    min-height: 8;
+    min-height: 14;
 }
 
 #call-history {
@@ -46,7 +53,7 @@ Screen {
 #session-history {
     width: 1fr;
     height: 1fr;
-    min-height: 8;
+    min-height: 14;
     border: solid dodgerblue;
     border-title-color: white;
     border-title-style: bold;
