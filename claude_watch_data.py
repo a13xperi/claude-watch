@@ -5,6 +5,7 @@ All data fetching, caching, and computation lives here.
 
 import csv
 import json
+import logging
 import os
 import re
 import subprocess
@@ -18,6 +19,13 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from rich.panel import Panel
 from rich.table import Table
+
+(Path.home() / ".claude/logs").mkdir(parents=True, exist_ok=True)
+_log = logging.getLogger("claude_watch")
+_log_handler = logging.FileHandler(Path.home() / ".claude/logs/claude-watch.log")
+_log_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+_log.addHandler(_log_handler)
+_log.setLevel(logging.WARNING)
 
 # ── constants ────────────────────────────────────────────────────────────────
 
@@ -50,7 +58,8 @@ def _load_paperclip_map():
             company = proj_info.get("company", "?")
             for agent_uuid, name in proj_info.get("agents", {}).items():
                 _paperclip_agents_flat[agent_uuid] = (company, name)
-    except Exception:
+    except Exception as e:
+        _log.warning("Failed to load paperclip map: %s", e)
         _paperclip_map = {}
         _paperclip_agents_flat = {}
 
@@ -59,6 +68,14 @@ _load_paperclip_map()
 
 
 # ── helpers ──────────────────────────────────────────────────────────────────
+
+def _safe_float(val, default=0.0):
+    """Convert val to float, returning default if it's '?' or non-numeric."""
+    try:
+        return float(val)
+    except (ValueError, TypeError):
+        return default
+
 
 def _current_pct():
     """Returns (five, seven, five_reset_ts, seven_reset_ts)."""
@@ -81,8 +98,8 @@ def _current_pct():
             five_reset = _ts(rl.get("five_hour", {}).get("resets_at", ""))
             seven_reset = _ts(rl.get("seven_day", {}).get("resets_at", ""))
             return five, seven, five_reset, seven_reset
-    except Exception:
-        pass
+    except Exception as e:
+        _log.warning("Failed to read rate limits: %s", e)
     return "?", "?", "", ""
 
 
@@ -160,15 +177,15 @@ def _active_sessions():
                 delta = "?"
                 try:
                     state_parts = Path(f"/tmp/claude-token-state-{pid}").read_text().split()
-                    start_pct = float(state_parts[0])
-                    start_epoch = float(state_parts[1]) if len(state_parts) > 1 else 0
-                    cur = float(_current_pct()[0])
+                    start_pct = _safe_float(state_parts[0])
+                    start_epoch = _safe_float(state_parts[1]) if len(state_parts) > 1 else 0
+                    cur = _safe_float(_current_pct()[0])
                     raw_delta = round(cur - start_pct, 1)
                     # Fix ghost session: if session just started and shows huge delta,
                     # it's measuring global drift, not actual consumption
                     age_secs = time.time() - start_epoch if start_epoch else 999
                     if raw_delta < 0:
-                        delta = "reset"  # 5h window reset during session
+                        delta = f"↻{cur:.0f}%"  # 5h window reset — show current absolute pct
                     elif age_secs < 120 and raw_delta > 5:
                         delta = "new"
                     else:
@@ -259,7 +276,7 @@ def _get_conversation_title(pid):
     if not session_id or not project_dir:
         # Fallback: scan recent transcript files for this PID
         # Active sessions may not be indexed yet
-        project_dirs = _project_dirs()
+        project_dirs = [p for p in ALL_PROJECT_DIRS.iterdir() if p.is_dir()]
         candidates = []  # type: list
         for pd in project_dirs:
             try:
@@ -448,6 +465,7 @@ def _detect_source(pid):
 
 # ── ledger ───────────────────────────────────────────────────────────────────
 
+_MAX_LEDGER_CACHE = 10_000
 _ledger_cache_time = 0.0
 _ledger_cache = []
 
@@ -469,10 +487,12 @@ def _load_ledger(last_n=None):
                     if line:
                         try:
                             entries.append(json.loads(line))
-                        except Exception:
-                            pass
-        except Exception:
-            pass
+                        except Exception as e:
+                            _log.debug("Malformed ledger line: %s", e)
+        except Exception as e:
+            _log.warning("Failed to load ledger: %s", e)
+        if len(entries) > _MAX_LEDGER_CACHE:
+            entries = entries[-_MAX_LEDGER_CACHE:]
         _ledger_cache = entries
         _ledger_cache_time = mtime
     if last_n is not None:
@@ -703,7 +723,9 @@ def _extract_accomplishments(session_id):
     # type: (str) -> Dict[str, Any]
     """Extract accomplishments for a session by ID."""
     # Check cached index first
-    entry = _index_cache.get(session_id, {})
+    with _index_lock:
+        snapshot = _index_cache
+    entry = snapshot.get(session_id, {})
     cached = entry.get("accomplishments")
     if cached:
         return cached
@@ -932,6 +954,9 @@ def lookup_by_ccid(user_input):
     # type: (str) -> Optional[Dict]
     """Look up session by CCID number, cc-PID, or UUID prefix."""
     _ensure_index()
+    with _index_lock:
+        snapshot = _index_cache
+        ccid_snapshot = _ccid_to_uuid
     s = user_input.strip()
 
     # Try as CCID number: "72887" → "cc-72887"
@@ -940,17 +965,17 @@ def lookup_by_ccid(user_input):
 
     # Try as cc-PID
     if s.startswith("cc-"):
-        uuid = _ccid_to_uuid.get(s)
+        uuid = ccid_snapshot.get(s)
         if uuid:
-            return _index_cache.get(uuid)
+            return snapshot.get(uuid)
         # Fallback: scan index
-        for uid, entry in _index_cache.items():
+        for uid, entry in snapshot.items():
             if entry.get("ccid") == s:
                 return entry
         return None
 
     # Try as UUID prefix
-    for uid, entry in _index_cache.items():
+    for uid, entry in snapshot.items():
         if uid.startswith(s):
             return entry
 
@@ -963,6 +988,7 @@ _index_cache = {}
 _index_loaded = False
 _index_building = False
 _index_thread = None
+_index_lock = threading.RLock()
 
 
 def _load_index():
@@ -980,13 +1006,14 @@ def _load_index():
                         sid = obj.get("session_id")
                         if sid:
                             cache[sid] = obj
-                    except Exception:
-                        pass
-        except Exception:
-            pass
-    _index_cache = cache
-    _index_loaded = True
-    _rebuild_ccid_index()
+                    except Exception as e:
+                        _log.debug("Malformed index line: %s", e)
+        except Exception as e:
+            _log.warning("Failed to load session index: %s", e)
+    with _index_lock:
+        _index_cache = cache
+        _index_loaded = True
+        _rebuild_ccid_index()
     return cache
 
 
@@ -1015,7 +1042,8 @@ def _parse_transcript(f):
                     continue
                 try:
                     obj = json.loads(line)
-                except Exception:
+                except Exception as e:
+                    _log.debug("Transcript parse error: %s", e)
                     continue
                 t = obj.get("type", "")
                 ts_str = obj.get("timestamp", "")
@@ -1182,11 +1210,13 @@ def _parse_transcript(f):
 
 def _build_or_update_index():
     global _index_building, _index_cache
-    if _index_building:
-        return
-    _index_building = True
+    with _index_lock:
+        if _index_building:
+            return
+        _index_building = True
     try:
-        known = dict(_index_cache)
+        with _index_lock:
+            known = dict(_index_cache)
         new_entries = []
         for proj_dir in ALL_PROJECT_DIRS.iterdir():
             if not proj_dir.is_dir():
@@ -1235,25 +1265,30 @@ def _build_or_update_index():
                 except OSError:
                     pass
                 raise
-            _index_cache = dict(known)
-            _rebuild_ccid_index()
-    except Exception:
-        pass
+            with _index_lock:
+                _index_cache = dict(known)
+                _rebuild_ccid_index()
+    except Exception as e:
+        _log.exception("Index build failed")
     finally:
-        _index_building = False
+        with _index_lock:
+            _index_building = False
 
 
 def _ensure_index():
     global _index_thread
-    if not _index_loaded:
-        _load_index()
-    if _index_thread is None or not _index_thread.is_alive():
-        _index_thread = threading.Thread(target=_build_or_update_index, daemon=True)
-        _index_thread.start()
+    with _index_lock:
+        if not _index_loaded:
+            _load_index()
+        if _index_thread is None or not _index_thread.is_alive():
+            _index_thread = threading.Thread(target=_build_or_update_index, daemon=True)
+            _index_thread.start()
 
 
 def _get_session_history():
     _ensure_index()
+    with _index_lock:
+        snapshot = _index_cache
     # Don't exclude any sessions — show everything in history.
     # The current session appears in both Active Sessions and Session History.
     # This is better than sessions mysteriously disappearing.
@@ -1262,7 +1297,7 @@ def _get_session_history():
     today = datetime.now(timezone.utc).astimezone().date()
     sessions = []
 
-    for sid, entry in _index_cache.items():
+    for sid, entry in snapshot.items():
         if sid == current_session_id:
             continue
         try:
@@ -1286,9 +1321,9 @@ def _get_session_history():
             pe = _interpolate_five_pct(last_ts)
             if ps is not None and pe is not None:
                 try:
-                    d_pct = round(float(pe) - float(ps), 1)
+                    d_pct = round(_safe_float(pe) - _safe_float(ps), 1)
                     if d_pct < -5:
-                        pct_str = "reset"  # 5h window reset during session
+                        pct_str = "↻win"  # 5h window reset during session
                     else:
                         pct_str = f"+{d_pct}%" if d_pct >= 0 else f"{d_pct}%"
                 except Exception:
@@ -1317,7 +1352,9 @@ def _get_session_history():
 
 def _find_transcript(session_id):
     """Find transcript file for a session_id, checking index first then scanning."""
-    entry = _index_cache.get(session_id)
+    with _index_lock:
+        snapshot = _index_cache
+    entry = snapshot.get(session_id)
     if entry and entry.get("project_dir"):
         p = Path(entry["project_dir"]) / f"{session_id}.jsonl"
         if p.exists():
@@ -1337,6 +1374,29 @@ _MODEL_OUTPUT_COST_PER_MTOK = {
     "sonnet": 15.0,
     "haiku": 1.25,
 }
+
+_MODEL_INPUT_COST_PER_MTOK = {
+    "opus": 15.0,
+    "sonnet": 3.0,
+    "haiku": 0.25,
+}
+
+
+def _estimate_turn_cost(tokens_in, tokens_out, model_str):
+    # type: (int, int, str) -> float
+    """Estimate full turn cost (input + output) in USD."""
+    model_lower = (model_str or "").lower()
+    in_rate = 3.0
+    out_rate = 15.0
+    for key, rate in _MODEL_INPUT_COST_PER_MTOK.items():
+        if key in model_lower:
+            in_rate = rate
+            break
+    for key, rate in _MODEL_OUTPUT_COST_PER_MTOK.items():
+        if key in model_lower:
+            out_rate = rate
+            break
+    return (tokens_in * in_rate + tokens_out * out_rate) / 1_000_000
 
 
 def _estimate_cost(output_tokens, model_str):
@@ -1365,6 +1425,8 @@ def _format_cost(cost):
 def export_session_history_csv(filepath):
     # type: (str) -> int
     """Export session history to CSV file. Returns number of rows written."""
+    with _index_lock:
+        snapshot = _index_cache
     sessions = _get_session_history()
     count = 0
     with open(filepath, "w", newline="") as f:
@@ -1402,7 +1464,7 @@ def export_session_history_csv(filepath):
                 company = ""
 
             # CCID from index
-            idx_entry = _index_cache.get(s["session_id"], {})
+            idx_entry = snapshot.get(s["session_id"], {})
             ccid = idx_entry.get("ccid", "")
 
             out_tokens = s.get("output_tokens", 0)
@@ -1554,12 +1616,14 @@ def _get_usage_metrics(days=7):
     Each metric: source, output_tokens, sessions, avg_tokens, pct_of_total.
     """
     _ensure_index()
+    with _index_lock:
+        snapshot = _index_cache
     cutoff = datetime.now(timezone.utc) - timedelta(days=days)
 
     by_source = defaultdict(lambda: {"output_tokens": 0, "sessions": 0})
     total_output = 0
 
-    for sid, entry in _index_cache.items():
+    for sid, entry in snapshot.items():
         try:
             last_ts = datetime.fromisoformat(entry["last_ts"])
             if last_ts.tzinfo is None:
@@ -1610,13 +1674,15 @@ def _get_daily_usage(days=7):
     Labels: 'Today' for today, abbreviated weekday name otherwise.
     """
     _ensure_index()
+    with _index_lock:
+        snapshot = _index_cache
     today = datetime.now().astimezone().date()
     result = []
     for offset in range(days - 1, -1, -1):
         day = today - timedelta(days=offset)
         total = sum(
             e.get("output_tokens", 0)
-            for e in _index_cache.values()
+            for e in snapshot.values()
             if _safe_date(e.get("last_ts")) == day
         )
         label = "Today" if offset == 0 else day.strftime("%a")
@@ -1630,6 +1696,8 @@ def _get_mcp_stats(days=7):
     Returns dict with by_server, top_actions, total_calls, sessions_with_mcp.
     """
     _ensure_index()
+    with _index_lock:
+        snapshot = _index_cache
     cutoff = datetime.now(timezone.utc) - timedelta(days=days)
 
     by_server = defaultdict(lambda: {"calls": 0, "actions": defaultdict(int)})  # type: Dict
@@ -1657,7 +1725,7 @@ def _get_mcp_stats(days=7):
 
     # Count sessions with any MCP usage from index
     sessions_with_mcp = 0
-    for entry in _index_cache.values():
+    for entry in snapshot.values():
         try:
             last_ts = datetime.fromisoformat(entry.get("last_ts", ""))
             if last_ts.tzinfo is None:
@@ -1726,11 +1794,13 @@ def _get_agent_stats(days=7):
     aggregated over last N days, sorted by count descending.
     """
     _ensure_index()
+    with _index_lock:
+        snapshot = _index_cache
     cutoff = datetime.now(timezone.utc) - timedelta(days=days)
     counts = defaultdict(int)  # type: Dict[str, int]
     last_seen = {}  # type: Dict[str, str]
 
-    for sid, entry in _index_cache.items():
+    for sid, entry in snapshot.items():
         try:
             last_ts_str = entry.get("last_ts", "")
             last_ts = datetime.fromisoformat(last_ts_str)
@@ -1784,6 +1854,8 @@ def _build_pid_map():
     if now - _pid_map_time < 10 and _pid_map_cache:
         return _pid_map_cache
     _pid_map_time = now
+    with _index_lock:
+        snapshot = _index_cache
 
     entries = _load_ledger(last_n=5000)
     # Build per-PID time ranges from ledger
@@ -1808,7 +1880,7 @@ def _build_pid_map():
 
     # Match transcript sessions to PIDs by overlapping time ranges
     result = {}
-    for uuid, entry in _index_cache.items():
+    for uuid, entry in snapshot.items():
         try:
             t_first = datetime.fromisoformat(entry["first_ts"])
             t_last = datetime.fromisoformat(entry["last_ts"])
@@ -1841,6 +1913,8 @@ def _get_call_history():
     """Aggregate tool calls per session from ledger. Returns list of dicts sorted by last activity.
     Includes recent tool details (merged from former Last Tool Activity panel).
     """
+    with _index_lock:
+        snapshot = _index_cache
     entries = _load_ledger(last_n=5000)
     tool_events = [e for e in entries if e.get("type") == "tool_use"]
     if not tool_events:
@@ -1887,9 +1961,9 @@ def _get_call_history():
 
         # 5h% used
         try:
-            delta = float(s["five_pct_end"]) - float(s["five_pct_start"])
+            delta = _safe_float(s["five_pct_end"]) - _safe_float(s["five_pct_start"])
             if delta < -5:
-                pct_str = "reset"
+                pct_str = "↻win"
             else:
                 pct_str = f"+{delta:.1f}%" if delta >= 0 else f"{delta:.1f}%"
         except Exception:
@@ -1905,7 +1979,7 @@ def _get_call_history():
             when_date = None
 
         # Source and project from index cache
-        idx_entry = _index_cache.get(sid, {})
+        idx_entry = snapshot.get(sid, {})
         source = idx_entry.get("source", "cli")
         project = idx_entry.get("project", "—")
 
@@ -1986,6 +2060,8 @@ def _compute_tool_feed_rows(last_n=200):
     """Return list of dicts with display-ready fields for tool feed.
     Each dict: ts_str, session, tool, directive, delta_str, delta_style
     """
+    with _index_lock:
+        snapshot = _index_cache
     entries = _load_ledger(last_n=500)
     tool_events = [e for e in entries if e.get("type") == "tool_use"][-last_n:]
     if not tool_events:
@@ -2020,7 +2096,7 @@ def _compute_tool_feed_rows(last_n=200):
         tick = None
         if cur_pct is not None and prev is not None:
             try:
-                diff = float(cur_pct) - float(prev)
+                diff = _safe_float(cur_pct) - _safe_float(prev)
                 if diff > 0:
                     tick = diff
             except Exception:
@@ -2033,7 +2109,7 @@ def _compute_tool_feed_rows(last_n=200):
             delta_style = "bold red" if tick >= 2 else "bold yellow"
         elif cumulative:
             try:
-                c = float(cumulative)
+                c = _safe_float(cumulative)
                 delta_str = f"+{c:.1f}%" if c > 0 else "—"
                 delta_style = "dim"
             except Exception:
@@ -2046,7 +2122,7 @@ def _compute_tool_feed_rows(last_n=200):
         snippet = e.get("tool_snippet", "")
         # Strip cc- prefix from session for index lookup
         index_sid = session[3:] if session.startswith("cc-") else session
-        source = _index_cache.get(index_sid, {}).get("source", "cli")
+        source = snapshot.get(index_sid, {}).get("source", "cli")
         rows.append({
             "ts_str": ts_str,
             "session": session,
@@ -2067,8 +2143,8 @@ def _drain_status(drain_events):
         return "dim", "● No drain data yet"
     last = drain_events[-1]
     try:
-        delta = float(last.get("delta_5h", 0))
-        burn = float(last.get("burn_rate_per_min", 0))
+        delta = _safe_float(last.get("delta_5h", 0))
+        burn = _safe_float(last.get("burn_rate_per_min", 0))
         sessions = int(last.get("cli_sessions", 0))
     except Exception:
         return "dim", "● Status unknown"
@@ -2108,7 +2184,7 @@ def _get_burndown_data():
         mins_total = 300.0  # 5 hours
         mins_elapsed = max(0, (now_utc - window_start).total_seconds() / 60)
         mins_to_reset = max(0, (reset - now_utc).total_seconds() / 60)
-        remaining_pct = 100.0 - float(five)
+        remaining_pct = 100.0 - _safe_float(five)
     except Exception:
         return {}
 
@@ -2126,7 +2202,7 @@ def _get_burndown_data():
             if ts < window_start:
                 continue
             elapsed = (ts - window_start).total_seconds() / 60
-            raw_points.append((elapsed, 100.0 - float(pct)))
+            raw_points.append((elapsed, 100.0 - _safe_float(pct)))
         except Exception:
             continue
 
@@ -2211,6 +2287,8 @@ def _get_token_attribution():
     # type: () -> Dict[str, Any]
     """Compute per-session token consumption breakdown for current 5h window."""
     global _attribution_cache, _attribution_cache_time
+    with _index_lock:
+        snapshot = _index_cache
     now = time.time()
     if _attribution_cache and now - _attribution_cache_time < 30:
         return _attribution_cache
@@ -2255,7 +2333,7 @@ def _get_token_attribution():
     if not window_entries:
         return {}
 
-    # Backfill empty session IDs using _index_cache
+    # Backfill empty session IDs using snapshot
     for we in window_entries:
         if we["session"]:
             continue
@@ -2264,7 +2342,7 @@ def _get_token_attribution():
         # Try directive + timestamp match
         matched = False
         if directive:
-            for sid, entry in _index_cache.items():
+            for sid, entry in snapshot.items():
                 try:
                     ft = datetime.fromisoformat(entry["first_ts"].replace("Z", "+00:00"))
                     lt = datetime.fromisoformat(entry["last_ts"].replace("Z", "+00:00"))
@@ -2282,7 +2360,7 @@ def _get_token_attribution():
                     continue
         # Fallback: timestamp overlap only
         if not matched:
-            for sid, entry in _index_cache.items():
+            for sid, entry in snapshot.items():
                 try:
                     ft = datetime.fromisoformat(entry["first_ts"].replace("Z", "+00:00"))
                     lt = datetime.fromisoformat(entry["last_ts"].replace("Z", "+00:00"))
@@ -3121,7 +3199,7 @@ def make_drain_panel():
             burn = e.get("burn_rate_per_min", 0)
             sessions = e.get("cli_sessions", "?")
             desktop = "YES" if e.get("desktop") else "no"
-            burn_color = "red" if float(burn) > 1 else "yellow"
+            burn_color = "red" if _safe_float(burn) > 1 else "yellow"
             t.add_row(
                 f"[dim]{ts_str}[/dim]", f"[red]+{delta}%[/red]",
                 f"[{burn_color}]{burn:.2f}%[/{burn_color}]", str(sessions),
@@ -3219,6 +3297,8 @@ def _stars_display(score):
 
 
 def _score_window(window_start_ts, window_reset_ts):
+    with _index_lock:
+        snapshot = _index_cache
     entries = _load_ledger()
     window_entries = []
     for e in entries:
@@ -3234,7 +3314,7 @@ def _score_window(window_start_ts, window_reset_ts):
     last_five = 0
     for e in reversed(window_entries):
         if e.get("five_pct") is not None:
-            last_five = float(e["five_pct"])
+            last_five = _safe_float(e["five_pct"])
             break
     burn_score = _score_dimension(last_five, 95.0)
 
@@ -3247,7 +3327,7 @@ def _score_window(window_start_ts, window_reset_ts):
     _load_index()
     total_commits = 0
     window_projects = set()
-    for sid, entry in _index_cache.items():
+    for sid, entry in snapshot.items():
         try:
             lts = entry.get("last_ts", "")
             if not lts:
@@ -3879,17 +3959,26 @@ def _estimate_pct_for_tokens(tokens_k):
 # -- Cycle Monitor (Supabase-backed freeform items per 5h window) -----------
 
 
-def _get_cycle_items(window_start):
-    # type: (str) -> List[dict]
-    """GET cycle_items for a given window_start."""
+def _get_cycle_items(window_start, all_windows=False):
+    # type: (str, bool) -> List[dict]
+    """GET cycle_items for a given window_start (or all windows)."""
     import urllib.request
+    from urllib.parse import quote
     config = _get_battlestation_config()
-    url = (
-        f"{_SUPABASE_URL}/cycle_items"
-        f"?user_id=eq.{config['user_id']}"
-        f"&window_start=eq.{window_start}"
-        f"&order=created_at.asc"
-    )
+    if all_windows:
+        url = (
+            f"{_SUPABASE_URL}/cycle_items"
+            f"?user_id=eq.{config['user_id']}"
+            f"&order=created_at.desc"
+            f"&limit=200"
+        )
+    else:
+        url = (
+            f"{_SUPABASE_URL}/cycle_items"
+            f"?user_id=eq.{config['user_id']}"
+            f"&window_start=eq.{quote(window_start)}"
+            f"&order=created_at.asc"
+        )
     try:
         req = urllib.request.Request(url, headers={
             "apikey": _SUPABASE_KEY,
@@ -4085,3 +4174,201 @@ def _roll_cycle_items(old_window_start, new_window_start):
             pass
 
     return rolled
+
+
+# ── Test Queue ────────────────────────────────────────────────────────────────
+
+def _get_test_queue(project=None, status="pending"):
+    # type: (str, str) -> list
+    """Fetch test_queue items from Supabase."""
+    import urllib.request
+    from urllib.parse import quote
+    config = _get_battlestation_config()
+    url = (
+        f"{_SUPABASE_URL}/test_queue"
+        f"?user_id=eq.{config['user_id']}"
+    )
+    if status is not None:
+        url += f"&status=eq.{quote(status)}"
+    if project:
+        url += f"&project=eq.{quote(project)}"
+    url += "&order=created_at.desc&limit=200"
+    try:
+        req = urllib.request.Request(url, headers={
+            "apikey": _SUPABASE_KEY,
+            "Authorization": f"Bearer {_SUPABASE_KEY}",
+        })
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            return json.loads(resp.read())
+    except Exception:
+        return []
+
+
+def _add_test_item(title, project="", source="manual", source_ref="", route="", priority="normal"):
+    # type: (str, str, str, str, str, str) -> dict
+    """Insert a new test_queue item. Returns inserted row or empty dict."""
+    import urllib.request
+    config = _get_battlestation_config()
+    payload = {
+        "user_id": config["user_id"],
+        "title": title[:200],
+        "project": project,
+        "source": source,
+        "source_ref": source_ref,
+        "route": route,
+        "priority": priority,
+        "status": "pending",
+    }
+    try:
+        data = json.dumps(payload).encode()
+        req = urllib.request.Request(
+            f"{_SUPABASE_URL}/test_queue",
+            data=data,
+            headers={
+                "apikey": _SUPABASE_KEY,
+                "Authorization": f"Bearer {_SUPABASE_KEY}",
+                "Content-Type": "application/json",
+                "Prefer": "return=representation",
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            rows = json.loads(resp.read())
+            return rows[0] if rows else {}
+    except Exception:
+        return {}
+
+
+def _update_test_item(item_id, status, notes=""):
+    # type: (str, str, str) -> bool
+    """Update test_queue item status. Sets tested_at on pass/fail/skip."""
+    import urllib.request
+    updates = {"status": status, "notes": notes}
+    if status in ("pass", "fail", "skip"):
+        updates["tested_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    try:
+        data = json.dumps(updates).encode()
+        req = urllib.request.Request(
+            f"{_SUPABASE_URL}/test_queue?id=eq.{item_id}",
+            data=data,
+            headers={
+                "apikey": _SUPABASE_KEY,
+                "Authorization": f"Bearer {_SUPABASE_KEY}",
+                "Content-Type": "application/json",
+            },
+            method="PATCH",
+        )
+        urllib.request.urlopen(req, timeout=5)
+        return True
+    except Exception:
+        return False
+
+
+def _delete_test_item(item_id):
+    # type: (str) -> bool
+    """Delete a test_queue item by id."""
+    import urllib.request
+    try:
+        req = urllib.request.Request(
+            f"{_SUPABASE_URL}/test_queue?id=eq.{item_id}",
+            headers={
+                "apikey": _SUPABASE_KEY,
+                "Authorization": f"Bearer {_SUPABASE_KEY}",
+            },
+            method="DELETE",
+        )
+        urllib.request.urlopen(req, timeout=5)
+        return True
+    except Exception:
+        return False
+
+
+def _import_atlas_qa_tests():
+    # type: () -> int
+    """Parse Atlas QA test-definitions.ts and upsert pending items.
+    Returns count of newly inserted items."""
+    import re
+    import os
+
+    ts_path = os.path.expanduser("~/atlas-portal/src/app/admin/qa/test-definitions.ts")
+    try:
+        with open(ts_path) as fh:
+            content = fh.read()
+    except Exception:
+        return 0
+
+    section_route_map = {
+        "auth": "/auth",
+        "dash": "/dashboard",
+        "craf": "/crafting",
+        "voic": "/voices",
+        "aler": "/signals",
+        "sign": "/signals",
+        "anal": "/analytics",
+        "brie": "/briefing",
+        "orac": "/onboarding",
+        "camp": "/campaigns",
+        "aren": "/arena",
+        "mana": "/management",
+        "team": "/management",
+        "queu": "/queue",
+        "nav": "/",
+        "perf": "/",
+        "desi": "/",
+        "a11y": "/",
+        "erro": "/",
+    }
+
+    priority_map = {
+        "critical": "high",
+        "high": "high",
+        "medium": "normal",
+        "normal": "normal",
+        "low": "low",
+    }
+
+    # Get existing qa source_refs to avoid duplicates
+    existing = _get_test_queue(status=None)
+    existing_refs = {
+        item["source_ref"] for item in existing
+        if item.get("source") == "qa" and item.get("source_ref")
+    }
+
+    test_pattern = re.compile(
+        r'id:\s*["\']([A-Z0-9]+-\d+)["\'].*?name:\s*["\']([^"\']+)["\']',
+        re.DOTALL,
+    )
+    priority_pattern = re.compile(r'priority:\s*["\']([^"\']+)["\']')
+
+    inserted = 0
+    for match in test_pattern.finditer(content):
+        test_id = match.group(1)
+        test_name = match.group(2)
+
+        if test_id in existing_refs:
+            continue
+
+        prefix = test_id.split("-")[0].lower()
+        route = ""
+        for key, r in section_route_map.items():
+            if prefix.startswith(key):
+                route = r
+                break
+
+        nearby = content[match.start():match.start() + 300]
+        pri_match = priority_pattern.search(nearby)
+        raw_priority = pri_match.group(1) if pri_match else "medium"
+        priority = priority_map.get(raw_priority, "normal")
+
+        result = _add_test_item(
+            title=f"{test_id}: {test_name}",
+            project="atlas",
+            source="qa",
+            source_ref=test_id,
+            route=route,
+            priority=priority,
+        )
+        if result:
+            inserted += 1
+
+    return inserted

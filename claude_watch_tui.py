@@ -5,6 +5,7 @@ Scrollable panels, keyboard navigation, no dead space.
 """
 
 import json
+import math
 import os
 import sys
 import time
@@ -25,6 +26,7 @@ from rich.table import Table as RichTable
 from claude_watch_data import (
     make_urgent_panel,
     _abbrev_model,
+    _safe_float,
     _active_pids,
     _active_sessions,
     _build_or_update_index,
@@ -35,6 +37,7 @@ from claude_watch_data import (
     _estimate_cost,
     _extract_accomplishments,
     _format_cost,
+    _get_active_account,
     _get_agent_stats,
     _get_burndown_data,
     _get_token_attribution,
@@ -45,16 +48,25 @@ from claude_watch_data import (
     _get_peer_sessions,
     _get_pid_cpu,
     _get_session_history,
+    _estimate_turn_cost,
     _get_session_turns,
     _get_system_health,
     _get_usage_metrics,
     _gravity_center,
     _index_building,
     _index_cache,
+    _index_lock,
     _load_index,
     _load_ledger,
+    _reset_day,
     _shorten_tool,
+    _token_pacing,
     check_and_notify,
+    _get_test_queue,
+    _add_test_item,
+    _update_test_item,
+    _delete_test_item,
+    _import_atlas_qa_tests,
     export_session_history_csv,
     focus_session_terminal,
     get_account_capacity_display,
@@ -81,8 +93,8 @@ class LazyView(ScrollableContainer):
 
 def _start_hot_reload_watcher(app):
     # type: (Any) -> None
-    """Watch *.py files in the same directory. On any mtime change, restart the process."""
-    watch_dir = Path(__file__).parent
+    """Watch source files for changes. Signal the app instead of auto-restarting."""
+    watch_dir = Path(__file__).resolve().parent
 
     def _snapshot():
         # type: () -> Dict[Path, float]
@@ -92,6 +104,11 @@ def _start_hot_reload_watcher(app):
                 result[p] = p.stat().st_mtime
             except Exception:
                 pass
+        tcss = watch_dir / "claude_watch_tui.tcss"
+        try:
+            result[tcss] = tcss.stat().st_mtime
+        except Exception:
+            pass
         return result
 
     mtimes = _snapshot()
@@ -99,12 +116,54 @@ def _start_hot_reload_watcher(app):
         time.sleep(2)
         current = _snapshot()
         if current != mtimes:
-            app.call_from_thread(app._trigger_reload)
-            return
+            mtimes = current
+            app.call_from_thread(app._signal_files_changed)
 
 
-def _project_to_company(project: str) -> tuple[str, str]:
-    """Return (company_name, style) from a project string."""
+_BACKUP_DIR = Path(f"/tmp/claude-watch-backup-{os.getpid()}")
+_SOURCE_DIR = Path(__file__).resolve().parent
+_BACKUP_FILES = ["claude_watch_tui.py", "claude_watch_data.py", "claude_watch.py", "claude_watch_tui.tcss"]
+
+
+def _backup_working_files():
+    """Snapshot current source files as last-known-good backup."""
+    try:
+        _BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+        import shutil
+        for fname in _BACKUP_FILES:
+            src = _SOURCE_DIR / fname
+            if src.exists():
+                shutil.copy2(str(src), str(_BACKUP_DIR / fname))
+    except Exception:
+        pass
+
+
+def _restore_backup_files():
+    """Restore backed-up files over current files. Returns True if restored."""
+    import shutil
+    if not _BACKUP_DIR.exists():
+        return False
+    restored = False
+    for fname in _BACKUP_FILES:
+        bak = _BACKUP_DIR / fname
+        dst = _SOURCE_DIR / fname
+        if bak.exists():
+            shutil.copy2(str(bak), str(dst))
+            restored = True
+    return restored
+
+
+def _project_to_company(project: str, company: str = "") -> tuple[str, str]:
+    """Return (company_name, style) from company field or project string."""
+    if company:
+        c = company.lower().strip()
+        if "delphi" in c: return "Delphi", "blue"
+        if "kaa" in c: return "KAA", "green"
+        if "frank" in c: return "Frank", "magenta"
+        if "sage" in c: return "SAGE", "yellow"
+        if "adinkra" in c: return "Adinkra", "purple"
+        if "personal" in c: return "Personal", "dim"
+        return company[:12], "dim"
     p = (project or "").lower().strip()
     if p in ("atlas", "atlas-be", "atlas-fe"):
         return "Delphi", "blue"
@@ -233,8 +292,10 @@ class ActiveSessionsTable(DataTable):
 
         try:
             cur_row = self.cursor_row
+            saved_y = self.scroll_y
         except Exception:
             cur_row = 0
+            saved_y = 0
 
         self.clear()
 
@@ -468,7 +529,11 @@ class ActiveSessionsTable(DataTable):
 
         try:
             if cur_row < self.row_count:
-                self.move_cursor(row=cur_row)
+                self.move_cursor(row=cur_row, scroll=False)
+        except Exception:
+            pass
+        try:
+            self.scroll_to(y=saved_y, animate=False)
         except Exception:
             pass
 
@@ -992,11 +1057,29 @@ class BurndownChart(Static):
         else:
             score_line = ""
 
+        # Token zone classification
+        def _token_zone(pct):
+            try:
+                p = float(pct)
+            except Exception:
+                return ("?", "dim")
+            if p < 40:
+                return ("COOL", "green")
+            if p < 70:
+                return ("WARM", "yellow")
+            if p < 85:
+                return ("HOT", "red")
+            return ("REDLINE", "bold red")
+
+        five_zone, five_zcolor = _token_zone(five)
+        seven_zone, seven_zcolor = _token_zone(seven)
+
         # Build right-side lines (aligned with chart rows)
         r = [
             f"  [bold {used_color}]{used_pct:.0f}% Used[/bold {used_color}]  [bold {left_color}]{remaining:.0f}% Left[/bold {left_color}]",
-            f"  [bold]5h[/bold] {mini_bar(five)} {float(five):.0f}%  [dim]resets {reset_str}[/dim]",
-            f"  [bold]7d[/bold] {mini_bar(seven)} {float(seven):.0f}%  [dim]{_reset_day(sr)[:10]}[/dim]",
+            f"  [bold]5h[/bold] {mini_bar(five)} {_safe_float(five):.0f}%  [dim]resets {reset_str}[/dim]",
+            f"  [bold]7d[/bold] {mini_bar(seven)} {_safe_float(seven):.0f}%  [dim]{_reset_day(sr)[:10]}[/dim]",
+            f"  [{five_zcolor}]{five_zone}[/{five_zcolor}] 5h  [{seven_zcolor}]{seven_zone}[/{seven_zcolor}] 7d",
             f"  [{acct_color}]Acct {label}[/{acct_color}]: {name} [dim]({lane})[/dim]",
             f"  {pace_str}",
             f"  {verdict}",
@@ -1011,6 +1094,7 @@ class BurndownChart(Static):
             f"     [dim]{axis_str}[/dim]{r[4]}",
             r[5],
             r[6],
+            r[7],
         ]
 
         content = "\n".join(lines)
@@ -1080,7 +1164,16 @@ class SystemHealthPanel(Static):
                        else ("cyan" if "atlas" in source else "dim"))
             )
 
-            mem_str = f"{mem/1024:.1f}GB" if mem >= 1024 else f"{mem}MB"
+            def mem_mini_gauge(mb):
+                pct = min(mb / 10, 100)  # scale: 1000MB = 100%
+                filled = min(int(pct * 3 / 100), 3)
+                color = "green" if mb < 300 else ("yellow" if mb < 500 else "red")
+                bar = f"[{color}]{'█' * filled}{'░' * (3 - filled)}[/{color}]"
+                if mb >= 1024:
+                    return f"{bar} {mb / 1024:.1f}GB"
+                return f"{bar} {mb}MB"
+
+            mem_str = mem_mini_gauge(mem)
             if st == "runaway":
                 dot = "[bold red]⚠ [/bold red]"
                 status_str = f"[bold red]runaway[/bold red] ({directive[:20]})"
@@ -1101,7 +1194,7 @@ class SystemHealthPanel(Static):
                 f"[{co_style}]{co_name}[/{co_style}]",
                 f"[dim]{project}[/dim]",
                 f"[{mdl_style}]{mdl}[/{mdl_style}]",
-                mem_str,
+                Text.from_markup(mem_str),
                 status_str,
             )
 
@@ -1142,6 +1235,38 @@ class SystemHealthPanel(Static):
         total_mem_str = f"{total_mem/1024:.1f}GB" if total_mem >= 1024 else f"{total_mem:.0f}MB"
         mem_pct_color = "red" if mem_pct > 80 else ("yellow" if mem_pct > 60 else "green")
 
+        # Summary gauge row
+        def gauge_bar(pct, width=10):
+            filled = int(pct * width / 100)
+            color = "green" if pct < 40 else ("yellow" if pct < 70 else "red")
+            return f"[{color}]{'█' * filled}{'░' * (width - filled)}[/{color}]"
+
+        def zone_label(pct):
+            if pct < 40:
+                return ("COOL", "green")
+            if pct < 70:
+                return ("WARM", "yellow")
+            if pct < 85:
+                return ("HOT", "red")
+            return ("REDLINE", "bold red")
+
+        mem_zone, mem_zc = zone_label(mem_pct)
+        cpu_capped = min(total_cpu, 100)
+        cpu_zone, cpu_zc = zone_label(cpu_capped)
+        mem_gb = total_mem / 1024
+        sys_gb = sys_mem / 1024
+
+        t.add_row(
+            "",
+            Text.from_markup(f"MEM {gauge_bar(mem_pct)} {mem_gb:.1f}GB/{sys_gb:.0f}GB [{mem_zc}]{mem_zone}[/{mem_zc}]"),
+            "",
+            "",
+            "",
+            Text.from_markup(f"CPU {gauge_bar(cpu_capped)} {total_cpu:.0f}% [{cpu_zc}]{cpu_zone}[/{cpu_zc}]"),
+            "",
+            "",
+        )
+
         t.add_row(
             "",
             "[bold]Total AI stack[/bold]",
@@ -1155,6 +1280,79 @@ class SystemHealthPanel(Static):
 
         self.display = True
         self.update(Panel(t, title="[bold]System Health[/bold]", border_style="magenta"))
+
+
+
+class ReloadBanner(Static):
+    """Banner shown when source files have changed. Click or press Shift+R to reload."""
+
+    DEFAULT_CSS = """
+    ReloadBanner {
+        display: none;
+        height: 1;
+        dock: top;
+        background: $warning;
+        color: $text;
+        text-align: center;
+        text-style: bold;
+    }
+    ReloadBanner.reverted {
+        background: $error;
+    }
+    """
+
+    def __init__(self, **kwargs):
+        super().__init__("", **kwargs)
+        self._mode = "hidden"
+
+    def show_pending(self):
+        self._mode = "pending"
+        self.update("[reverse] FILES CHANGED [/reverse]  Press [bold]Shift+R[/bold] to reload build")
+        self.remove_class("reverted")
+        self.display = True
+
+    def show_reverted(self, error_msg=""):
+        self._mode = "reverted"
+        short_err = error_msg.strip().split("\n")[-1][:80] if error_msg else "import error"
+        self.update(f"[reverse] BUILD BROKEN \u2014 REVERTED [/reverse]  {short_err}")
+        self.add_class("reverted")
+        self.display = True
+
+    def hide_banner(self):
+        self._mode = "hidden"
+        self.display = False
+
+    def on_click(self):
+        if self._mode == "pending":
+            self.app.action_reload_build()
+
+
+# ── Navigation bar ───────────────────────────────────────────────────────────
+
+
+class NavBar(Horizontal):
+    """Top navigation bar with clickable buttons."""
+
+    def __init__(self, active: str = "nav-dashboard", **kwargs):
+        super().__init__(**kwargs)
+        self._active = active
+
+    def compose(self) -> ComposeResult:
+        buttons = [
+            ("Dashboard", "nav-dashboard"),
+            ("Health", "nav-health"),
+            ("Cycle", "nav-sessions"),
+            ("Projects", "nav-projects"),
+            ("Leaderboard", "nav-leaderboard"),
+            ("Cycles", "nav-cycles"),
+            ("Usage", "nav-usage"),
+            ("MCP", "nav-mcp"),
+            ("Test", "nav-test"),
+        ]
+        for label, btn_id in buttons:
+            variant = "primary" if btn_id == self._active else "default"
+            yield Button(label, id=btn_id, variant=variant)
+
 
 
 class HealthScreen(Screen):
@@ -1180,32 +1378,6 @@ class HealthScreen(Screen):
         self.app.pop_screen()
 
 
-# ── Navigation bar ───────────────────────────────────────────────────────────
-
-
-class NavBar(Horizontal):
-    """Top navigation bar with clickable buttons."""
-
-    def __init__(self, active: str = "nav-dashboard", **kwargs):
-        super().__init__(**kwargs)
-        self._active = active
-
-    def compose(self) -> ComposeResult:
-        buttons = [
-            ("Dashboard", "nav-dashboard"),
-            ("Health", "nav-health"),
-            ("Cycle", "nav-sessions"),
-            ("Projects", "nav-projects"),
-            ("Leaderboard", "nav-leaderboard"),
-            ("Cycles", "nav-cycles"),
-            ("Usage", "nav-usage"),
-            ("MCP", "nav-mcp"),
-        ]
-        for label, btn_id in buttons:
-            variant = "primary" if btn_id == self._active else "default"
-            yield Button(label, id=btn_id, variant=variant)
-
-
 # ── Drill-down screen ────────────────────────────────────────────────────────
 
 
@@ -1221,23 +1393,27 @@ class SessionDrillDown(Screen):
         self.session_id = session_id
         self.session_directive = directive
         self.session_project = project
-        self.showing_tokens = False
+        self.showing_tokens = True
 
     def compose(self) -> ComposeResult:
         yield NavBar(active="nav-sessions")
-        yield Static(
-            f"[bold]Session:[/bold] {self.session_id}  "
-            f"[bold]Project:[/bold] {self.session_project}  "
-            f"[bold]Directive:[/bold] {self.session_directive}  "
-            "[dim](t=toggle view)[/dim]",
-            id="drilldown-header",
-        )
+        yield Static(id="drilldown-header")
         yield Static(id="accomplishments-view")
         yield DataTable(id="drilldown-table")
 
+    def _update_header(self):
+        hint = "[dim](t=accomplishments)[/dim]" if self.showing_tokens else "[dim](t=token usage)[/dim]"
+        self.query_one("#drilldown-header", Static).update(
+            f"[bold]Session:[/bold] {self.session_id}  "
+            f"[bold]Project:[/bold] {self.session_project}  "
+            f"[bold]Directive:[/bold] {self.session_directive}  "
+            + hint
+        )
+
     def on_mount(self):
-        self._show_accomplishments()
-        self.query_one("#drilldown-table", DataTable).display = False
+        self._update_header()
+        self.query_one("#accomplishments-view", Static).display = False
+        self._show_tokens()
 
     def _show_accomplishments(self):
         acc = _extract_accomplishments(self.session_id)
@@ -1255,7 +1431,8 @@ class SessionDrillDown(Screen):
         commits = len(acc.get("git_commits", []))
         errors = acc.get("errors", 0)
         # Get output tokens + model from index cache for cost estimate
-        idx_entry = _index_cache.get(self.session_id, {})
+        with _index_lock:
+            idx_entry = _index_cache.get(self.session_id, {})
         out_tok = idx_entry.get("output_tokens", 0)
         session_cost = _estimate_cost(out_tok, idx_entry.get("model", ""))
         summary_parts = [f"[bold]{turns}[/bold] turns"]
@@ -1343,19 +1520,20 @@ class SessionDrillDown(Screen):
         table.cursor_type = "row"
         table.zebra_stripes = True
         table.add_column("#", width=4)
-        table.add_column("In", width=8)
-        table.add_column("Out", width=8)
-        table.add_column("~5h%", width=6)
-        table.add_column("Model", width=7)
-        table.add_column("Tools", width=25)
-        table.add_column("Prompt")
+        table.add_column("In", width=7)
+        table.add_column("Out", width=7)
+        table.add_column("Cost", width=7)
+        table.add_column("5h%", width=5)
+        table.add_column("Mdl", width=6)
+        table.add_column("Tools", width=28)
+        table.add_column("User Prompt")
 
         turns = _get_session_turns(self.session_id)
         if not turns:
-            table.add_row("—", "", "", "", "", "", Text("no turns found", style="dim"))
+            table.add_row("—", "", "", "", "", "", "", Text("no turns found", style="dim"))
             return
 
-        total_in = total_out = total_pct = 0
+        total_in = total_out = total_pct = total_cost = 0
         for t in turns:
             tokens_in = t["tokens_in"]
             tokens_out = t["tokens_out"]
@@ -1363,27 +1541,35 @@ class SessionDrillDown(Screen):
             total_out += tokens_out
             total_pct += t["pct_est"]
 
+            turn_cost = _estimate_turn_cost(tokens_in, tokens_out, t["model"])
+            total_cost += turn_cost
+
             in_str = f"{tokens_in/1000:.1f}k" if tokens_in >= 1000 else str(tokens_in)
             out_str = f"{tokens_out/1000:.1f}k" if tokens_out >= 1000 else str(tokens_out)
+            cost_str = _format_cost(turn_cost)
 
             pct = t["pct_est"]
             pct_style = "red" if pct > 1 else ("yellow" if pct > 0.3 else "dim")
+            cost_style = "red" if turn_cost >= 0.20 else ("yellow" if turn_cost >= 0.05 else "green")
             mdl_style = "magenta" if t["model"] == "opus" else ("cyan" if t["model"] == "sonnet" else "dim")
 
             table.add_row(
                 str(t["turn"]),
                 Text(in_str, style="dim"),
                 Text(out_str),
+                Text(cost_str, style=cost_style),
                 Text(f"{pct:.1f}%", style=pct_style),
                 Text(t["model"], style=mdl_style),
-                Text(t["tools"][:25], style="dim"),
-                Text(t["prompt"][:50]),
+                Text(t["tools"][:28], style="dim"),
+                Text(t["prompt"][:60]),
             )
 
+        total_cost_str = f"${total_cost:.2f}" if total_cost >= 0.01 else "<$0.01"
         table.add_row(
             Text("Σ", style="bold"),
             Text(f"{total_in/1000:.0f}k", style="bold"),
             Text(f"{total_out/1000:.0f}k", style="bold"),
+            Text(total_cost_str, style="bold red" if total_cost >= 1.0 else "bold yellow"),
             Text(f"{total_pct:.1f}%", style="bold yellow"),
             "",
             "",
@@ -1394,6 +1580,7 @@ class SessionDrillDown(Screen):
         self.showing_tokens = not self.showing_tokens
         acc_view = self.query_one("#accomplishments-view", Static)
         table = self.query_one("#drilldown-table", DataTable)
+        self._update_header()
 
         if self.showing_tokens:
             acc_view.display = False
@@ -1402,6 +1589,7 @@ class SessionDrillDown(Screen):
         else:
             table.display = False
             acc_view.display = True
+            self._show_accomplishments()
 
     def action_pop_screen(self):
         self.app.pop_screen()
@@ -1621,14 +1809,21 @@ class SessionTasksView(LazyView):
     CAT_ICONS = {"bug": "\U0001f41b", "task": "\u2610", "idea": "\U0001f4a1", "direction": "\U0001f9ed"}
     STATUS_ICONS = {"open": "\u25cf", "done": "\u2713", "rolled": "\u2192"}
     CAT_ORDER = ["bug", "task", "idea", "direction"]
-    PROJECTS = ["", "atlas", "claude-watch", "paperclip", "openclaw", "frank", "kaa"]
+    PROJECTS = ["", "delphi", "kaa", "frank", "sage"]
+    COMPANY_PROJECTS = {
+        "delphi": ["atlas", "Atlas"],
+        "kaa": ["kaa", "KAA"],
+        "frank": ["frank", "Frank"],
+        "sage": ["claude-watch", "CW", "openclaw", "OClaw", "paperclip", "Paper", "battlestation"],
+    }
+    COMPANY_LABELS = {"delphi": "Delphi", "kaa": "KAA", "frank": "Frank", "sage": "SAGE"}
     PROJECT_LABELS = {"": "None", "atlas": "Atlas", "claude-watch": "CW", "paperclip": "Paper",
                       "openclaw": "OClaw", "frank": "Frank", "kaa": "KAA"}
 
     BINDINGS = [
         Binding("n", "focus_add", "New"),
-        Binding("e", "edit_item", "Edit"),
-        Binding("enter", "toggle_done", "Done"),
+        Binding("enter", "edit_item", "Edit"),
+        Binding("x", "toggle_done", "Done"),
         Binding("r", "roll_item", "Roll"),
         Binding("d", "delete_item", "Delete"),
         Binding("slash", "start_filter", "Filter"),
@@ -1638,6 +1833,7 @@ class SessionTasksView(LazyView):
     def compose(self) -> ComposeResult:
         from textual.widgets import Input
         yield Static(id="cm-header")
+        yield Static(id="cm-objective")
         with Horizontal(id="cm-add-row"):
             yield Input(id="cm-add-input", placeholder="Add item... (Tab=cat, Shift+Tab=project, Enter=save)")
             yield Button("Task \u2610", id="cm-cat-task", classes="cm-cat", variant="primary")
@@ -1645,24 +1841,28 @@ class SessionTasksView(LazyView):
             yield Button("Idea \U0001f4a1", id="cm-cat-idea", classes="cm-cat", variant="default")
             yield Button("Dir \U0001f9ed", id="cm-cat-dir", classes="cm-cat", variant="default")
         with Horizontal(id="cm-project-row"):
-            yield Button("None", id="cm-proj-none", classes="cm-proj", variant="primary")
-            yield Button("Atlas", id="cm-proj-atlas", classes="cm-proj")
-            yield Button("CW", id="cm-proj-claude-watch", classes="cm-proj")
-            yield Button("Paper", id="cm-proj-paperclip", classes="cm-proj")
-            yield Button("OClaw", id="cm-proj-openclaw", classes="cm-proj")
-            yield Button("Frank", id="cm-proj-frank", classes="cm-proj")
+            yield Button("All", id="cm-proj-all", classes="cm-proj", variant="primary")
+            yield Button("None", id="cm-proj-none", classes="cm-proj")
+            yield Button("Delphi", id="cm-proj-delphi", classes="cm-proj")
             yield Button("KAA", id="cm-proj-kaa", classes="cm-proj")
+            yield Button("Frank", id="cm-proj-frank", classes="cm-proj")
+            yield Button("SAGE", id="cm-proj-sage", classes="cm-proj")
         yield DataTable(id="cm-table")
+        with Horizontal(id="cm-lanes-row"):
+            yield Static(id="cm-lane-1")
+            yield Static(id="cm-lane-2")
+            yield Static(id="cm-lane-3")
         yield Static(id="cm-prev")
 
     def load_content(self):
         self._category = "task"
-        self._project = ""
+        self._project = None  # None = All (no filter), "" = None/unassigned
         self._items = []
         self._window_start = ""
         self._editing_id = None
         self._filtering = False
         self._filter_text = ""
+        self._show_all_windows = False
 
         # Compute window_start from burndown data
         bd = _get_burndown_data()
@@ -1683,8 +1883,10 @@ class SessionTasksView(LazyView):
         dt.add_column("Cat", width=5)
         dt.add_column("St", width=3)
         dt.add_column("Title", width=45)
-        dt.add_column("Project", width=12)
-        dt.add_column("Age", width=8)
+        dt.add_column("Co", width=8)
+        dt.add_column("Project", width=10)
+        dt.add_column("Lane", width=6)
+        dt.add_column("Age", width=6)
 
         self._reload()
 
@@ -1705,17 +1907,35 @@ class SessionTasksView(LazyView):
     def _reload(self):
         from claude_watch_data import (
             _get_cycle_items, _get_recent_cycle_summaries, _get_current_cycle,
+            _get_cycle_plan,
         )
 
         # Fetch items
-        self._items = _get_cycle_items(self._window_start)
+        self._items = _get_cycle_items(self._window_start, all_windows=self._show_all_windows)
 
-        # Apply filter if active
+        # Apply company filter (None = All/no filter, "" = unassigned, else = company key)
         display_items = self._items
+        if self._project is not None and self._project in self.COMPANY_PROJECTS:
+            allowed = [p.lower() for p in self.COMPANY_PROJECTS[self._project]]
+            display_items = [
+                i for i in display_items
+                if (i.get("project") or "").lower() in allowed
+            ]
+        elif self._project == "":
+            # "None" = show items not belonging to any company
+            all_known = set()
+            for projs in self.COMPANY_PROJECTS.values():
+                all_known.update(p.lower() for p in projs)
+            display_items = [
+                i for i in display_items
+                if (i.get("project") or "").lower() not in all_known
+            ]
+
+        # Apply text filter if active
         if self._filter_text:
             ft = self._filter_text.lower()
             display_items = [
-                i for i in self._items
+                i for i in display_items
                 if ft in (i.get("title") or "").lower()
                 or ft in (i.get("project") or "").lower()
             ]
@@ -1745,6 +1965,7 @@ class SessionTasksView(LazyView):
                     Text("", style="dim"),
                     Text("", style="dim"),
                     Text("", style="dim"),
+                    Text("", style="dim"),
                     key=f"sep-{cat}",
                 )
             first_group = False
@@ -1755,12 +1976,20 @@ class SessionTasksView(LazyView):
                 st_style = "green" if status == "done" else ("dim" if status == "rolled" else "")
                 title = item.get("title", "")[:45]
                 project = item.get("project", "")[:12]
+                # Derive company from project
+                item_proj_lower = (item.get("project") or "").lower()
+                company = ""
+                for comp, projs in self.COMPANY_PROJECTS.items():
+                    if item_proj_lower in [p.lower() for p in projs]:
+                        company = self.COMPANY_LABELS.get(comp, comp)
+                        break
                 age = self._fmt_age(item.get("created_at", ""))
 
                 dt.add_row(
                     Text(cat_icon),
                     Text(st_icon, style=st_style),
                     Text(title, style="strike" if status == "done" else ""),
+                    Text(company, style="magenta"),
                     Text(project, style="cyan"),
                     Text(age, style="dim"),
                     key=f"ci-{item['id']}",
@@ -1771,6 +2000,7 @@ class SessionTasksView(LazyView):
                 Text(""),
                 Text(""),
                 Text("No items yet — press n to add", style="dim"),
+                Text(""),
                 Text(""),
                 Text(""),
             )
@@ -1786,11 +2016,56 @@ class SessionTasksView(LazyView):
         stars = cycle.get("stars", "") if cycle else ""
 
         filter_str = f"  [yellow][filter: \"{self._filter_text}\"][/yellow]" if self._filter_text else ""
+        mode_label = "[bold yellow]ALL CYCLES[/bold yellow]" if self._show_all_windows else f"resets in {time_str}  {stars}"
         self.query_one("#cm-header", Static).update(
-            f"[bold]CYCLE MONITOR[/bold]  resets in {time_str}  {stars}  "
+            f"[bold]CYCLE MONITOR[/bold]  {mode_label}  "
             f"[green]{open_count} open[/green]  [dim]{done_count} done[/dim]{filter_str}  "
-            f"[dim](n=add  /=filter  a=all  e=edit  Enter=done  r=roll  d=delete  q=back)[/dim]"
+            f"[dim](n=add  /=filter  a=all  Enter=edit  x=done  r=roll  d=delete  q=back)[/dim]"
         )
+
+        # Objective banner from cycle plan
+        obj_text = ""
+        plan = _get_cycle_plan(self._window_start) if self._window_start else None
+        if plan:
+            obj = plan.get("objective", "")
+            process = plan.get("process", "")
+            lanes = plan.get("lanes", {})
+            if obj:
+                parts = [f"[bold magenta]OBJ:[/bold magenta] [bold white]{obj}[/bold white]"]
+                if process:
+                    parts.append(f"  [dim]{process}[/dim]")
+                if lanes:
+                    lane_strs = [f"[cyan]{k}[/cyan]" for k in lanes]
+                    parts.append(f"  Lanes: {' | '.join(lane_strs)}")
+                obj_text = "\n".join(parts)
+        self.query_one("#cm-objective", Static).update(obj_text)
+
+        # Lane visualization
+        lane_widgets = ["#cm-lane-1", "#cm-lane-2", "#cm-lane-3"]
+        if plan and plan.get("lanes"):
+            lane_keys = list(plan["lanes"].keys())
+            for idx, widget_id in enumerate(lane_widgets):
+                if idx < len(lane_keys):
+                    lane_name = lane_keys[idx]
+                    lane_data = plan["lanes"][lane_name]
+                    lane_tasks = lane_data.get("tasks", [])
+                    # Match cycle items to lane tasks
+                    lane_lines = [f"[bold cyan]{lane_name}[/bold cyan]"]
+                    for task_title in lane_tasks:
+                        # Check if this task is done in cycle items
+                        done = any(
+                            task_title.lower() in (i.get("title") or "").lower()
+                            and i.get("status") == "done"
+                            for i in self._items
+                        )
+                        icon = "[green]\u2713[/green]" if done else "[dim]\u25cb[/dim]"
+                        lane_lines.append(f" {icon} {task_title[:30]}")
+                    self.query_one(widget_id, Static).update("\n".join(lane_lines))
+                else:
+                    self.query_one(widget_id, Static).update("")
+        else:
+            for widget_id in lane_widgets:
+                self.query_one(widget_id, Static).update("")
 
         # Previous cycles
         summaries = _get_recent_cycle_summaries(limit=3)
@@ -1855,10 +2130,13 @@ class SessionTasksView(LazyView):
         self.query_one("#cm-add-input", Input).focus()
 
     def _update_project_buttons(self):
-        for proj in self.PROJECTS:
-            pid = proj or "none"
-            btn = self.query_one(f"#cm-proj-{pid}", Button)
-            btn.variant = "primary" if proj == self._project else "default"
+        all_btn = self.query_one("#cm-proj-all", Button)
+        all_btn.variant = "primary" if (self._project is None and not self._show_all_windows) or self._show_all_windows else "default"
+        none_btn = self.query_one("#cm-proj-none", Button)
+        none_btn.variant = "primary" if self._project == "" and not self._show_all_windows else "default"
+        for company in ["delphi", "kaa", "frank", "sage"]:
+            btn = self.query_one(f"#cm-proj-{company}", Button)
+            btn.variant = "primary" if company == self._project else "default"
 
     def on_key(self, event):
         from textual.widgets import Input
@@ -1890,8 +2168,9 @@ class SessionTasksView(LazyView):
         elif event.key == "shift+tab":
             event.prevent_default()
             event.stop()
-            idx = self.PROJECTS.index(self._project) if self._project in self.PROJECTS else 0
-            self._project = self.PROJECTS[(idx + 1) % len(self.PROJECTS)]
+            company_cycle = [None, "delphi", "kaa", "frank", "sage"]
+            idx = company_cycle.index(self._project) if self._project in company_cycle else 0
+            self._project = company_cycle[(idx + 1) % len(company_cycle)]
             self._update_project_buttons()
 
     def on_input_submitted(self, event):
@@ -1910,11 +2189,13 @@ class SessionTasksView(LazyView):
         title = event.value.strip()
         if not title:
             return
+        proj_map = {"delphi": "Atlas", "kaa": "KAA", "frank": "Frank", "sage": "CW"}
+        store_proj = proj_map.get(self._project, self._project or "")
         if self._editing_id:
-            _update_cycle_item(self._editing_id, {"title": title, "category": self._category, "project": self._project})
+            _update_cycle_item(self._editing_id, {"title": title, "category": self._category, "project": store_proj})
             self._editing_id = None
         else:
-            _post_cycle_item(self._window_start, self._category, title, project=self._project)
+            _post_cycle_item(self._window_start, self._category, title, project=store_proj)
         inp.value = ""
         self._reload()
         self.query_one("#cm-table", DataTable).focus()
@@ -1930,10 +2211,23 @@ class SessionTasksView(LazyView):
             for bid, cat in cat_map.items():
                 btn = self.query_one(f"#{bid}", Button)
                 btn.variant = "primary" if cat == self._category else "default"
+        elif btn_id == "cm-proj-all":
+            if self._show_all_windows:
+                self._show_all_windows = False
+            self._project = None  # All = no filter
+            self._update_project_buttons()
+            self._reload()
+        elif btn_id == "cm-proj-none":
+            self._project = ""  # None = unassigned items
+            self._show_all_windows = False
+            self._update_project_buttons()
+            self._reload()
         elif btn_id.startswith("cm-proj-"):
             proj_key = btn_id.removeprefix("cm-proj-")
-            self._project = "" if proj_key == "none" else proj_key
+            self._project = proj_key
+            self._show_all_windows = False
             self._update_project_buttons()
+            self._reload()
 
     def action_edit_item(self):
         from textual.widgets import Input
@@ -1959,13 +2253,25 @@ class SessionTasksView(LazyView):
         for cat, btn_id in cat_map.items():
             btn = self.query_one(btn_id, Button)
             btn.variant = "primary" if cat == self._category else "default"
-        # Set project and update buttons
-        self._project = item.get("project", "")
+        # Reverse-map project name to company key
+        item_proj = (item.get("project") or "").lower()
+        company = ""
+        for comp, projs in self.COMPANY_PROJECTS.items():
+            if item_proj in [p.lower() for p in projs]:
+                company = comp
+                break
+        self._project = company
         self._update_project_buttons()
         # Store editing state
         self._editing_id = item["id"]
         # Focus input
         inp.focus()
+
+    def on_data_table_row_selected(self, event):
+        """Handle click/Enter on a row — open edit mode."""
+        if event.data_table.id != "cm-table":
+            return
+        self.action_edit_item()
 
     def action_toggle_done(self):
         from claude_watch_data import _update_cycle_item
@@ -2086,7 +2392,9 @@ class ProjectBoardView(LazyView):
 
         for proj in sorted(by_project.keys()):
             counts = by_project[proj]
-            co_name, co_style = _project_to_company(proj)
+            proj_companies = [t.get("company", "") for t in tasks if t.get("project") == proj and t.get("company")]
+            company_val = max(set(proj_companies), key=proj_companies.count) if proj_companies else ""
+            co_name, co_style = _project_to_company(proj, company_val)
             proj_pts = sum(t.get("points") or 0 for t in tasks
                           if t.get("project") == proj and t.get("status") in ("ready", "in_progress"))
             summary_table.add_row(
@@ -2113,8 +2421,11 @@ class ProjectBoardView(LazyView):
         dt.add_column("Tier", width=5)
         dt.add_column("~kT", width=4)
         dt.add_column("St", width=12)
+        dt.add_column("Co", width=8)
         dt.add_column("Project", width=10)
-        dt.add_column("Task", width=35)
+        dt.add_column("Task", width=30)
+        dt.add_column("Created", width=12)
+        dt.add_column("Sess", width=7)
         dt.add_column("🚀", width=2)  # dispatch-ready indicator
 
         # Sort: in_progress first, then ready, then blocked, then built; within each, by priority
@@ -2156,6 +2467,13 @@ class ProjectBoardView(LazyView):
             dispatch_icon = "✓" if dispatch_ready else ("⊘" if blocked else "")
             dispatch_style = "green bold" if dispatch_ready else ("red" if blocked else "dim")
 
+            created_at = t.get("created_at", "")
+            created_display = created_at[5:16].replace("T", " ") if created_at else "—"
+            company_raw = t.get("company", "")
+            co_name, co_style = _project_to_company(t.get("project", ""), company_raw)
+            session_raw = t.get("created_by_session", "")
+            session_display = session_raw.replace("cc-", "") if session_raw else "—"
+
             dt.add_row(
                 Text(tid, justify="right"),
                 Text(_pri_label.get(pri, "—"), style=_pri_style.get(pri, "dim")),
@@ -2164,18 +2482,21 @@ class ProjectBoardView(LazyView):
                 Text(tier[:4], style=_tier_style.get(tier, "dim")),
                 Text(str(tok) if tok else "—", justify="right", style="magenta" if tok else "dim"),
                 Text(f"{status_icon} {status}", style=status_style),
+                Text(co_name[:8], style=co_style),
                 Text(t.get("project", "—")[:10], style="cyan"),
-                Text((t.get("task_name") or "—")[:35]),
+                Text((t.get("task_name") or "—")[:30]),
+                Text(created_display, style="dim"),
+                Text(session_display[:7], style="dim"),
                 Text(dispatch_icon, style=dispatch_style),
             )
 
         if not shown:
-            dt.add_row(*[""] * 10)
+            dt.add_row(*[""] * 13)
 
         if built_tasks:
             remaining_built = len([t for t in sorted_tasks if t.get("status") == "built"]) - 10
             if remaining_built > 0:
-                row = ["", "", "", "", "", "", Text(f"... +{remaining_built} built", style="dim"), "", "", ""]
+                row = ["", "", "", "", "", "", Text(f"... +{remaining_built} built", style="dim"), "", "", "", "", "", ""]
                 dt.add_row(*row)
 
 
@@ -2387,15 +2708,19 @@ class SessionHistoryTable(DataTable):
 
         try:
             cur_row = self.cursor_row
+            saved_y = self.scroll_y
         except Exception:
             cur_row = 0
+            saved_y = 0
 
         self.clear()
 
+        with _index_lock:
+            _building = _index_building
         if not sessions:
             self.add_row(
                 "...", "", "", "", "", "", "", "", "", "",
-                Text("building index..." if _index_building else "no sessions in this window", style="dim"),
+                Text("building index..." if _building else "no sessions in this window", style="dim"),
             )
             return
 
@@ -2510,7 +2835,11 @@ class SessionHistoryTable(DataTable):
 
         try:
             if cur_row < self.row_count:
-                self.move_cursor(row=cur_row)
+                self.move_cursor(row=cur_row, scroll=False)
+        except Exception:
+            pass
+        try:
+            self.scroll_to(y=saved_y, animate=False)
         except Exception:
             pass
 
@@ -2555,8 +2884,10 @@ class CallHistoryTable(DataTable):
 
         try:
             cur_row = self.cursor_row
+            saved_y = self.scroll_y
         except Exception:
             cur_row = 0
+            saved_y = 0
 
         self.clear()
 
@@ -2637,7 +2968,11 @@ class CallHistoryTable(DataTable):
 
         try:
             if cur_row < self.row_count:
-                self.move_cursor(row=cur_row)
+                self.move_cursor(row=cur_row, scroll=False)
+        except Exception:
+            pass
+        try:
+            self.scroll_to(y=saved_y, animate=False)
         except Exception:
             pass
 
@@ -3221,6 +3556,65 @@ class CyclePlanScreen(Screen):
 # ── App ──────────────────────────────────────────────────────────────────────
 
 
+def _render_pie_chart(sessions, width=30, height=15):
+    """Render an ASCII pie chart using Unicode blocks."""
+    if not sessions:
+        return "[dim]No data[/dim]"
+
+    # Use output_tokens for proportions (more meaningful than % which are all similar)
+    total_tokens = sum(s.get("output_tokens", 0) or 1 for s in sessions)
+
+    # Build angle ranges for each session
+    slices = []  # (start_angle, end_angle, color, label)
+    current_angle = -math.pi / 2  # Start from top (12 o'clock)
+    for s in sessions:
+        tokens = s.get("output_tokens", 0) or 1
+        sweep = 2 * math.pi * tokens / total_tokens
+        slices.append((current_angle, current_angle + sweep, s["color"], s.get("directive", "")[:15] or s["session_id"][:10]))
+        current_angle += sweep
+
+    # Render circle
+    cx, cy = width / 2, height / 2
+    # Account for terminal character aspect ratio (~2:1 width:height)
+    rx = width / 2 - 1  # radius x
+    ry = height / 2 - 0.5  # radius y
+
+    lines = []
+    for row in range(height):
+        line_chars = []
+        for col in range(width):
+            # Normalize to unit circle
+            dx = (col - cx) / rx if rx else 0
+            dy = (row - cy) / ry if ry else 0
+            dist = math.sqrt(dx * dx + dy * dy)
+
+            if dist > 1.0:
+                line_chars.append(" ")
+                continue
+
+            # Calculate angle
+            angle = math.atan2(dy, dx)
+
+            # Find which slice this angle belongs to
+            color = "white"
+            for start, end, c, _ in slices:
+                # Normalize angles
+                a = angle
+                s_a = start
+                # Handle wrap-around
+                while a < s_a:
+                    a += 2 * math.pi
+                if s_a <= a < end:
+                    color = c
+                    break
+
+            line_chars.append(f"[{color}]\u2588[/{color}]")
+
+        lines.append("".join(line_chars))
+
+    return "\n".join(lines)
+
+
 class TokenAttributionScreen(Screen):
     """Full-screen token attribution breakdown."""
 
@@ -3231,7 +3625,11 @@ class TokenAttributionScreen(Screen):
 
     def compose(self) -> ComposeResult:
         from textual.widgets import Footer
+        yield NavBar(active="nav-dashboard")
         yield Static(id="attr-header")
+        with Horizontal(id="attr-chart-row"):
+            yield Static(id="attr-pie")
+            yield Static(id="attr-legend")
         yield DataTable(id="attr-table")
         yield Footer()
 
@@ -3247,9 +3645,13 @@ class TokenAttributionScreen(Screen):
     def refresh_data(self):
         data = _get_token_attribution()
         header = self.query_one("#attr-header", Static)
+        pie_widget = self.query_one("#attr-pie", Static)
+        legend_widget = self.query_one("#attr-legend", Static)
 
         if not data or not data.get("sessions"):
             header.update("[bold]Token Attribution[/bold] \u2014 No data yet")
+            pie_widget.update("")
+            legend_widget.update("")
             return
 
         total = data["total_used_pct"]
@@ -3280,6 +3682,29 @@ class TokenAttributionScreen(Screen):
         bar = "".join(bar_chars)
         header.update(f"[bold]Who Ate My {total:.0f}%?[/bold]  5h rolling window\n{bar}")
 
+        # Render pie chart
+        pie_text = _render_pie_chart(sessions)
+        pie_widget.update(pie_text)
+
+        # Render legend
+        total_tokens = sum(s.get("output_tokens", 0) or 0 for s in sessions)
+        legend_lines = []
+        for s in sessions:
+            color = s["color"]
+            directive = s.get("directive", "")[:25] if s.get("directive") else s["session_id"][:12]
+            out_tokens = s.get("output_tokens", 0) or 0
+            if out_tokens >= 1_000_000:
+                tok_str = f"{out_tokens / 1_000_000:.1f}M"
+            elif out_tokens >= 1_000:
+                tok_str = f"{out_tokens / 1_000:.0f}K"
+            else:
+                tok_str = str(out_tokens)
+            pct_of_total = (out_tokens / total_tokens * 100) if total_tokens > 0 else 0
+            legend_lines.append(
+                f"[{color}]\u2588\u2588[/{color}] {directive:<25s} {tok_str:>6s} {pct_of_total:>4.0f}%"
+            )
+        legend_widget.update("\n".join(legend_lines))
+
         # Populate table
         table = self.query_one("#attr-table", DataTable)
         table.clear()
@@ -3308,6 +3733,193 @@ class TokenAttributionScreen(Screen):
             )
 
 
+
+class TestQueueView(LazyView):
+    """Test Queue — things that need manual verification after shipping."""
+
+    BINDINGS = [
+        Binding("p", "mark_pass", "Pass"),
+        Binding("f", "mark_fail", "Fail"),
+        Binding("s", "mark_skip", "Skip"),
+        Binding("d", "delete_item", "Delete"),
+        Binding("i", "import_qa", "Import QA"),
+        Binding("r", "reload", "Reload"),
+        Binding("a", "toggle_all", "All/Pending"),
+    ]
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self._items = []
+        self._filter_project = ""
+        self._show_all = False
+
+    def compose(self) -> ComposeResult:
+        yield Static(id="tq-header")
+        yield Static(id="tq-filters")
+        yield DataTable(id="tq-table")
+        yield Static(id="tq-footer")
+
+    def load_content(self):
+        self._reload_data()
+
+    def _reload_data(self):
+        status_filter = None if self._show_all else "pending"
+        project_filter = self._filter_project if self._filter_project else None
+        self._items = _get_test_queue(project=project_filter, status=status_filter)
+        self._render()
+
+    def _render(self):
+        pending = sum(1 for i in self._items if i.get("status") == "pending")
+        passed  = sum(1 for i in self._items if i.get("status") == "pass")
+        failed  = sum(1 for i in self._items if i.get("status") == "fail")
+        skipped = sum(1 for i in self._items if i.get("status") == "skip")
+
+        mode_label = "all" if self._show_all else "pending only"
+        proj_label = self._filter_project or "all projects"
+        self.query_one("#tq-header", Static).update(
+            f"[bold cyan]Test Queue[/bold cyan]  "
+            f"[yellow]{pending} pending[/yellow]  "
+            f"[green]{passed} passed[/green]  "
+            f"[red]{failed} failed[/red]  "
+            f"[dim]{skipped} skipped  ·  {mode_label}  ·  {proj_label}[/dim]"
+        )
+
+        # Project filter pills
+        projects = sorted({i.get("project", "") for i in self._items if i.get("project")})
+        pills = []
+        for p in [""] + projects:
+            active = p == self._filter_project
+            label = p or "all"
+            pills.append(f"[{'bold cyan' if active else 'dim'}][{label}][/{'bold cyan' if active else 'dim'}]")
+        self.query_one("#tq-filters", Static).update("  ".join(pills))
+
+        dt = self.query_one("#tq-table", DataTable)
+        dt.clear(columns=True)
+        dt.cursor_type = "row"
+        dt.zebra_stripes = True
+        dt.add_column("#",       width=4)
+        dt.add_column("Project", width=10)
+        dt.add_column("Title",   width=46)
+        dt.add_column("Src",     width=9)
+        dt.add_column("Route",   width=14)
+        dt.add_column("Pri",     width=5)
+        dt.add_column("Age",     width=6)
+        dt.add_column("St",      width=4)
+
+        if not self._items:
+            dt.add_row(
+                "—", "", Text("no items — press i to import Atlas QA tests", style="dim"),
+                "", "", "", "", "",
+            )
+        else:
+            now = datetime.now(timezone.utc)
+            for idx, item in enumerate(self._items, 1):
+                status = item.get("status", "pending")
+                st_icon = {
+                    "pending": Text("·", style="yellow"),
+                    "pass":    Text("✓", style="green"),
+                    "fail":    Text("✗", style="red"),
+                    "skip":    Text("−", style="dim"),
+                }.get(status, Text("·"))
+
+                pri = item.get("priority", "normal")
+                pri_style = "red" if pri in ("high", "critical") else ("yellow" if pri == "normal" else "dim")
+
+                try:
+                    created = datetime.fromisoformat(item["created_at"].replace("Z", "+00:00"))
+                    delta = now - created
+                    age = f"{delta.days}d" if delta.days > 0 else f"{delta.seconds // 3600}h"
+                except Exception:
+                    age = "—"
+
+                proj = item.get("project", "—")
+                proj_style = (
+                    "cyan" if proj == "atlas" else
+                    ("yellow" if proj == "kaa" else
+                    ("magenta" if proj == "paperclip" else "dim"))
+                )
+
+                src = item.get("source", "—")
+                src_ref = item.get("source_ref", "")
+                src_display = src[:4] + (f"/{src_ref[:4]}" if src_ref else "")
+
+                dt.add_row(
+                    str(idx),
+                    Text(proj, style=proj_style),
+                    Text(item.get("title", "—")[:46]),
+                    Text(src_display, style="dim"),
+                    Text(item.get("route", "—")[:14], style="dim"),
+                    Text(pri[:4], style=pri_style),
+                    Text(age, style="dim"),
+                    st_icon,
+                    key=item["id"],
+                )
+
+        self.query_one("#tq-footer", Static).update(
+            "[dim]p[/dim]=pass  [dim]f[/dim]=fail  [dim]s[/dim]=skip  "
+            "[dim]d[/dim]=delete  [dim]i[/dim]=import Atlas QA  "
+            "[dim]a[/dim]=toggle all/pending  [dim]r[/dim]=reload"
+        )
+
+    def _get_selected_id(self):
+        # type: () -> str
+        dt = self.query_one("#tq-table", DataTable)
+        if not dt.row_count:
+            return ""
+        try:
+            key = dt.get_row_at(dt.cursor_row)
+            # key is the row_key value we set (item UUID)
+            rk = dt._row_order[dt.cursor_row]
+            return str(rk) if rk else ""
+        except Exception:
+            return ""
+
+    def _mark_selected(self, status):
+        item_id = self._get_selected_id()
+        if item_id and not item_id.startswith("—"):
+            _update_test_item(item_id, status)
+            self._reload_data()
+
+    def action_mark_pass(self):
+        self._mark_selected("pass")
+
+    def action_mark_fail(self):
+        self._mark_selected("fail")
+
+    def action_mark_skip(self):
+        self._mark_selected("skip")
+
+    def action_delete_item(self):
+        item_id = self._get_selected_id()
+        if item_id and not item_id.startswith("—"):
+            _delete_test_item(item_id)
+            self._reload_data()
+
+    def action_import_qa(self):
+        self.query_one("#tq-header", Static).update(
+            "[yellow]Importing Atlas QA tests...[/yellow]"
+        )
+        try:
+            count = _import_atlas_qa_tests()
+            self._reload_data()
+            # Brief success message (will be overwritten by next _render)
+            if count == 0:
+                self.query_one("#tq-header", Static).update(
+                    "[dim]All Atlas QA tests already imported (nothing new)[/dim]"
+                )
+        except Exception as e:
+            self.query_one("#tq-header", Static).update(
+                f"[red]Import failed: {e}[/red]"
+            )
+
+    def action_reload(self):
+        self._reload_data()
+
+    def action_toggle_all(self):
+        self._show_all = not self._show_all
+        self._reload_data()
+
+
 class ClaudeWatchApp(App):
     CSS_PATH = "claude_watch_tui.tcss"
     TITLE = "claude-watch"
@@ -3325,16 +3937,21 @@ class ClaudeWatchApp(App):
         Binding("c", "show_capacity", "Capacity"),
         Binding("h", "toggle_health", "Health"),
         Binding("y", "show_cycles", "Cycles"),
+        Binding("x", "show_test", "Test"),
         Binding("w", "show_attribution", "Who?"),
         Binding("slash", "start_search", "Search"),
         Binding("tab", "focus_next", "Next panel", show=False),
         Binding("shift+tab", "focus_previous", "Prev panel", show=False),
+        Binding("R", "reload_build", "Reload", show=False),
     ]
 
     _filter_text = ""
+    _pending_reload = False
+    _revert_cooldown_until = 0.0
 
     def compose(self) -> ComposeResult:
         from textual.widgets import Input, Footer
+        yield ReloadBanner(id="reload-banner")
         yield NavBar(id="nav-bar")
         with ContentSwitcher(initial="view-dashboard", id="content-switcher"):
             with ScrollableContainer(id="view-dashboard"):
@@ -3360,6 +3977,7 @@ class ClaudeWatchApp(App):
             yield AccountCapacityView(id="view-capacity")
             yield LeaderboardView(id="view-leaderboard")
             yield CyclesView(id="view-cycles")
+            yield TestQueueView(id="view-test")
         yield Footer()
 
     def switch_view(self, view_id: str) -> None:
@@ -3382,6 +4000,7 @@ class ClaudeWatchApp(App):
             "view-capacity": "nav-capacity",
             "view-leaderboard": "nav-leaderboard",
             "view-cycles": "nav-cycles",
+            "view-test": "nav-test",
         }
         active_nav = nav_map.get(view_id, "")
         for btn in self.query("#nav-bar Button"):
@@ -3389,6 +4008,7 @@ class ClaudeWatchApp(App):
 
     def on_mount(self):
         _load_index()
+        _backup_working_files()
         self.build_index()
         # Hide search input, account capacity, and header (merged into burndown)
         self.query_one("#search-input").display = False
@@ -3403,9 +4023,77 @@ class ClaudeWatchApp(App):
     _RESTART_EXIT_CODE = 42
 
     def _trigger_reload(self):
-        """Restart the process when source files change."""
-        self.notify("Reloading...", severity="warning", timeout=1)
-        self.set_timer(0.5, lambda: self.exit(return_code=self._RESTART_EXIT_CODE))
+        """Legacy — redirects to safe reload flow."""
+        self._signal_files_changed()
+
+    def _signal_files_changed(self):
+        """Called from watcher thread when source files change. Auto-validates and restarts."""
+        import time as _time
+        if _time.time() < self._revert_cooldown_until:
+            return
+        self._pending_reload = True
+        try:
+            self.query_one("#reload-banner", ReloadBanner).show_pending()
+        except Exception:
+            pass
+        # Auto-validate and restart after brief delay
+        self.set_timer(1.0, self.action_reload_build)
+
+    def action_reload_build(self):
+        """Validate new code and restart if safe, or revert if broken."""
+        if not self._pending_reload:
+            return
+
+        import subprocess, sys
+        project_dir = str(Path(__file__).resolve().parent)
+
+        result = subprocess.run(
+            [sys.executable, "-c", "import claude_watch_data; import claude_watch_tui"],
+            cwd=project_dir,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+
+        if result.returncode == 0:
+            self._pending_reload = False
+            _backup_working_files()
+            self.notify("Reloading...", severity="warning", timeout=1)
+            self.set_timer(0.5, lambda: self.exit(return_code=self._RESTART_EXIT_CODE))
+        else:
+            import time as _time
+            error_msg = result.stderr or result.stdout or "Unknown import error"
+            self._log_build_error(error_msg)
+            restored = _restore_backup_files()
+            try:
+                banner = self.query_one("#reload-banner", ReloadBanner)
+                if restored:
+                    banner.show_reverted(error_msg)
+                    self.notify("Build broken \u2014 reverted to last working version", severity="error", timeout=10)
+                else:
+                    banner.show_reverted("No backup available!")
+                    self.notify("Build broken \u2014 no backup to revert to!", severity="error", timeout=10)
+            except Exception:
+                pass
+            self._pending_reload = False
+            self._revert_cooldown_until = _time.time() + 5
+
+    def _log_build_error(self, error_msg):
+        """Log build error for debugging."""
+        try:
+            log_dir = Path.home() / ".claude" / "logs"
+            log_dir.mkdir(parents=True, exist_ok=True)
+            log_file = log_dir / "claude-watch-build-errors.log"
+            from datetime import datetime
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            with open(log_file, "a") as f:
+                f.write(f"\n{'=' * 60}\n")
+                f.write(f"[{timestamp}] Build validation failed\n")
+                f.write(f"{'=' * 60}\n")
+                f.write(error_msg)
+                f.write("\n")
+        except Exception:
+            pass
 
     def build_index(self):
         import threading
@@ -3513,6 +4201,9 @@ class ClaudeWatchApp(App):
     def action_show_cycles(self):
         self.switch_view("view-cycles")
 
+    def action_show_test(self):
+        self.switch_view("view-test")
+
     def on_button_pressed(self, event: Button.Pressed) -> None:
         btn_map = {
             "nav-dashboard": "view-dashboard",
@@ -3522,8 +4213,14 @@ class ClaudeWatchApp(App):
             "nav-usage": "view-usage",
             "nav-mcp": "view-mcp",
             "nav-cycles": "view-cycles",
+            "nav-test": "view-test",
         }
         btn_id = event.button.id or ""
+        if not btn_id.startswith("nav-"):
+            return
+        # Pop to root first (handles nav from detail screens)
+        while len(self.screen_stack) > 1:
+            self.pop_screen()
         if btn_id in btn_map:
             self.switch_view(btn_map[btn_id])
         elif btn_id == "nav-health":
@@ -3672,6 +4369,204 @@ def _cli_list_sessions(args):
             ))
 
 
+def _snapshot_health_indicator(five, seven, alert_count):
+    """Return (color, label) for health dot."""
+    try:
+        f, s = float(five), float(seven)
+    except (ValueError, TypeError):
+        return "yellow", "UNKNOWN"
+    if f > 80 or s > 90 or alert_count > 0:
+        return "red", "RED"
+    if f > 50 or s > 70:
+        return "yellow", "YELLOW"
+    return "green", "GREEN"
+
+
+def _cli_snapshot():
+    """Print compact Rich-formatted token capacity snapshot and exit."""
+    from rich.console import Console
+
+    five, seven, five_reset_ts, seven_reset_ts = _current_pct()
+
+    # Gather all data
+    five_cd = _countdown(five_reset_ts)
+    seven_rd = _reset_day(seven_reset_ts)
+    acct_label, acct_name, acct_lane = _get_active_account()
+    pacing = _token_pacing()
+    sessions = _active_sessions()
+    daily = _get_daily_usage(days=1)
+    capacities = get_account_capacity_display()
+
+    # Compute daily tokens and cost
+    if daily and len(daily) > 0:
+        day_tokens = daily[0][1] if len(daily[0]) > 1 else 0
+    else:
+        day_tokens = 0
+    day_cost = _estimate_cost(day_tokens, "opus")
+    day_cost_str = _format_cost(day_cost)
+    if day_tokens >= 1_000_000:
+        tok_str = f"{day_tokens / 1_000_000:.1f}M"
+    elif day_tokens >= 1000:
+        tok_str = f"{day_tokens / 1000:.0f}k"
+    else:
+        tok_str = str(day_tokens)
+
+    session_count = len(sessions)
+    no_data = five == "?" and seven == "?"
+    health_color, health_label = _snapshot_health_indicator(five, seven, 0)
+
+    # JSON mode for piped output
+    if not sys.stdout.isatty():
+        import json as _json
+        payload = {
+            "account": {"label": acct_label, "name": acct_name, "lane": acct_lane},
+            "five_pct": five, "seven_pct": seven,
+            "five_reset": five_cd, "seven_reset": seven_rd,
+            "health": health_label,
+            "pacing": pacing,
+            "sessions_active": session_count,
+            "today_tokens": day_tokens,
+            "today_cost": day_cost,
+            "capacities": capacities,
+        }
+        print(_json.dumps(payload, default=str))
+        return
+
+    console = Console()
+
+    def _bar(pct_val, width=20):
+        try:
+            p = float(pct_val)
+        except (ValueError, TypeError):
+            return " " * width
+        p = max(0, min(100, p))
+        filled = int(p / 100 * width)
+        empty = width - filled
+        if p > 80:
+            color = "red"
+        elif p > 50:
+            color = "yellow"
+        else:
+            color = "green"
+        bar_text = Text()
+        bar_text.append("█" * filled, style=color)
+        bar_text.append("░" * empty, style="dim")
+        return bar_text
+
+    # Build content
+    content = Text()
+
+    # Account line
+    content.append(f"Account {acct_label}", style="bold")
+    content.append(f" ({acct_name}) ", style="")
+    content.append(acct_lane, style="dim")
+    content.append("\n\n")
+
+    if no_data:
+        content.append("No rate data", style="dim")
+        content.append("\n")
+    else:
+        # 5h bar
+        content.append("5h  ")
+        content.append_text(_bar(five))
+        try:
+            content.append(f"  {int(float(five)):>3}%", style="bold")
+        except (ValueError, TypeError):
+            content.append("    ?%")
+        # Extract just the time part from countdown
+        reset_short = five_cd.split(" (")[0] if " (" in five_cd else five_cd
+        content.append("  resets ", style="dim")
+        content.append(reset_short, style="dim")
+        content.append("\n")
+
+        # 7d bar
+        content.append("7d  ")
+        content.append_text(_bar(seven))
+        try:
+            content.append(f"  {int(float(seven)):>3}%", style="bold")
+        except (ValueError, TypeError):
+            content.append("    ?%")
+        content.append("  resets ", style="dim")
+        # Extract just day/month/date (e.g. "Mon Apr 13")
+        rd_parts = seven_rd.split(" ")
+        reset_day_short = " ".join(rd_parts[:3]) if len(rd_parts) >= 3 else seven_rd
+        content.append(reset_day_short, style="dim")
+        content.append("\n")
+
+    content.append("\n")
+
+    # Pacing line
+    if pacing is not None:
+        avg_burn = pacing.get("avg_burn", 0)
+        mins_to_100 = pacing.get("mins_to_100", 0)
+        mins_to_reset = pacing.get("mins_to_reset", 0)
+        burn_style = "bold" if avg_burn > 1.0 else ""
+        content.append("Burn: ", style="")
+        content.append(f"{avg_burn:.1f}%/min", style=burn_style)
+        hrs = int(mins_to_100 // 60)
+        mins = int(mins_to_100 % 60)
+        if mins_to_100 < mins_to_reset:
+            content.append(f" — 100% in ~{hrs}h{mins:02d}m")
+        else:
+            content.append(f" — 100% in ~{hrs}h{mins:02d}m (resets first)")
+        content.append("\n")
+
+    # Sessions + cost line
+    content.append(f"Sessions: {session_count} active", style="")
+    content.append(f"  Today: {tok_str} tok (~{day_cost_str})", style="")
+    content.append("\n")
+
+    # Other accounts footer
+    other_accts = [c for c in capacities if not c.get("is_active")]
+    if other_accts:
+        content.append("\n")
+        parts = []
+        for c in other_accts:
+            lbl = c.get("label", "?")
+            fp = c.get("five_pct")
+            sp = c.get("seven_pct")
+            if fp is None:
+                fp_str = "—"
+            else:
+                try:
+                    fp_str = f"{int(float(fp))}%"
+                except (ValueError, TypeError):
+                    fp_str = str(fp)
+            if sp is None:
+                sp_str = "—"
+            else:
+                try:
+                    sp_str = f"{int(float(sp))}%"
+                except (ValueError, TypeError):
+                    sp_str = str(sp)
+            parts.append(f"{lbl}: 5h:{fp_str} 7d:{sp_str}")
+        content.append("  ".join(parts), style="dim")
+        content.append("\n")
+
+    # Health indicator for title
+    health_dot = Text()
+    health_dot.append("● ", style=health_color)
+    health_dot.append(health_label, style=health_color)
+
+    title = Text()
+    title.append(" Token Capacity ")
+
+    subtitle_text = Text()
+    subtitle_text.append(" ")
+    subtitle_text.append_text(health_dot)
+    subtitle_text.append(" ")
+
+    panel = Panel(
+        content,
+        title=title,
+        subtitle=subtitle_text,
+        border_style="bright_cyan",
+        width=56,
+        padding=(0, 1),
+    )
+    console.print(panel)
+
+
 def main():
     import argparse
     import sys
@@ -3679,6 +4574,7 @@ def main():
     parser.add_argument("-s", "--session", help="Look up session by CCID or UUID prefix")
     parser.add_argument("-l", "--list", action="store_true", help="List recent sessions")
     parser.add_argument("--context", action="store_true", help="Include resume context (with --session)")
+    parser.add_argument("--snapshot", action="store_true", help="Print compact capacity snapshot and exit")
     args = parser.parse_args()
 
     if args.session:
@@ -3687,12 +4583,17 @@ def main():
     if args.list:
         _cli_list_sessions(args)
         return
+    if args.snapshot:
+        _cli_snapshot()
+        return
 
     while True:
         app = ClaudeWatchApp()
         result = app.run()
         if result != ClaudeWatchApp._RESTART_EXIT_CODE:
             break
+        # Full process restart so Python re-imports all modules from disk
+        os.execv(sys.executable, [sys.executable] + sys.argv)
 
 
 if __name__ == "__main__":

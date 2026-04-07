@@ -30,6 +30,13 @@ Screen {
     text-style: bold;
 }
 
+/* -- Reload Banner -- */
+#reload-banner {
+    dock: top;
+    height: 1;
+    display: none;
+}
+
 #content-switcher {
     height: 1fr;
 }
@@ -260,10 +267,31 @@ DataTable > .datatable--header {
     margin: 0 0 0 1;
 }
 
+#cm-objective {
+    height: auto;
+    max-height: 4;
+    padding: 0 1;
+}
+
 #cm-table {
     height: 1fr;
     border: solid green;
     border-title-color: white;
+}
+
+#cm-lanes-row {
+    height: auto;
+    max-height: 12;
+    min-height: 4;
+    padding: 0 1;
+}
+
+#cm-lane-1, #cm-lane-2, #cm-lane-3 {
+    width: 1fr;
+    height: auto;
+    border: solid $accent;
+    padding: 0 1;
+    margin: 0 1 0 0;
 }
 
 #cm-prev {
