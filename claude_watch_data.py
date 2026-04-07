@@ -69,6 +69,14 @@ _load_paperclip_map()
 
 # ── helpers ──────────────────────────────────────────────────────────────────
 
+def _safe_float(val, default=0.0):
+    """Convert val to float, returning default if it's '?' or non-numeric."""
+    try:
+        return float(val)
+    except (ValueError, TypeError):
+        return default
+
+
 def _current_pct():
     """Returns (five, seven, five_reset_ts, seven_reset_ts)."""
     try:
@@ -169,9 +177,9 @@ def _active_sessions():
                 delta = "?"
                 try:
                     state_parts = Path(f"/tmp/claude-token-state-{pid}").read_text().split()
-                    start_pct = float(state_parts[0])
-                    start_epoch = float(state_parts[1]) if len(state_parts) > 1 else 0
-                    cur = float(_current_pct()[0])
+                    start_pct = _safe_float(state_parts[0])
+                    start_epoch = _safe_float(state_parts[1]) if len(state_parts) > 1 else 0
+                    cur = _safe_float(_current_pct()[0])
                     raw_delta = round(cur - start_pct, 1)
                     # Fix ghost session: if session just started and shows huge delta,
                     # it's measuring global drift, not actual consumption
@@ -1313,7 +1321,7 @@ def _get_session_history():
             pe = _interpolate_five_pct(last_ts)
             if ps is not None and pe is not None:
                 try:
-                    d_pct = round(float(pe) - float(ps), 1)
+                    d_pct = round(_safe_float(pe) - _safe_float(ps), 1)
                     if d_pct < -5:
                         pct_str = "↻win"  # 5h window reset during session
                     else:
@@ -1953,7 +1961,7 @@ def _get_call_history():
 
         # 5h% used
         try:
-            delta = float(s["five_pct_end"]) - float(s["five_pct_start"])
+            delta = _safe_float(s["five_pct_end"]) - _safe_float(s["five_pct_start"])
             if delta < -5:
                 pct_str = "↻win"
             else:
@@ -2088,7 +2096,7 @@ def _compute_tool_feed_rows(last_n=200):
         tick = None
         if cur_pct is not None and prev is not None:
             try:
-                diff = float(cur_pct) - float(prev)
+                diff = _safe_float(cur_pct) - _safe_float(prev)
                 if diff > 0:
                     tick = diff
             except Exception:
@@ -2101,7 +2109,7 @@ def _compute_tool_feed_rows(last_n=200):
             delta_style = "bold red" if tick >= 2 else "bold yellow"
         elif cumulative:
             try:
-                c = float(cumulative)
+                c = _safe_float(cumulative)
                 delta_str = f"+{c:.1f}%" if c > 0 else "—"
                 delta_style = "dim"
             except Exception:
@@ -2135,8 +2143,8 @@ def _drain_status(drain_events):
         return "dim", "● No drain data yet"
     last = drain_events[-1]
     try:
-        delta = float(last.get("delta_5h", 0))
-        burn = float(last.get("burn_rate_per_min", 0))
+        delta = _safe_float(last.get("delta_5h", 0))
+        burn = _safe_float(last.get("burn_rate_per_min", 0))
         sessions = int(last.get("cli_sessions", 0))
     except Exception:
         return "dim", "● Status unknown"
@@ -2176,7 +2184,7 @@ def _get_burndown_data():
         mins_total = 300.0  # 5 hours
         mins_elapsed = max(0, (now_utc - window_start).total_seconds() / 60)
         mins_to_reset = max(0, (reset - now_utc).total_seconds() / 60)
-        remaining_pct = 100.0 - float(five)
+        remaining_pct = 100.0 - _safe_float(five)
     except Exception:
         return {}
 
@@ -2194,7 +2202,7 @@ def _get_burndown_data():
             if ts < window_start:
                 continue
             elapsed = (ts - window_start).total_seconds() / 60
-            raw_points.append((elapsed, 100.0 - float(pct)))
+            raw_points.append((elapsed, 100.0 - _safe_float(pct)))
         except Exception:
             continue
 
@@ -3191,7 +3199,7 @@ def make_drain_panel():
             burn = e.get("burn_rate_per_min", 0)
             sessions = e.get("cli_sessions", "?")
             desktop = "YES" if e.get("desktop") else "no"
-            burn_color = "red" if float(burn) > 1 else "yellow"
+            burn_color = "red" if _safe_float(burn) > 1 else "yellow"
             t.add_row(
                 f"[dim]{ts_str}[/dim]", f"[red]+{delta}%[/red]",
                 f"[{burn_color}]{burn:.2f}%[/{burn_color}]", str(sessions),
@@ -3306,7 +3314,7 @@ def _score_window(window_start_ts, window_reset_ts):
     last_five = 0
     for e in reversed(window_entries):
         if e.get("five_pct") is not None:
-            last_five = float(e["five_pct"])
+            last_five = _safe_float(e["five_pct"])
             break
     burn_score = _score_dimension(last_five, 95.0)
 

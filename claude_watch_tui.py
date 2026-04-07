@@ -26,6 +26,7 @@ from rich.table import Table as RichTable
 from claude_watch_data import (
     make_urgent_panel,
     _abbrev_model,
+    _safe_float,
     _active_pids,
     _active_sessions,
     _build_or_update_index,
@@ -1076,8 +1077,8 @@ class BurndownChart(Static):
         # Build right-side lines (aligned with chart rows)
         r = [
             f"  [bold {used_color}]{used_pct:.0f}% Used[/bold {used_color}]  [bold {left_color}]{remaining:.0f}% Left[/bold {left_color}]",
-            f"  [bold]5h[/bold] {mini_bar(five)} {float(five):.0f}%  [dim]resets {reset_str}[/dim]",
-            f"  [bold]7d[/bold] {mini_bar(seven)} {float(seven):.0f}%  [dim]{_reset_day(sr)[:10]}[/dim]",
+            f"  [bold]5h[/bold] {mini_bar(five)} {_safe_float(five):.0f}%  [dim]resets {reset_str}[/dim]",
+            f"  [bold]7d[/bold] {mini_bar(seven)} {_safe_float(seven):.0f}%  [dim]{_reset_day(sr)[:10]}[/dim]",
             f"  [{five_zcolor}]{five_zone}[/{five_zcolor}] 5h  [{seven_zcolor}]{seven_zone}[/{seven_zcolor}] 7d",
             f"  [{acct_color}]Acct {label}[/{acct_color}]: {name} [dim]({lane})[/dim]",
             f"  {pace_str}",
@@ -1808,7 +1809,14 @@ class SessionTasksView(LazyView):
     CAT_ICONS = {"bug": "\U0001f41b", "task": "\u2610", "idea": "\U0001f4a1", "direction": "\U0001f9ed"}
     STATUS_ICONS = {"open": "\u25cf", "done": "\u2713", "rolled": "\u2192"}
     CAT_ORDER = ["bug", "task", "idea", "direction"]
-    PROJECTS = ["", "atlas", "claude-watch", "paperclip", "openclaw", "frank", "kaa"]
+    PROJECTS = ["", "delphi", "kaa", "frank", "sage"]
+    COMPANY_PROJECTS = {
+        "delphi": ["atlas", "Atlas"],
+        "kaa": ["kaa", "KAA"],
+        "frank": ["frank", "Frank"],
+        "sage": ["claude-watch", "CW", "openclaw", "OClaw", "paperclip", "Paper", "battlestation"],
+    }
+    COMPANY_LABELS = {"delphi": "Delphi", "kaa": "KAA", "frank": "Frank", "sage": "SAGE"}
     PROJECT_LABELS = {"": "None", "atlas": "Atlas", "claude-watch": "CW", "paperclip": "Paper",
                       "openclaw": "OClaw", "frank": "Frank", "kaa": "KAA"}
 
@@ -1825,6 +1833,7 @@ class SessionTasksView(LazyView):
     def compose(self) -> ComposeResult:
         from textual.widgets import Input
         yield Static(id="cm-header")
+        yield Static(id="cm-objective")
         with Horizontal(id="cm-add-row"):
             yield Input(id="cm-add-input", placeholder="Add item... (Tab=cat, Shift+Tab=project, Enter=save)")
             yield Button("Task \u2610", id="cm-cat-task", classes="cm-cat", variant="primary")
@@ -1832,20 +1841,22 @@ class SessionTasksView(LazyView):
             yield Button("Idea \U0001f4a1", id="cm-cat-idea", classes="cm-cat", variant="default")
             yield Button("Dir \U0001f9ed", id="cm-cat-dir", classes="cm-cat", variant="default")
         with Horizontal(id="cm-project-row"):
-            yield Button("All", id="cm-proj-all", classes="cm-proj")
-            yield Button("None", id="cm-proj-none", classes="cm-proj", variant="primary")
-            yield Button("Atlas", id="cm-proj-atlas", classes="cm-proj")
-            yield Button("CW", id="cm-proj-claude-watch", classes="cm-proj")
-            yield Button("Paper", id="cm-proj-paperclip", classes="cm-proj")
-            yield Button("OClaw", id="cm-proj-openclaw", classes="cm-proj")
-            yield Button("Frank", id="cm-proj-frank", classes="cm-proj")
+            yield Button("All", id="cm-proj-all", classes="cm-proj", variant="primary")
+            yield Button("None", id="cm-proj-none", classes="cm-proj")
+            yield Button("Delphi", id="cm-proj-delphi", classes="cm-proj")
             yield Button("KAA", id="cm-proj-kaa", classes="cm-proj")
+            yield Button("Frank", id="cm-proj-frank", classes="cm-proj")
+            yield Button("SAGE", id="cm-proj-sage", classes="cm-proj")
         yield DataTable(id="cm-table")
+        with Horizontal(id="cm-lanes-row"):
+            yield Static(id="cm-lane-1")
+            yield Static(id="cm-lane-2")
+            yield Static(id="cm-lane-3")
         yield Static(id="cm-prev")
 
     def load_content(self):
         self._category = "task"
-        self._project = ""
+        self._project = None  # None = All (no filter), "" = None/unassigned
         self._items = []
         self._window_start = ""
         self._editing_id = None
@@ -1872,8 +1883,10 @@ class SessionTasksView(LazyView):
         dt.add_column("Cat", width=5)
         dt.add_column("St", width=3)
         dt.add_column("Title", width=45)
-        dt.add_column("Project", width=12)
-        dt.add_column("Age", width=8)
+        dt.add_column("Co", width=8)
+        dt.add_column("Project", width=10)
+        dt.add_column("Lane", width=6)
+        dt.add_column("Age", width=6)
 
         self._reload()
 
@@ -1894,17 +1907,35 @@ class SessionTasksView(LazyView):
     def _reload(self):
         from claude_watch_data import (
             _get_cycle_items, _get_recent_cycle_summaries, _get_current_cycle,
+            _get_cycle_plan,
         )
 
         # Fetch items
         self._items = _get_cycle_items(self._window_start, all_windows=self._show_all_windows)
 
-        # Apply filter if active
+        # Apply company filter (None = All/no filter, "" = unassigned, else = company key)
         display_items = self._items
+        if self._project is not None and self._project in self.COMPANY_PROJECTS:
+            allowed = [p.lower() for p in self.COMPANY_PROJECTS[self._project]]
+            display_items = [
+                i for i in display_items
+                if (i.get("project") or "").lower() in allowed
+            ]
+        elif self._project == "":
+            # "None" = show items not belonging to any company
+            all_known = set()
+            for projs in self.COMPANY_PROJECTS.values():
+                all_known.update(p.lower() for p in projs)
+            display_items = [
+                i for i in display_items
+                if (i.get("project") or "").lower() not in all_known
+            ]
+
+        # Apply text filter if active
         if self._filter_text:
             ft = self._filter_text.lower()
             display_items = [
-                i for i in self._items
+                i for i in display_items
                 if ft in (i.get("title") or "").lower()
                 or ft in (i.get("project") or "").lower()
             ]
@@ -1934,6 +1965,7 @@ class SessionTasksView(LazyView):
                     Text("", style="dim"),
                     Text("", style="dim"),
                     Text("", style="dim"),
+                    Text("", style="dim"),
                     key=f"sep-{cat}",
                 )
             first_group = False
@@ -1944,12 +1976,20 @@ class SessionTasksView(LazyView):
                 st_style = "green" if status == "done" else ("dim" if status == "rolled" else "")
                 title = item.get("title", "")[:45]
                 project = item.get("project", "")[:12]
+                # Derive company from project
+                item_proj_lower = (item.get("project") or "").lower()
+                company = ""
+                for comp, projs in self.COMPANY_PROJECTS.items():
+                    if item_proj_lower in [p.lower() for p in projs]:
+                        company = self.COMPANY_LABELS.get(comp, comp)
+                        break
                 age = self._fmt_age(item.get("created_at", ""))
 
                 dt.add_row(
                     Text(cat_icon),
                     Text(st_icon, style=st_style),
                     Text(title, style="strike" if status == "done" else ""),
+                    Text(company, style="magenta"),
                     Text(project, style="cyan"),
                     Text(age, style="dim"),
                     key=f"ci-{item['id']}",
@@ -1960,6 +2000,7 @@ class SessionTasksView(LazyView):
                 Text(""),
                 Text(""),
                 Text("No items yet — press n to add", style="dim"),
+                Text(""),
                 Text(""),
                 Text(""),
             )
@@ -1981,6 +2022,50 @@ class SessionTasksView(LazyView):
             f"[green]{open_count} open[/green]  [dim]{done_count} done[/dim]{filter_str}  "
             f"[dim](n=add  /=filter  a=all  Enter=edit  x=done  r=roll  d=delete  q=back)[/dim]"
         )
+
+        # Objective banner from cycle plan
+        obj_text = ""
+        plan = _get_cycle_plan(self._window_start) if self._window_start else None
+        if plan:
+            obj = plan.get("objective", "")
+            process = plan.get("process", "")
+            lanes = plan.get("lanes", {})
+            if obj:
+                parts = [f"[bold magenta]OBJ:[/bold magenta] [bold white]{obj}[/bold white]"]
+                if process:
+                    parts.append(f"  [dim]{process}[/dim]")
+                if lanes:
+                    lane_strs = [f"[cyan]{k}[/cyan]" for k in lanes]
+                    parts.append(f"  Lanes: {' | '.join(lane_strs)}")
+                obj_text = "\n".join(parts)
+        self.query_one("#cm-objective", Static).update(obj_text)
+
+        # Lane visualization
+        lane_widgets = ["#cm-lane-1", "#cm-lane-2", "#cm-lane-3"]
+        if plan and plan.get("lanes"):
+            lane_keys = list(plan["lanes"].keys())
+            for idx, widget_id in enumerate(lane_widgets):
+                if idx < len(lane_keys):
+                    lane_name = lane_keys[idx]
+                    lane_data = plan["lanes"][lane_name]
+                    lane_tasks = lane_data.get("tasks", [])
+                    # Match cycle items to lane tasks
+                    lane_lines = [f"[bold cyan]{lane_name}[/bold cyan]"]
+                    for task_title in lane_tasks:
+                        # Check if this task is done in cycle items
+                        done = any(
+                            task_title.lower() in (i.get("title") or "").lower()
+                            and i.get("status") == "done"
+                            for i in self._items
+                        )
+                        icon = "[green]\u2713[/green]" if done else "[dim]\u25cb[/dim]"
+                        lane_lines.append(f" {icon} {task_title[:30]}")
+                    self.query_one(widget_id, Static).update("\n".join(lane_lines))
+                else:
+                    self.query_one(widget_id, Static).update("")
+        else:
+            for widget_id in lane_widgets:
+                self.query_one(widget_id, Static).update("")
 
         # Previous cycles
         summaries = _get_recent_cycle_summaries(limit=3)
@@ -2046,14 +2131,12 @@ class SessionTasksView(LazyView):
 
     def _update_project_buttons(self):
         all_btn = self.query_one("#cm-proj-all", Button)
-        all_btn.variant = "primary" if self._show_all_windows else "default"
-        for proj in self.PROJECTS:
-            pid = proj or "none"
-            btn = self.query_one(f"#cm-proj-{pid}", Button)
-            if self._show_all_windows:
-                btn.variant = "default"
-            else:
-                btn.variant = "primary" if proj == self._project else "default"
+        all_btn.variant = "primary" if (self._project is None and not self._show_all_windows) or self._show_all_windows else "default"
+        none_btn = self.query_one("#cm-proj-none", Button)
+        none_btn.variant = "primary" if self._project == "" and not self._show_all_windows else "default"
+        for company in ["delphi", "kaa", "frank", "sage"]:
+            btn = self.query_one(f"#cm-proj-{company}", Button)
+            btn.variant = "primary" if company == self._project else "default"
 
     def on_key(self, event):
         from textual.widgets import Input
@@ -2085,8 +2168,9 @@ class SessionTasksView(LazyView):
         elif event.key == "shift+tab":
             event.prevent_default()
             event.stop()
-            idx = self.PROJECTS.index(self._project) if self._project in self.PROJECTS else 0
-            self._project = self.PROJECTS[(idx + 1) % len(self.PROJECTS)]
+            company_cycle = [None, "delphi", "kaa", "frank", "sage"]
+            idx = company_cycle.index(self._project) if self._project in company_cycle else 0
+            self._project = company_cycle[(idx + 1) % len(company_cycle)]
             self._update_project_buttons()
 
     def on_input_submitted(self, event):
@@ -2105,11 +2189,13 @@ class SessionTasksView(LazyView):
         title = event.value.strip()
         if not title:
             return
+        proj_map = {"delphi": "Atlas", "kaa": "KAA", "frank": "Frank", "sage": "CW"}
+        store_proj = proj_map.get(self._project, self._project or "")
         if self._editing_id:
-            _update_cycle_item(self._editing_id, {"title": title, "category": self._category, "project": self._project})
+            _update_cycle_item(self._editing_id, {"title": title, "category": self._category, "project": store_proj})
             self._editing_id = None
         else:
-            _post_cycle_item(self._window_start, self._category, title, project=self._project)
+            _post_cycle_item(self._window_start, self._category, title, project=store_proj)
         inp.value = ""
         self._reload()
         self.query_one("#cm-table", DataTable).focus()
@@ -2126,12 +2212,19 @@ class SessionTasksView(LazyView):
                 btn = self.query_one(f"#{bid}", Button)
                 btn.variant = "primary" if cat == self._category else "default"
         elif btn_id == "cm-proj-all":
-            self._show_all_windows = not self._show_all_windows
+            if self._show_all_windows:
+                self._show_all_windows = False
+            self._project = None  # All = no filter
+            self._update_project_buttons()
+            self._reload()
+        elif btn_id == "cm-proj-none":
+            self._project = ""  # None = unassigned items
+            self._show_all_windows = False
             self._update_project_buttons()
             self._reload()
         elif btn_id.startswith("cm-proj-"):
             proj_key = btn_id.removeprefix("cm-proj-")
-            self._project = "" if proj_key == "none" else proj_key
+            self._project = proj_key
             self._show_all_windows = False
             self._update_project_buttons()
             self._reload()
@@ -2160,8 +2253,14 @@ class SessionTasksView(LazyView):
         for cat, btn_id in cat_map.items():
             btn = self.query_one(btn_id, Button)
             btn.variant = "primary" if cat == self._category else "default"
-        # Set project and update buttons
-        self._project = item.get("project", "")
+        # Reverse-map project name to company key
+        item_proj = (item.get("project") or "").lower()
+        company = ""
+        for comp, projs in self.COMPANY_PROJECTS.items():
+            if item_proj in [p.lower() for p in projs]:
+                company = comp
+                break
+        self._project = company
         self._update_project_buttons()
         # Store editing state
         self._editing_id = item["id"]
