@@ -93,7 +93,8 @@ def _countdown(reset_ts):
             return "resetting..."
         h, rem = divmod(diff, 3600)
         m = rem // 60
-        return f"{h}h{m:02d}m"
+        local_time = reset.astimezone().strftime("%-I:%M %p")
+        return f"{h}h{m:02d}m (at {local_time})"
     except Exception:
         return "?"
 
@@ -103,7 +104,7 @@ def _reset_day(reset_ts):
         return "?"
     try:
         dt = datetime.fromisoformat(reset_ts.replace("Z", "+00:00")).astimezone()
-        return dt.strftime(f"%a %b {dt.day}")
+        return dt.strftime(f"%a %b {dt.day} %-I:%M %p")
     except Exception:
         return "?"
 
@@ -1268,6 +1269,36 @@ def _find_transcript(session_id):
     return None
 
 
+_MODEL_OUTPUT_COST_PER_MTOK = {
+    "opus": 75.0,
+    "sonnet": 15.0,
+    "haiku": 1.25,
+}
+
+
+def _estimate_cost(output_tokens, model_str):
+    # type: (int, str) -> float
+    """Estimate session cost in USD from output tokens and model name."""
+    model_lower = (model_str or "").lower()
+    cost_per_mtok = 15.0  # default to sonnet
+    for key, rate in _MODEL_OUTPUT_COST_PER_MTOK.items():
+        if key in model_lower:
+            cost_per_mtok = rate
+            break
+    return output_tokens * cost_per_mtok / 1_000_000
+
+
+def _format_cost(cost):
+    # type: (float) -> str
+    """Format cost as string: $0.12 or <$0.01."""
+    if cost < 0.01:
+        return "<$0.01"
+    elif cost < 1.0:
+        return f"${cost:.2f}"
+    else:
+        return f"${cost:.1f}"
+
+
 def _get_session_turns(session_id):
     """Parse transcript into per-turn breakdown.
     Returns list of dicts: turn_num, tokens_in, tokens_out, model, tools, prompt_preview
@@ -2203,6 +2234,48 @@ def _get_active_account():
         return "?", "?", "?"
 
 
+def _get_all_account_capacities():
+    # type: () -> list
+    """Return capacity info for all accounts. Live data only for active account."""
+    five, seven, five_reset_ts, seven_reset_ts = _current_pct()
+    try:
+        d = json.loads((Path.home() / ".claude/accounts.json").read_text())
+        active_label = d.get("active", "?")
+        accounts = d.get("accounts", [])
+    except Exception:
+        return []
+
+    result = []
+    for acct in accounts:
+        label = acct.get("label", "?")
+        is_active = label == active_label
+        result.append({
+            "label": label,
+            "name": acct.get("name", "?"),
+            "lane": acct.get("lane", "?"),
+            "active": is_active,
+            "five_pct": five if is_active else "—",
+            "seven_pct": seven if is_active else "—",
+            "five_reset": five_reset_ts if is_active else "",
+            "seven_reset": seven_reset_ts if is_active else "",
+        })
+    return result
+
+
+def _burn_mode():
+    """Return burn mode state: (active, remaining_secs) or (False, 0)."""
+    burn_file = Path("~/.claude/burn-mode.json").expanduser()
+    try:
+        with open(burn_file) as f:
+            data = json.load(f)
+        now = time.time()
+        if data.get("active") and data.get("expires", 0) > now:
+            return True, int(data["expires"] - now)
+    except Exception:
+        pass
+    return False, 0
+
+
 def make_header(five, seven, five_reset_ts, seven_reset_ts):
     budget = _budget()
     def bar(pct, width=20):
@@ -2248,7 +2321,13 @@ def make_header(five, seven, five_reset_ts, seven_reset_ts):
                 pace_str = f"[green]~{pacing['remaining_pct']:.0f}% left[/green] at {burn:.1f}%/min — resets first"
         t.add_row(pace_str, "")
 
-    return Panel(t, title="[bold white]Token Monitor[/bold white]", border_style="bright_blue")
+    burn_active, burn_secs = _burn_mode()
+    title = "[bold white]Token Monitor[/bold white]"
+    if burn_active:
+        burn_min = burn_secs // 60
+        burn_sec = burn_secs % 60
+        title += f"  [bold magenta]BURN MODE {burn_min}m {burn_sec:02d}s[/bold magenta]"
+    return Panel(t, title=title, border_style="bright_blue")
 
 
 def make_urgent_panel():
@@ -2585,3 +2664,73 @@ def make_drain_panel():
                 f"[bold red]{desktop}[/bold red]" if desktop == "YES" else f"[dim]{desktop}[/dim]",
             )
     return Panel(t, title="[bold]Passive Drain[/bold]  [dim](non-zero only)[/dim]", border_style="yellow")
+
+
+# ── session tasks (Supabase) ────────────────────────────────────────────────
+
+def _get_session_tasks(session_id=None, today_only=True):
+    """Fetch session tasks from Supabase.
+
+    Args:
+        session_id: Filter to specific session (e.g. 'cc-12345'). None = all.
+        today_only: If True and no session_id, only fetch today's tasks.
+
+    Returns: list of dicts with keys:
+        id, session_id, working_session, task_name, project, status,
+        started_at, completed_at, artifacts, notes, created_at
+    """
+    import urllib.request
+    import json as _json
+
+    url = "https://zoirudjyqfqvpxsrxepr.supabase.co/rest/v1/session_tasks"
+    params = ["order=created_at.desc", "limit=100"]
+    if session_id:
+        params.append(f"session_id=eq.{session_id}")
+    elif today_only:
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%dT00:00:00Z")
+        params.append(f"created_at=gte.{today}")
+
+    full_url = url + "?" + "&".join(params)
+    key = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InpvaXJ1ZGp5cWZxdnB4c3J4ZXByIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjgwMzE4MjgsImV4cCI6MjA4MzYwNzgyOH0.6W6OzRfJ-nmKN_23z1OBCS4Cr-ODRq9DJmF_yMwOCfo"
+
+    req = urllib.request.Request(full_url, headers={
+        "apikey": key,
+        "Authorization": f"Bearer {key}",
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            return _json.loads(resp.read())
+    except Exception:
+        return []
+
+
+def _get_project_tasks(project=None):
+    """Fetch project tasks from Supabase.
+
+    Args:
+        project: Filter to specific project. None = all.
+
+    Returns: list of dicts with keys:
+        id, project, task_name, phase, status, build_order, claimed_by,
+        route, file_path, notes, notion_ref, figma_ref, created_at, updated_at
+    """
+    import urllib.request
+    import json as _json
+
+    url = "https://zoirudjyqfqvpxsrxepr.supabase.co/rest/v1/project_tasks"
+    params = ["order=build_order.asc.nullslast,created_at.desc", "limit=200"]
+    if project:
+        params.append(f"project=eq.{project}")
+
+    full_url = url + "?" + "&".join(params)
+    key = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InpvaXJ1ZGp5cWZxdnB4c3J4ZXByIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjgwMzE4MjgsImV4cCI6MjA4MzYwNzgyOH0.6W6OzRfJ-nmKN_23z1OBCS4Cr-ODRq9DJmF_yMwOCfo"
+
+    req = urllib.request.Request(full_url, headers={
+        "apikey": key,
+        "Authorization": f"Bearer {key}",
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            return _json.loads(resp.read())
+    except Exception:
+        return []

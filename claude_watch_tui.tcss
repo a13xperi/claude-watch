@@ -2,6 +2,34 @@ Screen {
     layout: vertical;
 }
 
+/* ── Nav Bar ── */
+#nav-bar {
+    height: 3;
+    dock: top;
+    background: $surface;
+    padding: 0 1;
+}
+
+#nav-bar Button {
+    min-width: 12;
+    height: 3;
+    margin: 0 1 0 0;
+    border: none;
+    background: $surface-darken-1;
+    color: $text-muted;
+}
+
+#nav-bar Button:hover {
+    background: $primary-darken-1;
+    color: $text;
+}
+
+#nav-bar Button.-primary {
+    background: $primary;
+    color: $text;
+    text-style: bold;
+}
+
 #main-scroll {
     height: 1fr;
 }
@@ -18,10 +46,15 @@ Screen {
     max-height: 7;
 }
 
+/* ── Account Capacity (toggle with 'a') ── */
+#account-capacity {
+    height: auto;
+    max-height: 6;
+}
+
 /* ── Active Sessions (interactive DataTable — Enter/f to focus terminal) ── */
 #active-sessions {
     height: auto;
-    max-height: 14;
     border: solid cyan;
     border-title-color: white;
     border-title-style: bold;
@@ -31,25 +64,7 @@ Screen {
     border: tall $accent;
 }
 
-/* ── History row: Call History + Session History side-by-side ── */
-#history-row {
-    layout: horizontal;
-    height: 2fr;
-    min-height: 14;
-}
-
-#call-history {
-    width: 1fr;
-    height: 100%;
-    border: solid green;
-    border-title-color: white;
-    border-title-style: bold;
-}
-
-#call-history:focus {
-    border: tall $accent;
-}
-
+/* ── Session History (Call History merged in) ── */
 #session-history {
     width: 1fr;
     height: 1fr;
@@ -91,7 +106,7 @@ Screen {
 /* ── Burndown chart ── */
 #burndown {
     height: auto;
-    max-height: 8;
+    max-height: 10;
 }
 
 /* ── Search input ── */
@@ -105,7 +120,6 @@ Screen {
 /* ── System Health ── */
 #system-health {
     height: auto;
-    max-height: 12;
 }
 
 /* ── Drill-down screen ── */
@@ -151,4 +165,43 @@ DataTable {
 
 DataTable > .datatable--header {
     text-style: bold;
+}
+
+/* ── Session Tasks screen ── */
+#stasks-header {
+    height: auto;
+    max-height: 2;
+    padding: 0 1;
+}
+
+#stasks-table {
+    height: 1fr;
+    border: solid green;
+    border-title-color: white;
+}
+
+/* ── Project Board screen ── */
+#pboard-header {
+    height: auto;
+    max-height: 2;
+    padding: 0 1;
+}
+
+#pboard-body {
+    layout: horizontal;
+    height: 1fr;
+}
+
+#pboard-summary {
+    width: 1fr;
+    max-width: 40;
+    height: auto;
+    max-height: 20;
+}
+
+#pboard-table {
+    width: 3fr;
+    height: 1fr;
+    border: solid yellow;
+    border-title-color: white;
 }

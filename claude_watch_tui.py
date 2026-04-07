@@ -15,9 +15,9 @@ from pathlib import Path
 from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import Horizontal, ScrollableContainer
+from textual.containers import Horizontal, ScrollableContainer, Vertical
 from textual.screen import Screen
-from textual.widgets import DataTable, Static
+from textual.widgets import Button, DataTable, Static
 
 from rich.panel import Panel
 from rich.table import Table as RichTable
@@ -32,7 +32,9 @@ from claude_watch_data import (
     _countdown,
     _current_pct,
     _etime_to_secs,
+    _estimate_cost,
     _extract_accomplishments,
+    _format_cost,
     _get_agent_stats,
     _get_burndown_data,
     _get_call_data_map,
@@ -113,6 +115,47 @@ class UrgentAlerts(Static):
 class TokenHeader(Static):
     def update_content(self, five, seven, fr, sr):
         self.update(make_header(five, seven, fr, sr))
+
+
+class AccountCapacityPanel(Static):
+    """Compact side-by-side view of all Claude accounts."""
+
+    def update_content(self):
+        from claude_watch_data import _get_all_account_capacities
+        accounts = _get_all_account_capacities()
+        if not accounts:
+            self.update("")
+            self.display = False
+            return
+
+        def mini_bar(pct_str, width=6):
+            try:
+                pct = float(pct_str)
+                filled = int(pct * width / 100)
+                color = "green" if pct < 50 else ("yellow" if pct < 75 else "red")
+                return f"[{color}]{'█' * filled}{'░' * (width - filled)}[/{color}] {pct:.0f}%"
+            except Exception:
+                return f"[dim]{'░' * width}[/dim] —"
+
+        t = RichTable(show_header=False, box=None, padding=(0, 2), expand=True)
+        for _ in accounts:
+            t.add_column(justify="left")
+
+        # Row 1: Account labels
+        labels = []
+        for a in accounts:
+            color = "cyan" if a["label"] == "A" else ("magenta" if a["label"] == "B" else "yellow")
+            active = " ← ACTIVE" if a["active"] else ""
+            labels.append(f"[{color} bold]Account {a['label']}[/{color} bold] [dim]({a['name']})[/dim]{active}")
+        t.add_row(*labels)
+
+        # Row 2: 5h bars
+        t.add_row(*[f"5h: {mini_bar(a['five_pct'])}" for a in accounts])
+
+        # Row 3: 7d bars
+        t.add_row(*[f"7d: {mini_bar(a['seven_pct'])}" for a in accounts])
+
+        self.update(Panel(t, title="[bold]Account Capacity[/bold]", border_style="dim"))
 
 
 class ActiveSessionsTable(DataTable):
@@ -303,6 +346,13 @@ class ActiveSessionsTable(DataTable):
                 key=f"sub-{pid}",
             )
 
+            # Blank separator between sessions
+            self.add_row(
+                Text(""), Text(""), Text(""), Text(""), Text(""),
+                Text(""), Text(""), Text(""), Text(""),
+                key=f"gap-{pid}",
+            )
+
         try:
             if cur_row < self.row_count:
                 self.move_cursor(row=cur_row)
@@ -333,6 +383,8 @@ class ActiveSessionsTable(DataTable):
                     return key_str.replace("active-", "")
                 elif key_str.startswith("sub-"):
                     return key_str.replace("sub-", "")
+                elif key_str.startswith("gap-"):
+                    return key_str.replace("gap-", "")
         except Exception:
             pass
         return None
@@ -361,6 +413,8 @@ class ActiveSessionsTable(DataTable):
             pid = key_str.replace("active-", "")
         elif key_str.startswith("sub-"):
             pid = key_str.replace("sub-", "")
+        elif key_str.startswith("gap-"):
+            pid = key_str.replace("gap-", "")
         if pid and pid != "empty":
             ok = focus_session_terminal(pid)
             if ok:
@@ -613,19 +667,79 @@ class BurndownChart(Static):
             f"  │  {proj_label}"
         )
 
+        # ── Right side: converged Token Monitor info ──
+        from claude_watch_data import (
+            _current_pct, _countdown, _reset_day,
+            _get_active_account, _token_pacing, _burn_mode,
+        )
+        five, seven, fr, sr = _current_pct()
+
+        def mini_bar(pct, width=12):
+            try:
+                pct_f = float(pct)
+                filled = int(pct_f * width / 100)
+                color = "green" if pct_f < 50 else ("yellow" if pct_f < 75 else "red")
+                return f"[{color}]{'█' * filled}{'░' * (width - filled)}[/{color}]"
+            except Exception:
+                return f"[dim]{'░' * width}[/dim]"
+
+        used_pct = 100.0 - remaining
+        used_color = "red" if used_pct > 80 else ("yellow" if used_pct > 60 else "green")
+        left_color = "red" if remaining < 20 else ("yellow" if remaining < 40 else "green")
+
+        label, name, lane = _get_active_account()
+        acct_color = "cyan" if label == "A" else ("magenta" if label == "B" else "yellow")
+
+        h_reset = int(mins_to_reset // 60)
+        m_reset = int(mins_to_reset % 60)
+        reset_str = f"{h_reset}h{m_reset:02d}m" if h_reset else f"{m_reset}m"
+
+        # Pacing line
+        pacing = _token_pacing()
+        pace_str = ""
+        if pacing:
+            if pacing["status"] == "at_limit":
+                pace_str = "[red bold]AT LIMIT[/red bold]"
+            else:
+                m100 = pacing["mins_to_100"]
+                mr = pacing["mins_to_reset"]
+                burn = pacing["avg_burn"]
+                if m100 < mr:
+                    pace_str = f"[yellow]100% in ~{m100:.0f}m[/yellow] at {burn:.1f}%/min"
+                else:
+                    pace_str = f"[green]OK[/green] at {burn:.1f}%/min"
+
+        # Burn mode for title
+        burn_active, burn_secs = _burn_mode()
+        burn_title = ""
+        if burn_active:
+            bm, bs = burn_secs // 60, burn_secs % 60
+            burn_title = f"  [bold magenta]BURN {bm}m {bs:02d}s[/bold magenta]"
+
+        # Build right-side lines (aligned with chart rows)
+        r = [
+            f"  [bold {used_color}]{used_pct:.0f}% Used[/bold {used_color}]  [bold {left_color}]{remaining:.0f}% Left[/bold {left_color}]",
+            f"  [bold]5h[/bold] {mini_bar(five)} {float(five):.0f}%  [dim]resets {reset_str}[/dim]",
+            f"  [bold]7d[/bold] {mini_bar(seven)} {float(seven):.0f}%  [dim]{_reset_day(sr)[:10]}[/dim]",
+            f"  [{acct_color}]Acct {label}[/{acct_color}]: {name} [dim]({lane})[/dim]",
+            f"  {pace_str}",
+            f"  {verdict}",
+            f"  {details_line}",
+        ]
+
         lines = [
-            f"100%│{rows[0]}│",
-            f"    │{rows[1]}│",
-            f"  0%│{rows[2]}│",
-            f"    └{border_str}┘",
-            f"     [dim]{axis_str}[/dim]",
-            verdict_line,
-            details_line,
+            f"100%│{rows[0]}│{r[0]}",
+            f"    │{rows[1]}│{r[1]}",
+            f"  0%│{rows[2]}│{r[2]}",
+            f"    └{border_str}┘{r[3]}",
+            f"     [dim]{axis_str}[/dim]{r[4]}",
+            r[5],
+            r[6],
         ]
 
         content = "\n".join(lines)
         self.update(
-            Panel(content, title="[bold]Token Burndown[/bold]  [dim](5h window)[/dim]",
+            Panel(content, title=f"[bold]Token Burndown[/bold]  [dim](5h window)[/dim]{burn_title}",
                   border_style="bright_blue")
         )
 
@@ -814,11 +928,18 @@ class SessionDrillDown(Screen):
         files = len(acc.get("files_edited", [])) + len(acc.get("files_created", []))
         commits = len(acc.get("git_commits", []))
         errors = acc.get("errors", 0)
+        # Get output tokens + model from index cache for cost estimate
+        idx_entry = _index_cache.get(self.session_id, {})
+        out_tok = idx_entry.get("output_tokens", 0)
+        session_cost = _estimate_cost(out_tok, idx_entry.get("model", ""))
         summary_parts = [f"[bold]{turns}[/bold] turns"]
         if files:
             summary_parts.append(f"[bold]{files}[/bold] files")
         if commits:
             summary_parts.append(f"[bold]{commits}[/bold] commits")
+        if out_tok:
+            cost_style = "red" if session_cost >= 2.0 else ("yellow" if session_cost >= 0.50 else "green")
+            summary_parts.append(f"[{cost_style}]{_format_cost(session_cost)}[/{cost_style}]")
         if errors:
             summary_parts.append(f"[bold red]{errors}[/bold red] errors")
         lines.append("  ".join(summary_parts))
@@ -1015,10 +1136,17 @@ class UsageMetricsScreen(Screen):
         self.query_one("#metrics-sparkline", DailySparklinePanel).update_content()
         _, seven, _, _ = _current_pct()
 
+        # Estimate total cost across all sources
+        total_cost = sum(
+            _estimate_cost(m["output_tokens"], m.get("model", "sonnet"))
+            for m in metrics
+        )
+
         self.query_one("#metrics-header", Static).update(
             f"[bold]Usage Metrics — last 7 days[/bold]  "
             f"[dim]Total output: {total/1000:.0f}k tokens  "
-            f"Account 7d: {seven}%  (Escape to go back)[/dim]"
+            f"Est. cost: [/dim][yellow]{_format_cost(total_cost)}[/yellow]  "
+            f"[dim]Account 7d: {seven}%  (Escape to go back)[/dim]"
         )
 
         table = self.query_one("#metrics-table", DataTable)
@@ -1119,6 +1247,238 @@ class MCPStatsScreen(Screen):
         self.app.pop_screen()
 
 
+class SessionTasksScreen(Screen):
+    """Session Monitor — execution-layer task log."""
+    BINDINGS = [
+        Binding("escape", "pop_screen", "Back"),
+        Binding("q", "pop_screen", "Back"),
+    ]
+
+    def compose(self) -> ComposeResult:
+        yield Static(id="stasks-header")
+        yield DataTable(id="stasks-table")
+
+    def on_mount(self):
+        from claude_watch_data import _get_session_tasks
+        tasks = _get_session_tasks(today_only=True)
+
+        active_count = sum(1 for t in tasks if t.get("status") == "active")
+        done_count = sum(1 for t in tasks if t.get("status") == "done")
+        sessions = len(set(t.get("session_id", "") for t in tasks))
+
+        self.query_one("#stasks-header", Static).update(
+            f"[bold]Session Tasks — today[/bold]  "
+            f"[green]{active_count} active[/green]  "
+            f"[dim]{done_count} done  {sessions} sessions  "
+            f"(Escape / q to go back)[/dim]"
+        )
+
+        dt = self.query_one("#stasks-table", DataTable)
+        dt.cursor_type = "row"
+        dt.zebra_stripes = True
+        dt.add_column("#", width=5)
+        dt.add_column("Status", width=8)
+        dt.add_column("Session", width=10)
+        dt.add_column("Project", width=12)
+        dt.add_column("Task", width=40)
+        dt.add_column("Started", width=10)
+        dt.add_column("Duration", width=9)
+        dt.add_column("Artifacts")
+
+        for t in tasks:
+            tid = str(t.get("id", ""))
+            status = t.get("status", "?")
+            status_icon = {"active": "●", "done": "✓", "blocked": "◼", "skipped": "○"}.get(status, "?")
+            status_style = {"active": "green bold", "done": "dim", "blocked": "red", "skipped": "dim"}.get(status, "")
+
+            session = t.get("session_id", "?")
+            project = t.get("project", "—")
+            task_name = (t.get("task_name") or "—")[:40]
+
+            # Parse started_at time
+            started = ""
+            try:
+                st = datetime.fromisoformat(t["started_at"].replace("Z", "+00:00"))
+                started = st.astimezone().strftime("%H:%M")
+            except Exception:
+                pass
+
+            # Compute duration
+            duration = ""
+            try:
+                st = datetime.fromisoformat(t["started_at"].replace("Z", "+00:00"))
+                if t.get("completed_at"):
+                    et = datetime.fromisoformat(t["completed_at"].replace("Z", "+00:00"))
+                else:
+                    et = datetime.now(timezone.utc)
+                mins = int((et - st).total_seconds() / 60)
+                if mins >= 60:
+                    duration = f"{mins // 60}h {mins % 60}m"
+                else:
+                    duration = f"{mins}m"
+            except Exception:
+                pass
+
+            # Summarize artifacts
+            artifacts = ""
+            art = t.get("artifacts") or {}
+            if isinstance(art, str):
+                try:
+                    art = json.loads(art)
+                except Exception:
+                    art = {}
+            parts = []
+            if art.get("files_edited"):
+                parts.append(f"{len(art['files_edited'])} files")
+            if art.get("commits"):
+                parts.append(f"{len(art['commits'])} commits")
+            if art.get("skills"):
+                parts.append(f"{len(art['skills'])} skills")
+            artifacts = ", ".join(parts) if parts else "—"
+
+            dt.add_row(
+                Text(tid, justify="right"),
+                Text(f"{status_icon} {status}", style=status_style),
+                Text(session, style="cyan"),
+                Text(project),
+                Text(task_name),
+                Text(started, style="dim"),
+                Text(duration),
+                Text(artifacts, style="dim"),
+            )
+
+        if not tasks:
+            dt.add_row("", Text("No session tasks today", style="dim"), "", "", "", "", "", "")
+
+    def action_pop_screen(self):
+        self.app.pop_screen()
+
+
+class ProjectBoardScreen(Screen):
+    """Project Monitor — strategic task board."""
+    BINDINGS = [
+        Binding("escape", "pop_screen", "Back"),
+        Binding("q", "pop_screen", "Back"),
+    ]
+
+    def compose(self) -> ComposeResult:
+        yield Static(id="pboard-header")
+        with Horizontal(id="pboard-body"):
+            yield Static(id="pboard-summary")
+            yield DataTable(id="pboard-table")
+
+    def on_mount(self):
+        from claude_watch_data import _get_project_tasks
+        tasks = _get_project_tasks()
+
+        total = len(tasks)
+        by_status = {}
+        by_project = {}
+        for t in tasks:
+            s = t.get("status", "?")
+            p = t.get("project", "?")
+            by_status[s] = by_status.get(s, 0) + 1
+            if p not in by_project:
+                by_project[p] = {"ready": 0, "in_progress": 0, "built": 0, "blocked": 0}
+            if s in by_project[p]:
+                by_project[p][s] += 1
+
+        ready = by_status.get("ready", 0)
+        in_prog = by_status.get("in_progress", 0)
+        built = by_status.get("built", 0)
+        blocked = by_status.get("blocked", 0)
+
+        self.query_one("#pboard-header", Static).update(
+            f"[bold]Project Board[/bold]  "
+            f"[yellow]{ready} ready[/yellow]  "
+            f"[green]{in_prog} in progress[/green]  "
+            f"[dim]{built} built  {blocked} blocked  {total} total  "
+            f"(Escape / q to go back)[/dim]"
+        )
+
+        # Left panel: project summary
+        summary_table = RichTable(show_header=True, show_edge=False, pad_edge=False)
+        summary_table.add_column("Project", style="bold")
+        summary_table.add_column("Co", style="dim")
+        summary_table.add_column("Ready", style="yellow", justify="right")
+        summary_table.add_column("Active", style="green", justify="right")
+        summary_table.add_column("Built", style="dim", justify="right")
+        summary_table.add_column("Blocked", style="red", justify="right")
+
+        for proj in sorted(by_project.keys()):
+            counts = by_project[proj]
+            co_name, co_style = _project_to_company(proj)
+            summary_table.add_row(
+                proj,
+                Text(co_name, style=co_style),
+                str(counts["ready"]),
+                str(counts["in_progress"]),
+                str(counts["built"]),
+                str(counts["blocked"]),
+            )
+
+        self.query_one("#pboard-summary", Static).update(
+            Panel(summary_table, title="[bold]Summary[/bold]", border_style="cyan")
+        )
+
+        # Right panel: task list (in_progress first, then ready)
+        dt = self.query_one("#pboard-table", DataTable)
+        dt.cursor_type = "row"
+        dt.zebra_stripes = True
+        dt.add_column("#", width=5)
+        dt.add_column("Status", width=12)
+        dt.add_column("Project", width=12)
+        dt.add_column("Co", width=8)
+        dt.add_column("Task", width=35)
+        dt.add_column("Phase", width=10)
+        dt.add_column("Order", width=6)
+        dt.add_column("Claimed", width=10)
+        dt.add_column("Notes")
+
+        # Sort: in_progress first, then ready, then blocked, then built
+        status_order = {"in_progress": 0, "ready": 1, "blocked": 2, "built": 3, "archived": 4}
+        sorted_tasks = sorted(tasks, key=lambda t: (
+            status_order.get(t.get("status", ""), 9),
+            t.get("build_order") or 9999,
+        ))
+
+        # Show in_progress + ready + blocked (skip built for readability, they can scroll)
+        shown = [t for t in sorted_tasks if t.get("status") in ("in_progress", "ready", "blocked")]
+        # Add up to 10 built at the end
+        built_tasks = [t for t in sorted_tasks if t.get("status") == "built"][:10]
+        shown.extend(built_tasks)
+
+        for t in shown:
+            tid = str(t.get("id", ""))
+            status = t.get("status", "?")
+            status_icon = {"in_progress": "●", "ready": "○", "blocked": "◼", "built": "✓", "archived": "—"}.get(status, "?")
+            status_style = {"in_progress": "green bold", "ready": "yellow", "blocked": "red", "built": "dim"}.get(status, "")
+            co_name, co_style = _project_to_company(t.get("project", ""))
+
+            dt.add_row(
+                Text(tid, justify="right"),
+                Text(f"{status_icon} {status}", style=status_style),
+                Text(t.get("project", "—"), style="cyan"),
+                Text(co_name, style=co_style),
+                Text((t.get("task_name") or "—")[:35]),
+                Text((t.get("phase") or "—")[:10], style="dim"),
+                Text(str(t.get("build_order") or "—"), justify="right"),
+                Text((t.get("claimed_by") or "—")[:10], style="dim"),
+                Text((t.get("notes") or "—")[:30], style="dim"),
+            )
+
+        if not shown:
+            dt.add_row("", Text("No project tasks found", style="dim"), "", "", "", "", "", "", "")
+
+        if built_tasks:
+            remaining_built = len([t for t in sorted_tasks if t.get("status") == "built"]) - 10
+            if remaining_built > 0:
+                dt.add_row("", Text(f"... and {remaining_built} more built tasks", style="dim"), "", "", "", "", "", "", "")
+
+    def action_pop_screen(self):
+        self.app.pop_screen()
+
+
 # ── DataTable widgets (scrollable) ───────────────────────────────────────────
 
 
@@ -1138,6 +1498,7 @@ class SessionHistoryTable(DataTable):
         self.add_column("Dur", width=7)
         self.add_column("~5h%", width=7)
         self.add_column("Out", width=6)
+        self.add_column("Cost", width=7)
         self.add_column("Directive")
 
     def refresh_rows(self):
@@ -1167,7 +1528,7 @@ class SessionHistoryTable(DataTable):
 
         if not sessions:
             self.add_row(
-                "...", "", "", "", "", "", "", "", "",
+                "...", "", "", "", "", "", "", "", "", "",
                 Text("building index..." if _index_building else "no sessions", style="dim"),
             )
             return
@@ -1187,7 +1548,7 @@ class SessionHistoryTable(DataTable):
 
             if group != current_group:
                 sep = f"— {group} —"
-                self.add_row(Text(sep, style="dim"), "", "", "", "", "", "", "", "", "", key=f"sep-{group}")
+                self.add_row(Text(sep, style="dim"), "", "", "", "", "", "", "", "", "", "", key=f"sep-{group}")
                 current_group = group
 
             when_str = s["last_ts"].astimezone().strftime("%H:%M:%S")
@@ -1235,6 +1596,10 @@ class SessionHistoryTable(DataTable):
             else:
                 co_name, co_style = _project_to_company(project)
 
+            cost = _estimate_cost(out_k, s.get("model", ""))
+            cost_str = _format_cost(cost)
+            cost_style = "red" if cost >= 2.0 else ("yellow" if cost >= 0.50 else "green")
+
             dot = "[bold green]● [/bold green]" if is_active else "  "
             self.add_row(
                 Text(when_str, style="dim"),
@@ -1246,15 +1611,16 @@ class SessionHistoryTable(DataTable):
                 Text(s["dur_str"], style="dim"),
                 Text(pct, style=pct_style),
                 Text(out_str, style="dim", justify="right"),
+                Text(cost_str, style=cost_style),
                 directive,
                 key=s["session_id"],
             )
 
-            # Sub-row: tool call summary
+            # Sub-row: tool call summary (matches Active Sessions sub-row style)
             cd = call_by_uuid.get(s["session_id"])
             if cd:
                 calls_str = f"{cd['calls']} calls"
-                tools_detail = cd['tools_str'][:40]
+                tools_detail = cd['tools_str'][:30]
                 last_tool = cd.get('recent_str', '')[:30]
             else:
                 calls_str = ""
@@ -1262,11 +1628,17 @@ class SessionHistoryTable(DataTable):
                 last_tool = ""
 
             self.add_row(
-                Text(""), Text(""), Text(""), Text(""), Text(""),
-                Text(calls_str, style="dim italic"),
-                Text(""), Text(""),
                 Text(""),
-                Text(f"{tools_detail}  {last_tool}" if tools_detail else "", style="dim"),
+                Text(""),
+                Text(""),
+                Text(""),
+                Text(""),
+                Text(calls_str, style="dim italic"),
+                Text(""),
+                Text(""),
+                Text(""),
+                Text(tools_detail, style="dim italic"),
+                Text(last_tool, style="dim italic"),
                 key=f"sub-{s['session_id']}",
             )
 
@@ -1404,6 +1776,20 @@ class CallHistoryTable(DataTable):
             pass
 
 
+# ── Nav Bar ──────────────────────────────────────────────────────────────────
+
+
+class NavBar(Horizontal):
+    """Top navigation bar with clickable buttons."""
+
+    def compose(self) -> ComposeResult:
+        yield Button("Dashboard", id="nav-dashboard", variant="primary")
+        yield Button("Sessions", id="nav-sessions", variant="default")
+        yield Button("Projects", id="nav-projects", variant="default")
+        yield Button("Usage", id="nav-usage", variant="default")
+        yield Button("MCP", id="nav-mcp", variant="default")
+
+
 # ── App ──────────────────────────────────────────────────────────────────────
 
 
@@ -1416,6 +1802,9 @@ class ClaudeWatchApp(App):
         Binding("r", "force_refresh", "Refresh"),
         Binding("u", "show_usage", "Usage"),
         Binding("m", "show_mcp", "MCP"),
+        Binding("s", "show_session_tasks", "Tasks"),
+        Binding("p", "show_project_board", "Board"),
+        Binding("a", "toggle_accounts", "Accounts"),
         Binding("h", "toggle_health", "Health"),
         Binding("slash", "start_search", "Search"),
         Binding("tab", "focus_next", "Next panel", show=False),
@@ -1425,28 +1814,31 @@ class ClaudeWatchApp(App):
     _filter_text = ""
 
     def compose(self) -> ComposeResult:
-        from textual.widgets import Input
+        from textual.widgets import Input, Footer
+        yield NavBar(id="nav-bar")
         with ScrollableContainer(id="main-scroll"):
             yield TokenHeader(id="header")
+            yield AccountCapacityPanel(id="account-capacity")
             yield BurndownChart(id="burndown")
             yield Input(placeholder="Search sessions (ccid, project, directive)...", id="search-input")
             yield UrgentAlerts(id="urgent")
             yield SystemHealthPanel(id="system-health")
             yield ActiveSessionsTable(id="active-sessions")
-            with Horizontal(id="history-row"):
-                yield CallHistoryTable(id="call-history")
             yield SessionHistoryTable(id="session-history")
             yield DrainPanel(id="drain")
             with Horizontal(id="feed-row"):
                 yield ToolFrequency(id="tool-freq")
                 yield SkillsPanel(id="skills")
                 yield AgentsPanel(id="agents")
+        yield Footer()
 
     def on_mount(self):
         _load_index()
         self.build_index()
-        # Hide search input by default
+        # Hide search input, account capacity, and header (merged into burndown)
         self.query_one("#search-input").display = False
+        self.query_one("#account-capacity").display = False
+        self.query_one("#header").display = False
         self.set_interval(1.0, self.refresh_data)
         self.refresh_data()
         # Start hot-reload watcher in background
@@ -1468,6 +1860,9 @@ class ClaudeWatchApp(App):
     def refresh_data(self):
         five, seven, fr, sr = _current_pct()
         self.query_one("#header", TokenHeader).update_content(five, seven, fr, sr)
+        acct = self.query_one("#account-capacity", AccountCapacityPanel)
+        if acct.display:
+            acct.update_content()
         self.query_one("#burndown", BurndownChart).update_content()
         self.query_one("#urgent", UrgentAlerts).update_content()
         self.query_one("#active-sessions", ActiveSessionsTable).refresh_rows()
@@ -1478,7 +1873,7 @@ class ClaudeWatchApp(App):
         self.query_one("#tool-freq", ToolFrequency).update_content()
         self.query_one("#skills", SkillsPanel).update_content()
         self.query_one("#agents", AgentsPanel).update_content()
-        self.query_one("#call-history", CallHistoryTable).refresh_rows()
+        # CallHistoryTable removed — merged into SessionHistoryTable sub-rows
         self.query_one("#drain", DrainPanel).update_content()
 
     def action_force_refresh(self):
@@ -1490,6 +1885,35 @@ class ClaudeWatchApp(App):
 
     def action_show_mcp(self):
         self.push_screen(MCPStatsScreen())
+
+    def action_show_session_tasks(self):
+        self.push_screen(SessionTasksScreen())
+
+    def action_show_project_board(self):
+        self.push_screen(ProjectBoardScreen())
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        btn_id = event.button.id or ""
+        if btn_id == "nav-dashboard":
+            # Already on dashboard — pop any overlay screens
+            while len(self.screen_stack) > 1:
+                self.pop_screen()
+        elif btn_id == "nav-sessions":
+            self.action_show_session_tasks()
+        elif btn_id == "nav-projects":
+            self.action_show_project_board()
+        elif btn_id == "nav-usage":
+            self.action_show_usage()
+        elif btn_id == "nav-mcp":
+            self.action_show_mcp()
+
+    def action_toggle_accounts(self):
+        acct = self.query_one("#account-capacity", AccountCapacityPanel)
+        if acct.display:
+            acct.display = False
+        else:
+            acct.display = True
+            acct.update_content()
 
     def action_toggle_health(self):
         health = self.query_one("#system-health", SystemHealthPanel)
