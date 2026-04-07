@@ -3,38 +3,32 @@
 ## What This Is
 Real-time terminal dashboard for monitoring Claude Code token usage. GitHub: a13xperi/claude-watch
 
-## Current State (v0.6 — fully featured)
+## Current State (v0.7 — merged history, MCP stats, agents panel, hot reload)
 
-**v0.6 features (built on top of v0.5):**
-- **Click-to-focus**: Active Sessions converted from Static panel to interactive DataTable. Enter or `f` key on any active session brings its Warp terminal window to front via AppleScript/AXRaise. Matches by conversation title or directive text.
-- **Usage sparkline**: Press `u` for 7-day daily sparkline + per-day token breakdown table
-- **MCP Stats screen**: Press `m` for MCP server usage and top actions over 7 days
-- **Agent Spawns panel**: Shows subagent types spawned in last 7 days with count and last seen
+**v0.7 features (built on top of v0.6):**
 - **Hot reload**: File watcher auto-restarts TUI when .py files change (exit code 42 restart loop)
-- **Gravity center quality**: Normalizes commit messages (strips conventional prefixes, filters generic/merge commits)
-- **Company column**: All tables show Co (company) derived from project
-- **Dynamic burndown chart**: Width adapts to terminal, stats moved below chart
-- **System Health enriched**: Start time, source, model, company columns added
+- **ActiveSessionsTable interactive**: Converted from Static to interactive DataTable with Enter/`f` to focus Warp terminal. Sub-rows show live state (ago, tok, cpu)
+- **Merged Call History into Session History**: Call History panel removed. Tool call data (call count + tool breakdown) now shows as expandable sub-rows in Session History
+- **Co (Company) column**: Added across System Health, Session History, and the merged history view. Derived from project name
+- **Mdl column in System Health**: Shows the model each session is running
+- **Memory-sorted System Health**: Highest memory consumer sorts to top
+- **AgentsPanel**: New panel showing agent spawn stats over 7 days (type, count, last seen)
+- **MCPStatsScreen**: Press `m` for MCP tool usage breakdown by server (7-day window)
+- **DailySparklinePanel**: 7-day output token sparkline in Usage Metrics
+- **Project column alignment**: System Health columns aligned with Active Sessions widths
 
-**v0.5 features:**
-- **Gravity center directives**: Completed sessions show what was accomplished (first commit message, files edited, skills used) instead of "unnamed session"
-- **Project column**: New column in all tables showing which project a session worked on
-- **Accomplishments drill-down**: Enter on a session shows structured view: git commits, files edited/created, skills, MCP ops, notable commands, user prompts
-- **Token view toggle**: Press `t` in drill-down to switch between accomplishments and per-turn token breakdown
-- **CCID persistence**: cc-PID → UUID mapping stored in session-index.jsonl, survives process death
-- **CLI lookup**: `python3 claude_watch_tui.py --session 72887` for JSON output, `--context` for resume packet
-- **Session list**: `python3 claude_watch_tui.py --list` shows recent sessions with projects
-- **TUI search**: Press `/` to filter sessions by CCID, project, directive, or UUID
+**Previous (v0.5 / v0.6):**
+- v0.6: Click-to-focus (AppleScript/AXRaise), usage sparkline (`u`), gravity center quality, dynamic burndown chart, System Health enriched (start, source, model, company)
+- v0.5: Gravity center directives, project column, accomplishments drill-down, token view toggle (`t`), CCID persistence, CLI lookup, session list, TUI search (`/`)
 
 **Layout order (top to bottom):**
 1. Token Monitor header (5h/7d bars, pacing, account)
 2. Search bar (hidden, press `/` to show)
 3. Urgent Alerts (token expiry, runaway burn — actionable with kill PID)
-4. Active Sessions with inline sub-rows (state, ago, tokens, cpu per session) + Project column
-5. Call History (all sessions from ledger, with model + last tool + project + company)
-6. Session History (indexed transcripts, PID-mapped, green dot, project, company, gravity center)
-7. Passive Drain
-8. Tool Frequency + Skills + Agent Spawns (side by side)
+4. Active Sessions — interactive DataTable with inline sub-rows (state, ago, tokens, cpu) + Project + Co columns
+5. Session History — merged with Call History; indexed transcripts + tool call sub-rows (call count, tool breakdown), PID-mapped, green dot, project, company, gravity center
+6. Passive Drain
+7. Tool Frequency + Skills + Agent Spawns (side by side)
 
 **Two versions:**
 - `claude-watch` → Textual TUI (symlink: `~/bin/claude-watch`)
@@ -49,6 +43,7 @@ Real-time terminal dashboard for monitoring Claude Code token usage. GitHub: a13
 - `Enter`/`f` on Active Sessions → focus that session's Warp terminal
 - `Enter` on Session History → drill-down (accomplishments view)
 - `t` in drill-down → toggle token breakdown
+- `m` → MCP tool usage breakdown by server
 - Mouse wheel / arrow keys to scroll full dashboard
 
 **CLI:**
@@ -56,13 +51,14 @@ Real-time terminal dashboard for monitoring Claude Code token usage. GitHub: a13
 - `python3 claude_watch_tui.py --session 72887 --context` → resume context packet
 - `python3 claude_watch_tui.py --list` → recent sessions table/JSON
 
-## What's Next (v0.7)
+## What's Next (v0.8)
 
 ### Ideas
-- Nested row expansion in Call History and Session History (same parent/sub-row pattern as Active Sessions)
 - Export session history to CSV
-- Per-session cost estimation
+- Per-session cost estimation ($)
 - Alert notifications (system notification on spike)
+- Nested row expansion in Session History (expand to see full tool call detail)
+- Multi-account capacity view (A/B/C usage side by side)
 
 ## Key Context
 - Python 3.9.6 (no `X | None` type hints)
