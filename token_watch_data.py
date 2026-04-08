@@ -2659,6 +2659,76 @@ def _get_active_account():
         return "?", "?", "?"
 
 
+def _is_account_locked(label):
+    # type: (str) -> bool
+    """Check if guardian has locked this account."""
+    return os.path.exists("/tmp/claude-account-{}.locked".format(label))
+
+
+_guardian_state_cache = None  # type: Optional[Tuple[float, Dict[str, Any]]]
+
+def _get_guardian_state():
+    # type: () -> Dict[str, Any]
+    """Read guardian daemon state from /tmp. Cached 60s."""
+    global _guardian_state_cache
+    now = time.time()
+    if _guardian_state_cache is not None:
+        cached_at, cached_data = _guardian_state_cache
+        if now - cached_at < 60:
+            return cached_data
+
+    state_path = Path("/tmp/capacity-guardian-last-state.json")
+    try:
+        data = json.loads(state_path.read_text())
+        age_secs = now - state_path.stat().st_mtime
+        data["last_run_min"] = age_secs / 60.0
+    except Exception:
+        data = {"last_run_min": -1}
+
+    _guardian_state_cache = (now, data)
+    return data
+
+
+_guardian_events_cache = None  # type: Optional[Tuple[float, List[Dict[str, Any]]]]
+
+def _get_guardian_events(limit=10):
+    # type: (int) -> List[Dict[str, Any]]
+    """Parse guardian log for non-CHECK events. Cached 60s."""
+    global _guardian_events_cache
+    now = time.time()
+    if _guardian_events_cache is not None:
+        cached_at, cached_data = _guardian_events_cache
+        if now - cached_at < 60:
+            return cached_data[:limit]
+
+    log_path = Path.home() / ".claude/logs/capacity-guardian.log"
+    if not log_path.exists():
+        return []
+
+    try:
+        with open(log_path) as f:
+            lines = f.readlines()[-50:]
+    except Exception:
+        return []
+
+    events = []
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        m = re.match(r'\[([^\]]+)\]\s+(WARN|LOCK|UNLOCK|SWITCH|CRITICAL):\s+(.*)', line)
+        if m:
+            events.append({
+                "ts": m.group(1),
+                "level": m.group(2),
+                "message": m.group(3),
+            })
+
+    events.reverse()  # newest first
+    _guardian_events_cache = (now, events)
+    return events[:limit]
+
+
 def _get_all_account_capacities():
     # type: () -> list
     """Return capacity info for all accounts. Live data only for active account."""
@@ -2683,18 +2753,28 @@ def _get_all_account_capacities():
             "seven_pct": seven if is_active else "—",
             "five_reset": five_reset_ts if is_active else "",
             "seven_reset": seven_reset_ts if is_active else "",
+            "locked": _is_account_locked(label),
         })
     return result
 
 
+_sb_acct_cap_cache = None  # type: Optional[Tuple[float, List[Dict[str, Any]]]]
+
 def _get_supabase_account_capacity():
     # type: () -> List[Dict[str, Any]]
-    """Fetch account capacity snapshots from Supabase.
+    """Fetch account capacity snapshots from Supabase. Cached 60s.
 
     Returns list of dicts with columns: account, account_name,
     five_hour_used_pct, five_hour_resets_at, seven_day_used_pct,
     seven_day_resets_at, snapshot_at, is_active.
     """
+    global _sb_acct_cap_cache
+    now = time.time()
+    if _sb_acct_cap_cache is not None:
+        cached_at, cached_data = _sb_acct_cap_cache
+        if now - cached_at < 60:
+            return cached_data
+
     import urllib.request
     import json as _json
 
@@ -2715,7 +2795,9 @@ def _get_supabase_account_capacity():
     })
     try:
         with urllib.request.urlopen(req, timeout=5) as resp:
-            return _json.loads(resp.read())
+            rows_result = _json.loads(resp.read())
+        _sb_acct_cap_cache = (now, rows_result)
+        return rows_result
     except Exception:
         return []
 
@@ -2796,6 +2878,7 @@ def get_account_capacity_display():
             "five_reset": five_reset,
             "seven_reset": seven_reset,
             "snapshot_age_min": age_min,
+            "is_locked": _is_account_locked(label),
         })
 
     return result
@@ -2957,6 +3040,53 @@ def make_urgent_panel():
                     else:
                         line2 += " — actively working."
                     alerts.append(line2)
+    except Exception:
+        pass
+
+    # Check weekly capacity — suggest switch if active account >70%
+    try:
+        cap_data = get_account_capacity_display()
+        active_acct = None
+        best_alt = None
+        best_alt_pct = 100.0
+        for a in cap_data:
+            if a["is_active"]:
+                active_acct = a
+            else:
+                try:
+                    pct = float(a["seven_pct"])
+                    if not _is_account_locked(a["label"]) and pct < best_alt_pct:
+                        best_alt = a
+                        best_alt_pct = pct
+                except (ValueError, TypeError):
+                    pass
+
+        if active_acct:
+            try:
+                active_weekly = float(active_acct["seven_pct"])
+            except (ValueError, TypeError):
+                active_weekly = 0
+
+            if active_weekly > 70 and best_alt and best_alt_pct < active_weekly:
+                acct_color = {"A": "cyan", "B": "magenta", "C": "yellow"}.get(
+                    active_acct["label"], "white"
+                )
+                alt_color = {"A": "cyan", "B": "magenta", "C": "yellow"}.get(
+                    best_alt["label"], "white"
+                )
+                if active_weekly >= 90:
+                    urgency = "[bold red]SWITCH NOW[/bold red]"
+                else:
+                    urgency = "[yellow]SWITCH SOON[/yellow]"
+
+                alerts.append(
+                    "  {urg} — [{ac}]{al}[/{ac}] at [bold]{pct:.0f}%[/bold] weekly. "
+                    "Switch to [{bc}]{bl}[/{bc}] ({bpct:.0f}%).".format(
+                        urg=urgency,
+                        ac=acct_color, al=active_acct["label"], pct=active_weekly,
+                        bc=alt_color, bl=best_alt["label"], bpct=best_alt_pct,
+                    )
+                )
     except Exception:
         pass
 

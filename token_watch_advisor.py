@@ -1,5 +1,5 @@
 """
-Token Watch advisor engine — synthesizes all data sources into ranked actionable insights.
+Token Watch Advisor Agent — synthesizes all data sources into ranked actionable insights.
 
 Usage:
     from token_watch_advisor import run_advisor, get_top_insights
@@ -733,3 +733,127 @@ def get_top_insights(max_count: int = 3, min_severity: str = "warning") -> List[
     else:
         severity_filter = {"critical"}
     return [i for i in report.insights if i.severity in severity_filter][:max_count]
+
+
+
+def diff_reports(current, previous_json):
+    # type: (AdvisorReport, dict) -> List[Insight]
+    """Return insights in current that are new (not in previous run).
+
+    Used by advisor-watch.sh cron to detect changes and send proactive alerts.
+    """
+    prev_keys = {(i['category'], i['title']) for i in previous_json.get('insights', [])}
+    return [i for i in current.insights
+            if i.severity in ('critical', 'warning')
+            and (i.category, i.title) not in prev_keys]
+
+
+
+def get_inbox_items():
+    """Aggregate all items needing user attention across all systems.
+
+    Returns list of dicts sorted by priority:
+        priority (1=urgent, 2=attention, 3=fyi), category, source, summary, action
+    """
+    from token_watch_data import (
+        _active_sessions, _get_wire_messages, _get_project_tasks,
+        _get_system_health, _get_build_ledger, _etime_to_secs,
+    )
+
+    wire = _get_wire_messages(limit=50)
+    advisor = run_advisor()
+    tasks = _get_project_tasks()
+    sessions = _active_sessions()
+    health = _get_system_health()
+    build = _get_build_ledger(days=3, limit=100)
+
+    items = []
+
+    # Wire messages needing response
+    for m in wire.get("messages", []):
+        if m.get("read"):
+            continue
+        if m.get("type") in ("question", "file_release", "patch"):
+            items.append({
+                "priority": 1, "category": "WIRE",
+                "source": m.get("from", "?"),
+                "summary": "[{}] {}".format(m["type"], m["message"][:80]),
+                "action": "Reply to {}".format(m.get("from", "?")),
+            })
+        elif m.get("type") in ("info", "status"):
+            items.append({
+                "priority": 3, "category": "WIRE_FYI",
+                "source": m.get("from", "?"),
+                "summary": m["message"][:80],
+                "action": "Acknowledge",
+            })
+
+    # Advisor critical/warning insights
+    for ins in advisor.insights:
+        if ins.severity in ("critical", "warning"):
+            items.append({
+                "priority": 1 if ins.severity == "critical" else 2,
+                "category": "ADVISOR",
+                "source": ins.category,
+                "summary": ins.message,
+                "action": ins.action,
+            })
+
+    # Blocked tasks
+    for t in tasks:
+        if t.get("status") == "blocked":
+            items.append({
+                "priority": 2, "category": "BLOCKED",
+                "source": t.get("project", "?"),
+                "summary": "{} ({})".format(t.get("task_name", "?"), t.get("project", "?")),
+                "action": "Unblock or reassign",
+            })
+
+    # Runaway sessions
+    for s in health.get("claude_sessions", []):
+        if s.get("status") == "runaway":
+            items.append({
+                "priority": 1, "category": "RUNAWAY",
+                "source": "cc-{}".format(s["pid"]),
+                "summary": "cc-{} at {:.0f}% CPU while idle".format(s["pid"], s["cpu"]),
+                "action": "Kill process",
+            })
+
+    # Stuck sessions (>3h, no progress)
+    for sess in sessions:
+        pid, etime, directive, delta, source = sess
+        secs = _etime_to_secs(etime)
+        if secs and secs > 10800 and delta in ("?", "new"):
+            items.append({
+                "priority": 2, "category": "STUCK",
+                "source": "cc-{}".format(pid),
+                "summary": "cc-{} active {}h ({})".format(pid, secs // 3600, directive),
+                "action": "Check or kill",
+            })
+
+    # Untested builds (>=3 per project)
+    untested_by_project = {}
+    for item in build.get("items", []):
+        if item.get("test_status") == "untested":
+            proj = item.get("project", "?")
+            untested_by_project[proj] = untested_by_project.get(proj, 0) + 1
+    for proj, count in untested_by_project.items():
+        if count >= 3:
+            items.append({
+                "priority": 3, "category": "UNTESTED",
+                "source": proj,
+                "summary": "{} untested in {}".format(count, proj),
+                "action": "Run verification",
+            })
+
+    # Sort and deduplicate
+    items.sort(key=lambda x: (x["priority"], x["category"]))
+    seen = set()
+    deduped = []
+    for item in items:
+        key = (item["category"], item["summary"][:40])
+        if key not in seen:
+            seen.add(key)
+            deduped.append(item)
+
+    return deduped

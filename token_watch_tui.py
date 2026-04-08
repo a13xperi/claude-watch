@@ -231,7 +231,8 @@ class AccountCapacityPanel(Static):
         for a in accounts:
             color = "cyan" if a["label"] == "A" else ("magenta" if a["label"] == "B" else "yellow")
             active = " ← ACTIVE" if a["active"] else ""
-            labels.append(f"[{color} bold]Account {a['label']}[/{color} bold] [dim]({a['name']})[/dim]{active}")
+            lock = " [bold red]LOCKED[/bold red]" if a.get("locked") else ""
+            labels.append(f"[{color} bold]Account {a['label']}[/{color} bold] [dim]({a['name']})[/dim]{active}{lock}")
         t.add_row(*labels)
 
         # Row 2: 5h bars
@@ -1402,6 +1403,7 @@ class NavBar(Horizontal):
         ("MCP", "nav-mcp"),
         ("Test", "nav-test"),
         ("TW Advisor", "nav-advisor"),
+        ("Inbox", "nav-inbox"),
     ]
 
     def compose(self) -> ComposeResult:
@@ -3078,6 +3080,7 @@ class AccountCapacityView(LazyView):
             yield Static(id="cap-panel-a")
             yield Static(id="cap-panel-b")
             yield Static(id="cap-panel-c")
+        yield Static(id="cap-guardian-events")
         yield Static(id="cap-footer")
 
     def load_content(self):
@@ -3111,12 +3114,14 @@ class AccountCapacityView(LazyView):
 
             # Active indicator
             if a["is_active"]:
-                title_line = "[green]●[/green] [bold {c}]Account {l}[/bold {c}] [dim]({n})[/dim]".format(
-                    c=color, l=label, n=a["name"]
+                lock_badge = " [bold red]LOCKED[/bold red]" if a.get("is_locked") else ""
+                title_line = "[green]●[/green] [bold {c}]Account {l}[/bold {c}] [dim]({n})[/dim]{lock}".format(
+                    c=color, l=label, n=a["name"], lock=lock_badge
                 )
             else:
-                title_line = "[dim]○[/dim] [{c}]Account {l}[/{c}] [dim]({n})[/dim]".format(
-                    c=color, l=label, n=a["name"]
+                lock_badge = " [bold red]LOCKED[/bold red]" if a.get("is_locked") else ""
+                title_line = "[dim]○[/dim] [{c}]Account {l}[/{c}] [dim]({n})[/dim]{lock}".format(
+                    c=color, l=label, n=a["name"], lock=lock_badge
                 )
 
             # Lane
@@ -3178,7 +3183,12 @@ class AccountCapacityView(LazyView):
                 "[dim]data:[/dim] " + freshness,
             ]
 
-            border_style = "bold " + color if a["is_active"] else "dim"
+            if a.get("is_locked"):
+                border_style = "bold red"
+            elif a["is_active"]:
+                border_style = "bold " + color
+            else:
+                border_style = "dim"
             panel_widget.update(
                 Panel(
                     "\n".join(lines),
@@ -3188,14 +3198,75 @@ class AccountCapacityView(LazyView):
                 )
             )
 
-        # Footer: capacity health summary
+        # Guardian events
+        from token_watch_data import _get_guardian_events
+        events = _get_guardian_events(limit=10)
+        if events:
+            level_colors = {
+                "WARN": "yellow",
+                "LOCK": "red",
+                "UNLOCK": "green",
+                "SWITCH": "magenta",
+                "CRITICAL": "bold red",
+            }
+            evt_lines = []
+            for e in events:
+                color = level_colors.get(e["level"], "dim")
+                ts_short = e["ts"][11:19] if len(e["ts"]) >= 19 else e["ts"]
+                evt_lines.append(
+                    "[dim]{ts}[/dim] [{c}]{lvl:>8s}[/{c}]  {msg}".format(
+                        ts=ts_short, c=color, lvl=e["level"], msg=e["message"]
+                    )
+                )
+            self.query_one("#cap-guardian-events", Static).update(
+                Panel(
+                    "\n".join(evt_lines),
+                    title="[bold]Guardian Events[/bold]",
+                    border_style="dim",
+                )
+            )
+        else:
+            self.query_one("#cap-guardian-events", Static).update("")
+
+        # Footer: capacity health summary + guardian state
         avg_five = total_five / 3
         avg_seven = total_seven / 3
         health_color = "green" if healthy >= 2 else ("yellow" if healthy >= 1 else "red")
+
+        from token_watch_data import _get_guardian_state
+        gstate = _get_guardian_state()
+        last_run = gstate.get("last_run_min", -1)
+        all_critical = gstate.get("all_critical", False)
+
+        if last_run < 0:
+            guard_str = "[dim]guardian: no data[/dim]"
+        elif last_run < 6:
+            guard_str = "[green]guardian: {:.0f}m ago[/green]".format(last_run)
+        elif last_run < 15:
+            guard_str = "[yellow]guardian: {:.0f}m ago[/yellow]".format(last_run)
+        else:
+            guard_str = "[red]guardian: {:.0f}m ago[/red]".format(last_run)
+
+        level_parts = []
+        for lbl in ("A", "B", "C"):
+            acct_state = gstate.get(lbl, {})
+            level = acct_state.get("level", 0)
+            lbl_color = {"A": "cyan", "B": "magenta", "C": "yellow"}[lbl]
+            if level >= 97:
+                level_parts.append("[{c}]{l}[/{c}]:[red]{v}[/red]".format(c=lbl_color, l=lbl, v=level))
+            elif level >= 90:
+                level_parts.append("[{c}]{l}[/{c}]:[yellow]{v}[/yellow]".format(c=lbl_color, l=lbl, v=level))
+            else:
+                level_parts.append("[{c}]{l}[/{c}]:[green]ok[/green]".format(c=lbl_color, l=lbl))
+
+        crit_str = "  [bold red]ALL CRITICAL[/bold red]" if all_critical else ""
+
         self.query_one("#cap-footer", Static).update(
             "[dim]Avg 5h: {five:.0f}%  Avg 7d: {seven:.0f}%  "
-            "[/dim][{hc}]{h}/3 accounts healthy (<70% weekly)[/{hc}]".format(
+            "[/dim][{hc}]{h}/3 healthy[/{hc}]  |  "
+            "{guard}  levels: {levels}{crit}".format(
                 five=avg_five, seven=avg_seven, hc=health_color, h=healthy,
+                guard=guard_str, levels=" ".join(level_parts), crit=crit_str,
             )
         )
 
@@ -5689,6 +5760,83 @@ class AnalyticsView(LazyView):
         self.load_content()
 
 
+
+class InboxView(LazyView):
+    """Token Watch Inbox — unified view of everything waiting on you."""
+
+    BINDINGS = [
+        Binding("R", "refresh_inbox", "Refresh"),
+    ]
+
+    def compose(self) -> ComposeResult:
+        yield Static(id="inbox-header")
+        yield DataTable(id="inbox-table")
+
+    def load_content(self):
+        self._refresh_inbox()
+
+    def refresh_content(self):
+        now = time.time()
+        if not hasattr(self, '_last_refresh') or (now - self._last_refresh) > 30:
+            self._last_refresh = now
+            self._refresh_inbox()
+
+    def _refresh_inbox(self):
+        from token_watch_advisor import get_inbox_items
+        self._last_refresh = time.time()
+        items = get_inbox_items()
+
+        priority_display = {
+            1: ("!!!", "bold red"),
+            2: (" ! ", "yellow"),
+            3: (" · ", "dim"),
+        }
+        priority_labels = {1: "urgent", 2: "attention", 3: "fyi"}
+
+        urgent = len([i for i in items if i["priority"] == 1])
+        attn = len([i for i in items if i["priority"] == 2])
+        fyi = len([i for i in items if i["priority"] == 3])
+
+        parts = []
+        if urgent:
+            parts.append(f"[bold red]{urgent} urgent[/bold red]")
+        if attn:
+            parts.append(f"[yellow]{attn} attention[/yellow]")
+        if fyi:
+            parts.append(f"[dim]{fyi} fyi[/dim]")
+        counts = "  ".join(parts) if parts else "[dim]empty[/dim]"
+
+        header = f"[bold]Inbox[/bold]  {len(items)} items · {counts}"
+        self.query_one("#inbox-header", Static).update(header)
+
+        table = self.query_one("#inbox-table", DataTable)
+        table.clear(columns=True)
+        table.cursor_type = "row"
+        table.zebra_stripes = True
+        table.add_column("#", width=3)
+        table.add_column("", width=3)
+        table.add_column("Category", width=12)
+        table.add_column("Source", width=14)
+        table.add_column("Summary")
+        table.add_column("Action", width=30)
+
+        for idx, item in enumerate(items, 1):
+            icon, style = priority_display.get(item["priority"], (" · ", "dim"))
+            table.add_row(
+                Text(str(idx), style="bold"),
+                Text(icon, style=style),
+                Text(item["category"], style="bold"),
+                Text(item["source"][:14]),
+                Text(item["summary"][:80]),
+                Text(item["action"], style="dim"),
+            )
+
+    def action_refresh_inbox(self):
+        self._last_refresh = 0
+        self._refresh_inbox()
+        self.notify("Inbox refreshed")
+
+
 class ClaudeWatchApp(App):
     CSS_PATH = "token_watch_tui.tcss"
     TITLE = "Token Watch"
@@ -5711,6 +5859,7 @@ class ClaudeWatchApp(App):
         Binding("w", "show_wire", "Wire"),
         Binding("M", "show_mission", "Mission"),
         Binding("v", "show_advisor", "TW Advisor"),
+        Binding("i", "show_inbox", "Inbox"),
         Binding("[", "prev_cycle", "Prev Cycle"),
         Binding("]", "next_cycle", "Next Cycle"),
         Binding("0", "all_cycles", "All Cycles"),
@@ -5761,6 +5910,7 @@ class ClaudeWatchApp(App):
             yield WireView(id="view-wire")
             yield RulesView(id="view-rules")
             yield AdvisorView(id="view-advisor")
+            yield InboxView(id="view-inbox")
             yield AnalyticsView(id="view-analytics")
         yield Footer()
 
@@ -6112,6 +6262,9 @@ class ClaudeWatchApp(App):
 
     def action_show_advisor(self):
         self.switch_view("view-advisor")
+
+    def action_show_inbox(self):
+        self.switch_view("view-inbox")
 
     def action_show_analytics(self):
         self.switch_view("view-analytics")

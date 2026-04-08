@@ -448,6 +448,10 @@ DataTable > .datatable--header {
 #advisor-summary { height: auto; max-height: 2; padding: 0 1; }
 #advisor-table { height: 1fr; border: solid magenta; border-title-color: white; border-title-style: bold; }
 
+/* ── Inbox View ── */
+#inbox-header { height: auto; max-height: 3; padding: 0 1; }
+#inbox-table { height: 1fr; border: solid cyan; border-title-color: white; border-title-style: bold; }
+
 /* ── Analytics View ── */
 #an-header { height: auto; max-height: 2; padding: 0 1; }
 #an-fleet { height: auto; max-height: 8; padding: 0 1; margin: 0 0 1 0; }

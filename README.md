@@ -1,22 +1,60 @@
 # token-watch
 
-Real-time terminal dashboard for monitoring Claude Code token usage, session activity, and burn rate.
+Real-time terminal dashboard for monitoring Claude Code token usage, session activity, burn rate, and fleet operations across multiple accounts.
 
-Built on Textual for Claude Code Max subscribers who run multiple concurrent sessions and need visibility into their 5-hour and 7-day rate limit windows.
+Built on Textual for Claude Code Max subscribers who run multiple concurrent sessions and need full visibility into rate limits, capacity, build output, and session coordination.
+
+**Version: 0.16**
 
 ## What it shows
 
-- **Token Monitor** -- 5h and 7d window usage bars with countdown/reset times, account indicator (A/B/C), pacing prediction
-- **Burndown Chart** -- ASCII chart of 5h window usage over time with rate markers, projection line, budget per 10min
+### Dashboard (home view)
+
+- **Account Capacity Header** -- A/B/C capacity bars with 5h/7d usage, countdowns, and pacing
+- **Burndown Chart** -- ASCII chart of 5h window usage over time with rate markers and projection line
+- **Token Attribution** -- who (which session/account) is burning tokens
 - **Urgent Alerts** -- red banner for rate limit warnings (>80% usage, high burn rate)
-- **Active Sessions** -- interactive table of running Claude CLI processes with parent/sub-row layout, live status, token delta, directive, and click-to-focus Warp terminal
-- **Call History** -- aggregated tool calls per session, grouped by date, with call count, top tools, last tool, 5h% delta
-- **Session History** -- all past sessions from transcript index, grouped by day, with model, duration, 5h%, output tokens, gravity center directive; drill down into accomplishments
-- **Tool Frequency** -- most-used tools across all sessions
-- **Skills Panel** -- skill/slash command usage stats
-- **Agent Spawns** -- agent subprocesses spawned in last 7 days
-- **Passive Drain** -- background token consumption with anomaly detection (Normal / Check / Spike)
 - **System Health** -- all Claude processes + infrastructure with memory, start time, model, source, status
+- **Active Sessions** -- interactive table of running Claude CLI processes with parent/sub-row layout, live status, token delta, directive, and click-to-focus Warp terminal
+- **Session Narrative** -- natural language summary of what the current session is doing
+- **Session History** -- all past sessions from transcript index, grouped by day, with drill-down
+- **Passive Drain** -- background token consumption with anomaly detection (Normal / Check / Spike)
+- **Tool Frequency** -- most-used tools across all sessions
+- **Skills Panel** -- skill/slash command usage statistics
+- **Agents Panel** -- agent subprocesses spawned in the last 7 days
+
+### Tab views
+
+| Key | Tab | Description |
+|---|---|---|
+| `u` | Usage | 7-day breakdown, daily sparkline, per-day table, window scores |
+| `m` | MCP | MCP server usage stats and top actions |
+| `s` | Cycle | Current Pomodoro cycle task capture -- add/edit/roll/delete tasks per 5h window |
+| `c` | Capacity | A/B/C account capacity side-by-side with 5h/7d bars |
+| `y` | Cycles | All past Pomodoro cycles with scores and plan view |
+| `x` | Test Queue | Build items with test status tracking |
+| `l` | Leaderboard | Window scores and velocity rankings |
+| `a` | Audit | Cross-cycle audit with drill-down |
+| `M` | Mission Control | Everything shipped, grouped by company/project (from build_ledger) |
+| `w` | Wire | Inter-session messages via Supabase session_messages |
+| `g` | Rules | Hook/permission rules, events, block counts |
+| `p` | Projects | Project task board |
+| `v` | Advisor | AI advisor synthesis -- fleet health, capacity, suggestions |
+| `i` | Inbox | Unified prioritized inbox (urgent / attention / fyi) |
+| `t` | Analytics | Token utilization coaching -- fleet scorecard, account cards, heatmap, waste analysis, efficiency metrics, 10-rule suggestion engine |
+| `h` | Health | Toggle System Health panel on dashboard |
+
+### Screens (overlays)
+
+- **SessionDrillDown** -- structured view of session accomplishments (commits, files, skills, tools)
+- **TokenAccessScreen** -- token access control panel for Paperclip agents (toggle heartbeats)
+- **CycleDetailScreen** -- single cycle deep dive
+- **CyclePlanScreen** -- cycle planning view
+- **TokenAttributionScreen** -- detailed token attribution breakdown
+- **TestDetailScreen** -- test case detail view
+- **BlockAssignScreen** -- assign tasks to Pomodoro blocks
+- **HealthScreen** -- expanded health view
+- **NavigationScreen** -- full navigation overlay
 
 ## Requirements
 
@@ -24,6 +62,7 @@ Built on Textual for Claude Code Max subscribers who run multiple concurrent ses
 - `textual` (pip install textual) -- TUI framework (includes `rich`)
 - Claude Code CLI (`claude`) installed and running
 - The PreToolUse hook (`token-tracker.sh`) logging to `~/.claude/logs/token-ledger.jsonl`
+- Supabase project for build_ledger, session_locks, session_messages, account_capacity_history (optional but recommended)
 
 ## Setup
 
@@ -57,15 +96,24 @@ Copy `hooks/token-tracker.sh` to `~/.claude/hooks/` and register it in `~/.claud
 ### 3. Run
 
 ```bash
+token-watch
+```
+
+Or run directly:
+
+```bash
 python3 token_watch_tui.py
 ```
 
-Or symlink it:
+## Architecture
 
-```bash
-ln -s $(pwd)/token_watch_tui.py ~/bin/token-watch
-chmod +x token_watch_tui.py
-```
+| File | Role |
+|---|---|
+| `token_watch_tui.py` | Main entry point -- Textual TUI app (~6800 lines) |
+| `token_watch_data.py` | Data layer -- parsing, indexing, aggregation (~6600 lines) |
+| `token_watch_advisor.py` | AI advisor engine + inbox synthesis |
+| `token_watch_tui.tcss` | Textual CSS styles |
+| `token_watch.py` | Legacy Rich-only version (superseded) |
 
 ## How it works
 
@@ -80,23 +128,34 @@ PreToolUse hook fires --> token-tracker.sh
     |                    ~/.claude/logs/token-ledger.jsonl     (global)
     |
     v
-token-watch reads:
+PostToolUse hook --> logs commits to Supabase build_ledger
+    |
+    v
+capacity-snapshot cron (every 5min) --> Supabase account_capacity_history
+    |
+    v
+token-watch reads all sources:
     - token-ledger.jsonl              (tool calls, drain events)
     - /tmp/statusline-debug.json      (current rate limits)
     - /tmp/claude-directive-{PID}     (session directives)
     - /tmp/claude-token-state-{PID}   (per-session token state)
     - ~/.claude/projects/*/           (transcript .jsonl files for history)
-    - ~/.claude/logs/session-index.jsonl (built/cached session index)
+    - ~/.claude/logs/session-index.jsonl   (built/cached session index)
+    - ~/.claude/logs/window-scores.jsonl   (per-5h window scores)
+    - Supabase: build_ledger, session_locks, session_messages, account_capacity_history
 ```
 
-### Architecture
+### Data sources
 
-| File | Role |
-|---|---|
-| `token_watch_tui.py` | Main entry point -- Textual TUI app |
-| `token_watch_data.py` | Data layer -- parsing, indexing, aggregation |
-| `token_watch_tui.tcss` | Textual CSS styles |
-| `token_watch.py` | Legacy Rich-only version (still works, superseded by TUI) |
+| Source | What | Location |
+|---|---|---|
+| Token Ledger | Per-tool-call: timestamps, burn rate, model, tokens | `~/.claude/logs/token-ledger.jsonl` |
+| Session Index | Per-session: duration, tokens, model, directive | `~/.claude/logs/session-index.jsonl` |
+| Window Scores | Per-5h-window: burn, parallelism, shipping, score | `~/.claude/logs/window-scores.jsonl` |
+| Build Ledger | Per-commit: project, files, item type, points | Supabase `build_ledger` |
+| Capacity History | Per-5min: account, 5h%, 7d%, reset timestamps | Supabase `account_capacity_history` |
+| Session Locks | Active sessions: account, repo, task | Supabase `session_locks` |
+| Session Messages | Inter-session wire messages | Supabase `session_messages` |
 
 ### Session Index
 
@@ -108,104 +167,139 @@ A file watcher monitors `*.py` files in the project directory. When a source fil
 
 ### Auto-Refresh
 
-All non-dashboard views auto-refresh when visible — no manual `r` needed. Each tab refreshes on a throttled interval (10–30s) to keep data fresh without hammering data sources.
+All tabs auto-refresh when visible on throttled intervals (10--30s). No manual refresh needed, though `r` forces an immediate refresh of the current view.
 
-## Panels
+### Lazy Loading
 
-### Token Monitor (header)
-5h and 7d rate limit bars with:
-- Current usage percentage and pacing prediction
-- 5h countdown to reset, 7d reset day
-- Active account indicator (A/B/C)
+Tabs only load their data when first visited, keeping startup fast.
 
-### Cycle Banner (global)
-Compact status bar visible on every tab. Shows:
-- 5h reset countdown and burn % progress bar
-- Active projects and task progress (done/open)
-- Cost estimate for the current cycle
+## Key features
 
-### Burndown Chart
-ASCII chart tracking 5h window usage over time:
-- Rate markers and projection line
-- Budget per 10-minute interval
+### Tri-account management
 
-### Urgent Alerts
-Red banner triggered by:
-- Usage exceeding 80%
-- High burn rate relative to remaining window
+Monitors 3 Claude Code Max accounts ($200/mo each) with per-account capacity tracking, 5h/7d reset countdowns, and rebalancing suggestions. The Capacity tab (`c`) shows all three side-by-side.
 
-### Active Sessions (interactive DataTable)
-Live processes detected via `ps`. Two-level row layout:
-- **Parent row:** start time, session ID (cc-PID), launch source, company, project, model, duration, token delta%, directive
-- **Sub-row:** live state (`>>` tool active, `thinking...`, `~` recent, idle), elapsed since last call, token count, CPU%
-- Press `Enter` or `f` to focus the session's Warp terminal window via AppleScript
+### Pomodoro cycle system
 
-### Call History
-Aggregated tool calls per session, grouped by date:
-- Call count, top tools used, last tool invoked
-- 5h% delta consumed
+10x 30-minute blocks per 5h window. The Cycle tab (`s`) captures tasks, assigns them to blocks, tracks completion, and scores each cycle. The Cycles tab (`y`) shows history. Unfinished items roll forward automatically.
 
-### Session History
-All past sessions from transcript files, grouped by day (Today / Yesterday / date):
-- End time, duration, model (opus/sonnet/haiku)
-- Estimated 5h% consumed, output tokens
-- Gravity center directive
-- Press `Enter` to drill down
+### Analytics / coaching engine
 
-### Session Drill-Down
-Structured view of a session's accomplishments:
-- Git commits, files edited/created
-- Skills used, MCP operations
-- Notable commands, user prompts
-- Press `t` to toggle token breakdown
+The Analytics tab (`t`) provides a fleet scorecard with utilization heatmaps, waste analysis, and efficiency metrics. A 10-rule suggestion engine generates prioritized coaching based on actual usage patterns. Switch time windows with `1` (24h), `2` (72h), `3` (1 week), `4` (1 month).
 
-### Tool Frequency
-Most-used tools across all sessions, ranked by invocation count.
+### Wire messaging
 
-### Skills Panel
-Skill/slash command usage statistics.
+Sessions communicate via Supabase `session_messages` for file-lock coordination, status updates, and questions. The Wire tab (`w`) shows all messages. Messages auto-expire after 30 minutes.
 
-### Agent Spawns
-Agent subprocesses spawned in the last 7 days with count and last seen date.
+### Mission Control
 
-### Passive Drain
-Token burn between tool calls (background consumption):
-- Status: Normal (green) / Check (yellow) / Spike (red)
-- Per-event: delta%, burn rate, active session count
+Everything shipped, grouped by company and project, pulled from the Supabase `build_ledger`. Each commit logged by the PostToolUse hook appears here with test status.
 
-### System Health
-All Claude-related processes plus infrastructure (node, python, etc.):
-- Memory usage, start time, model, source, status
+### Advisor
+
+AI-synthesized fleet health analysis with capacity recommendations, inbox prioritization, and actionable suggestions. Available as a tab (`v`) or via CLI (`--advisor`).
+
+### Token Access Control
+
+Screen overlay for managing Paperclip agent heartbeats. Toggle individual agents on/off to control token consumption from automated processes.
 
 ## Keybindings
+
+### Global
 
 | Key | Action |
 |---|---|
 | `q` | Quit |
-| `r` | Refresh |
-| `u` | Usage Metrics screen (7-day breakdown, daily sparkline, per-day table) |
-| `m` | MCP Stats screen (server usage and top actions over 7 days) |
-| `h` | Toggle System Health panel |
-| `Tab` / `Shift+Tab` | Focus between panels |
+| `r` | Refresh current tab |
+| `e` | Export session history to CSV |
 | `/` | Search/filter sessions |
-| `Escape` | Clear search |
+| `Tab` / `Shift+Tab` | Focus between panels |
+| `Escape` | Clear search / dismiss overlay |
+| `A` | Toggle Accounts |
+| `R` | Reload build (hidden) |
+
+### Tab navigation
+
+| Key | Tab |
+|---|---|
+| `u` | Usage |
+| `m` | MCP |
+| `s` | Cycle |
+| `c` | Capacity |
+| `y` | Cycles |
+| `x` | Test Queue |
+| `l` | Leaderboard |
+| `a` | Audit |
+| `M` | Mission Control |
+| `w` | Wire |
+| `g` | Rules |
+| `p` | Projects |
+| `v` | Advisor |
+| `i` | Inbox |
+| `t` | Analytics |
+| `h` | Toggle Health panel |
+
+### Cycle navigation
+
+| Key | Action |
+|---|---|
+| `[` / `]` | Previous / next cycle |
+| `0` | Toggle all cycles view |
+
+### Cycle tab (task management)
+
+| Key | Action |
+|---|---|
+| `n` | New task |
+| `Enter` | Edit item |
+| `x` | Toggle done |
+| `r` | Roll item to next cycle |
+| `d` | Delete item |
+| `b` | Assign to block |
+| `/` | Filter |
+| `a` | Show all |
+| `i` | Import sessions |
+
+### Analytics tab (time windows)
+
+| Key | Window |
+|---|---|
+| `1` | 24 hours |
+| `2` | 72 hours |
+| `3` | 1 week |
+| `4` | 1 month |
+
+### Active Sessions / Session History
+
+| Key | Action |
+|---|---|
 | `Enter` / `f` | Focus Warp terminal (Active Sessions) or drill down (Session History) |
 | `t` | Toggle token breakdown (in drill-down view) |
-| `s` | Cycle Monitor (task capture for current 5h window) |
-| `c` | Account Capacity view (A/B/C side by side) |
-| `e` | Export session history to CSV |
 
 ## CLI
 
 ```bash
-# Launch the TUI
-python3 token_watch_tui.py
+# Launch TUI
+token-watch
 
-# Resume context packet for a specific session
-python3 token_watch_tui.py --session <PID> --context
+# Print compact capacity snapshot (JSON)
+token-watch --snapshot
 
-# List recent sessions (table/JSON)
-python3 token_watch_tui.py --list
+# Advisor insights (text)
+token-watch --advisor
+
+# Advisor insights (JSON)
+token-watch --advisor --json
+
+# Look up session by CCID or UUID prefix
+token-watch -s <CCID>
+
+# Session with resume context
+token-watch -s <CCID> --context
+
+# List recent sessions
+token-watch -l
+token-watch --list
 ```
 
 ## Roadmap
@@ -215,9 +309,18 @@ python3 token_watch_tui.py --list
 - [x] Multi-account capacity view (v0.9)
 - [x] Cycle Monitor (v0.12)
 - [x] Auto-refresh all tabs (v0.13)
-- [ ] Nested row expansion in Session History
-- [ ] Per-session cost estimation
+- [x] Wire messaging (v0.14)
+- [x] Mission Control (v0.14)
+- [x] Analytics / coaching engine (v0.15)
+- [x] Advisor + Inbox (v0.15)
+- [x] Token Access Control (v0.15)
+- [x] Rules tab (v0.16)
+- [x] Projects board (v0.16)
+- [x] Leaderboard (v0.16)
+- [x] Audit view (v0.16)
+- [ ] Per-session cost estimation (partial -- fleet-level exists)
 - [ ] Prompt-level analytics
+- [ ] Nested row expansion in Session History
 
 ## License
 
