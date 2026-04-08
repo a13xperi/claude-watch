@@ -363,46 +363,50 @@ def _extract_first_user_message(fpath):
     return None
 
 
-def _raise_warp_window(search_text):
+def _raise_terminal_window(search_text):
     # type: (str) -> bool
-    """Try to raise a Warp window whose title contains search_text (case-insensitive)."""
+    """Try to raise a terminal window whose title contains search_text."""
     escaped = search_text.replace("\\", "\\\\").replace('"', '\\"')
-    # AppleScript 'contains' is case-insensitive by default
-    script = (
-        'tell application "System Events"\n'
-        '  tell application process "stable"\n'
-        '    set frontmost to true\n'
-        '    set wl to every window whose name contains "' + escaped + '"\n'
-        '    if (count of wl) > 0 then\n'
-        '      perform action "AXRaise" of item 1 of wl\n'
-        '      return "found"\n'
-        '    end if\n'
-        '  end tell\n'
-        'end tell'
-    )
-    try:
-        r = subprocess.run(
-            ["osascript", "-e", script],
-            timeout=3, capture_output=True, text=True,
+    # Try known terminal app process names in order
+    for process_name in ("stable", "Warp", "iTerm2", "Terminal"):
+        script = (
+            'tell application "System Events"\n'
+            '  if exists application process "' + process_name + '" then\n'
+            '    tell application process "' + process_name + '"\n'
+            '      set frontmost to true\n'
+            '      set wl to every window whose name contains "' + escaped + '"\n'
+            '      if (count of wl) > 0 then\n'
+            '        perform action "AXRaise" of item 1 of wl\n'
+            '        return "found"\n'
+            '      end if\n'
+            '    end tell\n'
+            '  end if\n'
+            'end tell'
         )
-        return "found" in r.stdout
-    except Exception as e:
-        _log.debug("__raise_warp_window: %s", e)
-        return False
+        try:
+            r = subprocess.run(
+                ["osascript", "-e", script],
+                timeout=3, capture_output=True, text=True,
+            )
+            if "found" in r.stdout:
+                return True
+        except Exception as e:
+            _log.debug("_raise_terminal_window: %s", e)
+    return False
 
 
 def focus_session_terminal(pid):
     # type: (str) -> bool
-    """Bring the Warp window for a claude session to the front.
+    """Bring the terminal window for a claude session to the front.
 
-    Tries multiple strategies to match the right Warp window:
-    1. Conversation title (first user message) — matches Warp's tab title
+    Tries multiple strategies to match the right terminal window:
+    1. Conversation title (first user message) — matches terminal tab title
     2. Directive text — fallback
-    3. Generic Warp activation — last resort
+    3. Generic terminal activation — last resort
     """
     # Strategy 1: match by conversation title (what Warp actually shows)
     title = _get_conversation_title(pid)
-    if title and _raise_warp_window(title):
+    if title and _raise_terminal_window(title):
         return True
 
     # Strategy 2: match by directive
@@ -412,18 +416,20 @@ def focus_session_terminal(pid):
     except Exception as e:
         _log.debug("_focus_session_terminal: %s", e)
         pass
-    if directive and directive != "\u2014" and _raise_warp_window(directive):
+    if directive and directive != "\u2014" and _raise_terminal_window(directive):
         return True
 
-    # Strategy 3: just activate Warp
-    try:
-        subprocess.run(
-            ["osascript", "-e", 'tell application "Warp" to activate'],
-            timeout=3, capture_output=True,
-        )
-    except Exception as e:
-        _log.debug("_focus_session_terminal: %s", e)
-        pass
+    # Strategy 3: just activate the most likely terminal
+    for app_name in ("Warp", "iTerm", "Terminal"):
+        try:
+            r = subprocess.run(
+                ["osascript", "-e", f'tell application "{app_name}" to activate'],
+                timeout=3, capture_output=True, text=True,
+            )
+            if r.returncode == 0:
+                break
+        except Exception as e:
+            _log.debug("focus_session_terminal: %s", e)
     return False
 
 
@@ -3893,6 +3899,63 @@ def _get_build_ledger(days=1, limit=100, cycle_id=None):
     except Exception as e:
         _log.warning("__get_build_ledger: %s", e)
         return {"items": [], "by_company": {}, "stats": {"total": 0, "untested": 0, "decisions": 0, "sessions": 0, "projects": 0}}
+
+_dispatch_queue_cache = (0, None)
+
+def _get_dispatch_queue():
+    """Fetch dispatchable tasks from project_tasks — items with dispatch_prompt, ready or in-progress."""
+    import urllib.request
+    global _dispatch_queue_cache
+    now = time.time()
+    if _dispatch_queue_cache[1] is not None and (now - _dispatch_queue_cache[0]) < 30:
+        return _dispatch_queue_cache[1]
+
+    empty = {"queue": [], "active": [], "stats": {"total_ready": 0, "total_active": 0, "total_tokens_k": 0, "by_project": {}}}
+    try:
+        url = (
+            f"{_SUPABASE_URL}/project_tasks"
+            f"?dispatch_prompt=not.is.null"
+            f"&status=in.(ready,in_progress)"
+            f"&select=id,task_name,dispatch_prompt,project,company,status,tier,priority,difficulty,points,est_tokens_k,source,claimed_by,run_count,notes,created_at,build_order"
+            f"&order=created_at.desc"
+            f"&limit=100"
+        )
+        req = urllib.request.Request(url, headers={
+            "apikey": _SUPABASE_KEY,
+            "Authorization": f"Bearer {_SUPABASE_KEY}",
+        })
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            items = json.loads(resp.read())
+
+        pri_order = {"critical": 0, "high": 1, "medium": 2, "low": 3}
+        queue = sorted(
+            [i for i in items if i.get("status") == "ready"],
+            key=lambda x: (pri_order.get(x.get("priority", "medium"), 9), x.get("build_order") or 9999),
+        )
+        active = [i for i in items if i.get("status") == "in_progress"]
+
+        by_project = {}
+        total_tokens = 0
+        for i in items:
+            proj = i.get("project", "general")
+            by_project[proj] = by_project.get(proj, 0) + 1
+            total_tokens += i.get("est_tokens_k") or 0
+
+        result = {
+            "queue": queue,
+            "active": active,
+            "stats": {
+                "total_ready": len(queue),
+                "total_active": len(active),
+                "total_tokens_k": total_tokens,
+                "by_project": by_project,
+            },
+        }
+        _dispatch_queue_cache = (now, result)
+        return result
+    except Exception as e:
+        _log.warning("_get_dispatch_queue: %s", e)
+        return empty
 
 def _get_wire_messages(limit=50, cycle_id=None):
     """Fetch recent Wire messages from Supabase session_messages table."""

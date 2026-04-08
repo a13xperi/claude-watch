@@ -298,7 +298,7 @@ class EngineTable(DataTable):
         self.add_column("Co", width=8, key="co")
         self.add_column("Project", width=12, key="project")
         self.add_column("Mdl", width=10, key="mdl")
-        self.add_column("Mem", width=8, key="mem")
+        self.add_column("Mem", width=10, key="mem")
         self.add_column("Dur", width=12, key="dur")
         self.add_column("Used", width=11, key="used")
         self.add_column("Directive", key="directive")
@@ -380,17 +380,14 @@ class EngineTable(DataTable):
 
         # Pressure alert row
         if pressure["active"]:
-            trim_hints = []
-            for tr in pressure["trim_order"][:3]:
-                trim_hints.append("{} ({}, ~{}MB)".format(tr["sid"], tr["reason"], tr["mem_freed_mb"]))
-            pressure_text = "{} | trim: {}".format(
-                pressure["reason"], ", ".join(trim_hints) if trim_hints else "none"
-            )
+            trim_sids = [tr["sid"] for tr in pressure["trim_order"][:3]]
+            pressure_short = pressure["reason"]
+            trim_note = "trim: " + ", ".join(trim_sids) if trim_sids else ""
             self.add_row(
                 Text(""), Text(""), Text(""),
                 Text("⚠ PRESSURE", style="bold red"),
                 Text(""), Text(""), Text(""), Text(""), Text(""), Text(""),
-                Text(pressure_text, style="bold red"),
+                Text(f"{pressure_short}  {trim_note}", style="red"),
                 key="pressure-alert",
             )
 
@@ -616,16 +613,15 @@ class EngineTable(DataTable):
         mem_gb = total_mem / 1024
         sys_gb = sys_mem / 1024
 
+        n_total = len(engine_sessions) + len(remote_peers)
         self.add_row(
-            Text(""),
+            Text(""), Text(""), Text(""), Text(""), Text(""), Text(""),
+            Text(""), Text(""), Text(""), Text(""),
             Text.from_markup(
-                f"MEM {_gauge_bar(mem_pct)} {mem_gb:.1f}/{sys_gb:.0f}GB [{mem_zc}]{mem_zone}[/{mem_zc}]"
+                f"  MEM {_gauge_bar(mem_pct)} {mem_gb:.1f}/{sys_gb:.0f}GB [{mem_zc}]{mem_zone}[/{mem_zc}]"
+                f"    CPU {_gauge_bar(cpu_capped)} {total_cpu:.0f}% [{cpu_zc}]{cpu_zone}[/{cpu_zc}]"
+                f"    Sessions: {n_total}"
             ),
-            Text(""), Text(""), Text(""),
-            Text.from_markup(
-                f"CPU {_gauge_bar(cpu_capped)} {total_cpu:.0f}% [{cpu_zc}]{cpu_zone}[/{cpu_zc}]"
-            ),
-            Text(""), Text(""), Text(""), Text(""), Text(""),
             key="totals-footer",
         )
 
@@ -854,29 +850,46 @@ class TokenAttributionPanel(Static):
             bar_width = max(20, self.size.width - 6)
         except Exception:
             bar_width = 50
+
+        # Build single-line bar
         bar_chars = []
+        for s in sessions:
+            pct = s["pct_used"]
+            if pct < 0.3:
+                continue
+            cols = max(1, int(pct / max(total, 0.1) * bar_width))
+            color = s["color"]
+            label = f"{pct:.0f}%"
+            segment = label.center(cols) if cols >= len(label) + 2 else "\u2588" * cols
+            bar_chars.append(f"[bold white on {color}]{segment}[/]")
+        if unaccounted > 0.5:
+            cols = max(1, int(unaccounted / max(total, 0.1) * bar_width))
+            segment = f"{unaccounted:.0f}%".center(cols) if cols >= 6 else "\u2591" * cols
+            bar_chars.append(f"[dim]{segment}[/dim]")
+        bar_line = "".join(bar_chars)
+
+        # Build legend — always visible
         legend_parts = []
         for s in sessions:
             pct = s["pct_used"]
-            if pct < 0.5:
+            if pct < 0.3:
                 continue
-            cols = max(1, int(pct / total * bar_width)) if total > 0 else 1
             color = s["color"]
-            label = f"{pct:.0f}%"
-            segment = label.center(cols) if cols >= len(label) + 2 else "█" * cols
-            bar_chars.append(f"[bold white on {color}]{segment}[/]")
-            directive = s["directive"][:35] if s["directive"] else s["session_id"][:16]
-            legend_parts.append(f"[{color}]■[/] {directive} ({pct:.1f}%)")
+            directive = s["directive"][:40] if s["directive"] else s["session_id"][:16]
+            out_tokens = s.get("output_tokens", 0) or 0
+            if out_tokens >= 1_000_000:
+                tok_str = f"{out_tokens / 1_000_000:.1f}M tok"
+            elif out_tokens >= 1_000:
+                tok_str = f"{out_tokens / 1_000:.0f}K tok"
+            else:
+                tok_str = f"{out_tokens} tok"
+            legend_parts.append(f"[{color}]\u2588\u2588[/{color}] {directive}  [bold]{pct:.1f}%[/bold]  [dim]{tok_str}[/dim]")
         if unaccounted > 0.5:
-            cols = max(1, int(unaccounted / total * bar_width)) if total > 0 else 1
-            segment = f"{unaccounted:.0f}%".center(cols) if cols >= 6 else "░" * cols
-            bar_chars.append(f"[dim]{segment}[/dim]")
-            legend_parts.append(f"[dim]░ rolled out ({unaccounted:.1f}%)[/dim]")
-        bar_line = "".join(bar_chars)
-        legend_line = "\n".join(legend_parts)
-        content_str = bar_line + chr(10) + legend_line
+            legend_parts.append(f"[dim]\u2591\u2591 rolled off window  {unaccounted:.1f}%[/dim]")
+
+        content = bar_line + "\n" + "\n".join(legend_parts)
         self.update(Panel(
-            content_str,
+            content,
             title=f"[bold]Who Ate My {total:.0f}%?[/bold]",
             border_style="yellow",
         ))
@@ -1474,6 +1487,7 @@ class NavBar(Horizontal):
         ("Test", "nav-test"),
         ("TW Advisor", "nav-advisor"),
         ("Inbox", "nav-inbox"),
+        ("Dispatch", "nav-dispatch"),
     ]
 
     def compose(self) -> ComposeResult:
@@ -1525,6 +1539,7 @@ class NavigationScreen(Screen):
                 "nav-wire": "view-wire",
                 "nav-advisor": "view-advisor",
                 "nav-analytics": "view-analytics",
+                "nav-dispatch": "view-dispatch",
             }
             view_id = btn_map.get(view_key)
             if view_id:
@@ -5942,6 +5957,193 @@ class InboxView(LazyView):
         self.notify("Inbox refreshed")
 
 
+class DispatchDetailScreen(Screen):
+    """Full dispatch prompt viewer."""
+    BINDINGS = [
+        Binding("escape", "pop_screen", "Back"),
+        Binding("q", "pop_screen", "Back"),
+        Binding("c", "copy_prompt", "Copy"),
+    ]
+
+    def __init__(self, task: dict, **kwargs):
+        super().__init__(**kwargs)
+        self._task = task
+
+    def compose(self) -> ComposeResult:
+        yield Static(id="dd-header")
+        yield ScrollableContainer(Static(id="dd-body"), id="dd-scroll")
+
+    def on_mount(self):
+        t = self._task
+        pri_colors = {"critical": "red", "high": "yellow", "medium": "white", "low": "dim"}
+        pri = t.get("priority", "medium")
+        pc = pri_colors.get(pri, "white")
+
+        self.query_one("#dd-header", Static).update(
+            f"[bold]#{t.get('id', '?')}[/bold]  "
+            f"[{pc}]{pri.upper()}[/{pc}]  "
+            f"[cyan]{t.get('project', '?')}[/cyan]  "
+            f"[dim]source={t.get('source', '?')}  tier={t.get('tier', '?')}  "
+            f"~{t.get('est_tokens_k', '?')}kT[/dim]  "
+            f"[dim italic]c=copy  esc=back[/dim italic]"
+        )
+
+        prompt = t.get("dispatch_prompt", "(no prompt)")
+        self.query_one("#dd-body", Static).update(f"\n{prompt}\n")
+
+    def action_copy_prompt(self):
+        import subprocess
+        prompt = self._task.get("dispatch_prompt", "")
+        try:
+            subprocess.run(["pbcopy"], input=prompt.encode(), check=True)
+            self.notify("Copied to clipboard")
+        except Exception:
+            self.notify("Copy failed", severity="error")
+
+    def action_pop_screen(self):
+        self.app.pop_screen()
+
+
+class DispatchView(LazyView):
+    """Dispatch queue — ready tasks with prompts, prioritized for burn sessions."""
+
+    BINDINGS = [
+        Binding("r", "refresh_dispatch", "Refresh"),
+        Binding("enter", "view_detail", "View"),
+        Binding("c", "copy_selected", "Copy"),
+    ]
+
+    def refresh_content(self):
+        now = time.time()
+        if not hasattr(self, '_last_refresh') or (now - self._last_refresh) > 30:
+            self._last_refresh = now
+            try:
+                self.query_one("#dispatch-table", DataTable).clear(columns=True)
+                self.load_content()
+            except Exception:
+                pass
+
+    def compose(self) -> ComposeResult:
+        yield Static(id="dispatch-header")
+        yield DataTable(id="dispatch-table")
+
+    def load_content(self):
+        from token_watch_data import _get_dispatch_queue
+        data = _get_dispatch_queue()
+        stats = data["stats"]
+
+        self.query_one("#dispatch-header", Static).update(
+            f"[bold]Dispatch[/bold]  "
+            f"[green]{stats['total_ready']} ready[/green]  ·  "
+            f"[yellow]{stats['total_active']} active[/yellow]  ·  "
+            f"[dim]~{stats['total_tokens_k']}kT total[/dim]  "
+            f"[dim italic]enter=view  c=copy  r=refresh[/dim italic]"
+        )
+
+        table = self.query_one("#dispatch-table", DataTable)
+        table.cursor_type = "row"
+        table.zebra_stripes = True
+        table.add_column("#", width=5)
+        table.add_column("Pri", width=5)
+        table.add_column("Tier", width=5)
+        table.add_column("Project", width=12)
+        table.add_column("Task", width=40)
+        table.add_column("Source", width=8)
+        table.add_column("Age", width=8)
+
+        pri_styles = {
+            "critical": "[red bold]P0[/red bold]",
+            "high": "[yellow]P1[/yellow]",
+            "medium": "P2",
+            "low": "[dim]P3[/dim]",
+        }
+        tier_styles = {
+            "auto": "[green]auto[/green]",
+            "assisted": "[yellow]asst[/yellow]",
+            "manual": "[red]man[/red]",
+        }
+
+        self._items = []
+
+        # Active items first (in-progress)
+        for item in data["active"]:
+            self._items.append(item)
+            age = self._format_age(item.get("created_at", ""))
+            table.add_row(
+                str(item.get("id", "")),
+                "[magenta]RUN[/magenta]",
+                tier_styles.get(item.get("tier", ""), "?"),
+                f"[cyan]{item.get('project', '?')}[/cyan]",
+                (item.get("task_name", "?")[:38] + "..") if len(item.get("task_name", "")) > 40 else item.get("task_name", "?"),
+                item.get("source", "?"),
+                age,
+            )
+
+        # Queue items (ready)
+        for item in data["queue"]:
+            self._items.append(item)
+            age = self._format_age(item.get("created_at", ""))
+            table.add_row(
+                str(item.get("id", "")),
+                pri_styles.get(item.get("priority", "medium"), "?"),
+                tier_styles.get(item.get("tier", ""), "?"),
+                f"[cyan]{item.get('project', '?')}[/cyan]",
+                (item.get("task_name", "?")[:38] + "..") if len(item.get("task_name", "")) > 40 else item.get("task_name", "?"),
+                item.get("source", "?"),
+                age,
+            )
+
+    def _format_age(self, created_at: str) -> str:
+        if not created_at:
+            return "?"
+        try:
+            from datetime import datetime, timezone
+            created = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+            delta = datetime.now(timezone.utc) - created
+            hours = delta.total_seconds() / 3600
+            if hours < 1:
+                return f"{int(delta.total_seconds()/60)}m"
+            elif hours < 24:
+                return f"{int(hours)}h"
+            else:
+                return f"{int(hours/24)}d"
+        except Exception:
+            return "?"
+
+    def action_refresh_dispatch(self):
+        try:
+            self.query_one("#dispatch-table", DataTable).clear(columns=True)
+            self.load_content()
+        except Exception:
+            pass
+        self.notify("Dispatch refreshed")
+
+    def action_view_detail(self):
+        table = self.query_one("#dispatch-table", DataTable)
+        if not hasattr(self, '_items') or not self._items:
+            return
+        try:
+            row_idx = table.cursor_row
+            if 0 <= row_idx < len(self._items):
+                self.app.push_screen(DispatchDetailScreen(self._items[row_idx]))
+        except Exception:
+            pass
+
+    def action_copy_selected(self):
+        import subprocess
+        table = self.query_one("#dispatch-table", DataTable)
+        if not hasattr(self, '_items') or not self._items:
+            return
+        try:
+            row_idx = table.cursor_row
+            if 0 <= row_idx < len(self._items):
+                prompt = self._items[row_idx].get("dispatch_prompt", "")
+                subprocess.run(["pbcopy"], input=prompt.encode(), check=True)
+                self.notify("Copied to clipboard")
+        except Exception:
+            self.notify("Copy failed", severity="error")
+
+
 class ClaudeWatchApp(App):
     CSS_PATH = "token_watch_tui.tcss"
     TITLE = "Token Watch"
@@ -5970,6 +6172,7 @@ class ClaudeWatchApp(App):
         Binding("0", "all_cycles", "All Cycles"),
         Binding("t", "show_analytics", "Analytics"),
         Binding("g", "show_rules", "Rules"),
+        Binding("d", "show_dispatch", "Dispatch"),
         Binding("w", "show_attribution", "Who?"),
         Binding("slash", "start_search", "Search"),
         Binding("tab", "focus_next", "Next panel", show=False),
@@ -6016,6 +6219,7 @@ class ClaudeWatchApp(App):
             yield AdvisorView(id="view-advisor")
             yield InboxView(id="view-inbox")
             yield AnalyticsView(id="view-analytics")
+            yield DispatchView(id="view-dispatch")
         yield Footer()
 
     def switch_view(self, view_id: str) -> None:
@@ -6045,6 +6249,7 @@ class ClaudeWatchApp(App):
             "view-mission": "nav-mission",
             "view-advisor": "nav-advisor",
             "view-analytics": "nav-analytics",
+            "view-dispatch": "nav-dispatch",
         }
         active_nav = nav_map.get(view_id, "")
         for btn in self.query("#nav-bar Button"):
@@ -6372,6 +6577,9 @@ class ClaudeWatchApp(App):
     def action_show_analytics(self):
         self.switch_view("view-analytics")
 
+    def action_show_dispatch(self):
+        self.switch_view("view-dispatch")
+
     def _ensure_cycle_list(self):
         """Load cycle list if not loaded."""
         if not self._cycle_list:
@@ -6434,6 +6642,7 @@ class ClaudeWatchApp(App):
             "nav-mission": "view-mission",
             "nav-advisor": "view-advisor",
             "nav-analytics": "view-analytics",
+            "nav-dispatch": "view-dispatch",
         }
         btn_id = event.button.id or ""
         if not btn_id.startswith("nav-"):

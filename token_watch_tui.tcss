@@ -453,3 +453,12 @@ DataTable > .datatable--header {
 #navscreen-header { height: auto; max-height: 2; padding: 1 2; }
 #navscreen-grid { padding: 1 2; }
 #navscreen-grid Button { width: 100%; height: 3; margin: 0 0 1 0; }
+
+/* -- Dispatch View -- */
+#dispatch-header { height: auto; max-height: 3; padding: 0 1; }
+#dispatch-table { height: 1fr; border: solid green; border-title-color: white; border-title-style: bold; }
+
+/* -- Dispatch Detail Screen -- */
+#dd-header { height: auto; max-height: 3; padding: 0 1; background: $surface; }
+#dd-scroll { height: 1fr; padding: 1 2; }
+#dd-body { height: auto; }
