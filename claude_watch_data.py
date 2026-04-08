@@ -5913,11 +5913,11 @@ def _compute_utilization(window):
     build_data = _get_build_ledger(days=days, limit=500)
     build_items = build_data.get("items", [])
 
-    # ── Account capacity (current) ───────────────────────────────────────
-    supa_capacity = _get_supabase_account_capacity()
+    # ── Account capacity (current — merges live + Supabase) ────────────
+    cap_display = get_account_capacity_display()
     cap_by_label = {}
-    for row in supa_capacity:
-        cap_by_label[row.get("account", "")] = row
+    for row in cap_display:
+        cap_by_label[row.get("label", "")] = row
 
     # ── Per-account metrics ──────────────────────────────────────────────
     account_labels = ["A", "B", "C"]
@@ -5942,32 +5942,27 @@ def _compute_utilization(window):
                 acct_sessions += 1
                 acct_tokens += s.get("output_tokens", 0)
 
-        # Avg burn from window scores
-        scores = _get_window_scores(limit=50)
-        burn_vals = []
-        for sc in scores:
-            try:
-                sc_ts = datetime.fromisoformat(sc["window_start"].replace("Z", "+00:00"))
-                if sc_ts >= cutoff:
-                    burn_vals.append(_safe_float(sc.get("burn_pct", 0)))
-            except Exception:
-                pass
-        avg_burn = sum(burn_vals) / len(burn_vals) if burn_vals else 0
-
-        # Current 7d usage from Supabase
+        # Current capacity from live data (active acct) or Supabase (inactive)
         cap_row = cap_by_label.get(label, {})
-        seven_day = _safe_float(cap_row.get("seven_day_used_pct", 0))
+        five_pct = cap_row.get("five_pct")
+        seven_day = cap_row.get("seven_pct")
+        # Convert non-numeric values to 0
+        five_pct = _safe_float(five_pct, 0) if five_pct not in (None, "—") else None
+        seven_day = _safe_float(seven_day, 0) if seven_day not in (None, "—") else None
+        snapshot_age = cap_row.get("snapshot_age_min", 999)
 
         score = _score_dimension(util_pct, 85.0)
 
         account_results.append({
             "label": label,
-            "name": meta.get("name", "?"),
-            "lane": meta.get("lane", "?"),
+            "name": meta.get("name", cap_row.get("name", "?")),
+            "lane": meta.get("lane", cap_row.get("lane", "?")),
             "active_hours": round(active_h, 1),
             "idle_hours": round(idle_h, 1),
-            "avg_burn_pct": round(avg_burn, 1),
-            "seven_day_pct": round(seven_day, 1),
+            "five_pct": five_pct,
+            "seven_day_pct": seven_day,
+            "snapshot_age_min": round(snapshot_age, 0),
+            "is_active": cap_row.get("is_active", False),
             "sessions": acct_sessions,
             "output_tokens": acct_tokens,
             "utilization_pct": round(util_pct, 1),
@@ -5991,7 +5986,8 @@ def _compute_utilization(window):
     run_rate = total_cost / max(days, 1)
 
     # Fleet score: weighted from 5 dimensions
-    burn_vals_all = [a["avg_burn_pct"] for a in account_results]
+    # Use actual 7d usage for burn dimension (accounts with data only)
+    burn_vals_all = [a["seven_day_pct"] for a in account_results if a.get("seven_day_pct") is not None]
     avg_burn_fleet = sum(burn_vals_all) / len(burn_vals_all) if burn_vals_all else 0
 
     # Gini coefficient for balance
@@ -6271,15 +6267,20 @@ def _generate_utilization_suggestions(analytics):
     efficiency = analytics.get("efficiency", {})
     waste = analytics.get("waste", {})
 
+    # Helper: safely get numeric 7d pct (None-safe)
+    def _seven(a):
+        v = a.get("seven_day_pct")
+        return v if v is not None else 0
+
     # Rule 1: Account imbalance — one high, one low
     for a in accounts:
-        if a.get("seven_day_pct", 0) > 95:
+        if _seven(a) > 95:
             for b in accounts:
-                if b["label"] != a["label"] and b.get("seven_day_pct", 0) < 50:
+                if b["label"] != a["label"] and _seven(b) < 50:
                     suggestions.append({
                         "priority": "high", "category": "rebalance",
-                        "message": f"Account {a['label']} at {a['seven_day_pct']}% weekly "
-                                   f"while {b['label']} at {b['seven_day_pct']}%. "
+                        "message": f"Account {a['label']} at {_seven(a):.0f}% weekly "
+                                   f"while {b['label']} at {_seven(b):.0f}%. "
                                    f"Shift work to {b['label']} before {a['label']} exhausts.",
                     })
                     break
@@ -6343,7 +6344,7 @@ def _generate_utilization_suggestions(analytics):
         })
 
     # Rule 8: Low burn
-    avg_burns = [a.get("avg_burn_pct", 0) for a in accounts]
+    avg_burns = [a["seven_day_pct"] for a in accounts if a.get("seven_day_pct") is not None]
     fleet_burn = sum(avg_burns) / len(avg_burns) if avg_burns else 0
     if fleet_burn < 60 and fleet_burn > 0:
         suggestions.append({
@@ -6363,7 +6364,7 @@ def _generate_utilization_suggestions(analytics):
 
     # Rule 10: Great utilization (positive feedback)
     if fleet.get("utilization_pct", 0) > 85:
-        all_above_80 = all(a.get("seven_day_pct", 0) > 80 for a in accounts if a.get("seven_day_pct", 0) > 0)
+        all_above_80 = all(_seven(a) > 80 for a in accounts if _seven(a) > 0)
         if all_above_80 and accounts:
             suggestions.append({
                 "priority": "info", "category": "positive",

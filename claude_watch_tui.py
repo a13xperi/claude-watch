@@ -5472,13 +5472,32 @@ class AnalyticsView(LazyView):
             a_score = _score_dimension(a_util, 85.0)
             a_stars = _stars_display(a_score)
 
+            # Format capacity values — None means no data for inactive accounts
+            five_val = acct.get("five_pct")
+            seven_val = acct.get("seven_day_pct")
+            five_str = f"{five_val:.0f}%" if five_val is not None else "[dim]—[/dim]"
+            seven_str = f"{seven_val:.0f}%" if seven_val is not None else "[dim]—[/dim]"
+            # Color 7d by urgency
+            if seven_val is not None:
+                if seven_val >= 95:
+                    seven_str = f"[red bold]{seven_val:.0f}%[/red bold]"
+                elif seven_val >= 70:
+                    seven_str = f"[yellow]{seven_val:.0f}%[/yellow]"
+                else:
+                    seven_str = f"[green]{seven_val:.0f}%[/green]"
+
+            active_tag = " [green bold]ACTIVE[/green bold]" if acct.get("is_active") else ""
+            snap_age = acct.get("snapshot_age_min", 0)
+            stale_note = ""
+            if not acct.get("is_active") and snap_age > 60:
+                stale_note = f"  [dim](snapshot {snap_age/60:.0f}h ago)[/dim]"
+
             card = (
-                f"Lane: {acct.get('lane', '?')}\n"
+                f"Lane: {acct.get('lane', '?')}{active_tag}\n"
                 f"Active: [{color}]{acct.get('active_hours', 0)}h[/{color}] / "
                 f"{acct.get('active_hours', 0) + acct.get('idle_hours', 0):.0f}h\n"
                 f"{a_bar}  {a_util}%\n"
-                f"5h avg burn: {acct.get('avg_burn_pct', 0)}%    "
-                f"7d: {acct.get('seven_day_pct', 0)}%\n"
+                f"5h: {five_str}    7d: {seven_str}{stale_note}\n"
                 f"Sessions: {acct.get('sessions', 0)}    Tokens: {tok_s}\n"
                 f"Score: {a_stars} ({a_score:.1f})"
             )
