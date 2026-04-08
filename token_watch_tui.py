@@ -6219,6 +6219,8 @@ class DispatchView(LazyView):
     BINDINGS = [
         Binding("r", "refresh_dispatch", "Refresh"),
         Binding("c", "copy_selected", "Copy"),
+        Binding("x", "claim_selected", "Claim"),
+        Binding("a", "archive_selected", "Archive"),
     ]
 
     def refresh_content(self):
@@ -6245,7 +6247,7 @@ class DispatchView(LazyView):
             f"[green]{stats['total_ready']} ready[/green]  ·  "
             f"[yellow]{stats['total_active']} active[/yellow]  ·  "
             f"[dim]~{stats['total_tokens_k']}kT total[/dim]  "
-            f"[dim italic]enter=view  c=copy  r=refresh[/dim italic]"
+            f"[dim italic]enter=view  c=copy  x=claim  a=archive  r=refresh[/dim italic]"
         )
 
         table = self.query_one("#dispatch-table", DataTable)
@@ -6351,6 +6353,47 @@ class DispatchView(LazyView):
                 self.notify("Copied to clipboard")
         except Exception:
             self.notify("Copy failed", severity="error")
+
+    def action_claim_selected(self):
+        """Claim the selected task — sets status=in_progress, claimed_by=this session."""
+        from token_watch_data import _dispatch_claim_task
+        if not hasattr(self, '_items') or not self._items:
+            return
+        try:
+            table = self.query_one("#dispatch-table", DataTable)
+            row_idx = table.cursor_row
+            if 0 <= row_idx < len(self._items):
+                item = self._items[row_idx]
+                if item.get("status") != "ready":
+                    self.notify("Already claimed", severity="warning")
+                    return
+                ok = _dispatch_claim_task(item["id"])
+                if ok:
+                    self.notify("Claimed #" + str(item["id"]) + " — " + item.get("task_name", "")[:30])
+                    self.action_refresh_dispatch()
+                else:
+                    self.notify("Claim failed", severity="error")
+        except Exception:
+            self.notify("Claim failed", severity="error")
+
+    def action_archive_selected(self):
+        """Archive the selected task — removes from queue."""
+        from token_watch_data import _dispatch_archive_task
+        if not hasattr(self, '_items') or not self._items:
+            return
+        try:
+            table = self.query_one("#dispatch-table", DataTable)
+            row_idx = table.cursor_row
+            if 0 <= row_idx < len(self._items):
+                item = self._items[row_idx]
+                ok = _dispatch_archive_task(item["id"])
+                if ok:
+                    self.notify("Archived #" + str(item["id"]))
+                    self.action_refresh_dispatch()
+                else:
+                    self.notify("Archive failed", severity="error")
+        except Exception:
+            self.notify("Archive failed", severity="error")
 
 
 class ExpensiveTurnsView(LazyView):

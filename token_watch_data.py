@@ -3976,6 +3976,57 @@ def _get_dispatch_queue():
         _log.warning("_get_dispatch_queue: %s", e)
         return empty
 
+def _dispatch_claim_task(task_id):
+    """Claim a task from the dispatch queue — set status=in_progress."""
+    import urllib.request, os
+    try:
+        session_id = "cc-" + str(os.getppid())
+        data = json.dumps({
+            "status": "in_progress",
+            "claimed_by": session_id,
+        }).encode()
+        url = _SUPABASE_URL + "/project_tasks?id=eq." + str(task_id) + "&status=eq.ready"
+        req = urllib.request.Request(url, data=data, headers={
+            "apikey": _SUPABASE_KEY,
+            "Authorization": "Bearer " + _SUPABASE_KEY,
+            "Content-Type": "application/json",
+            "Prefer": "return=representation",
+        }, method="PATCH")
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            result = json.loads(resp.read())
+        global _dispatch_queue_cache
+        _dispatch_queue_cache = (0, None)
+        return len(result) > 0
+    except Exception as e:
+        _log.warning("_dispatch_claim_task: %s", e)
+        return False
+
+
+def _dispatch_archive_task(task_id):
+    """Archive a task — remove from dispatch queue."""
+    import urllib.request
+    try:
+        data = json.dumps({
+            "status": "archived",
+            "notes": "Archived from TUI Dispatch tab",
+        }).encode()
+        url = _SUPABASE_URL + "/project_tasks?id=eq." + str(task_id)
+        req = urllib.request.Request(url, data=data, headers={
+            "apikey": _SUPABASE_KEY,
+            "Authorization": "Bearer " + _SUPABASE_KEY,
+            "Content-Type": "application/json",
+            "Prefer": "return=representation",
+        }, method="PATCH")
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            result = json.loads(resp.read())
+        global _dispatch_queue_cache
+        _dispatch_queue_cache = (0, None)
+        return len(result) > 0
+    except Exception as e:
+        _log.warning("_dispatch_archive_task: %s", e)
+        return False
+
+
 def _get_wire_messages(limit=50, cycle_id=None):
     """Fetch recent Wire messages from Supabase session_messages table."""
     import urllib.request
