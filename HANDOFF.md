@@ -3,7 +3,15 @@
 ## What This Is
 Real-time terminal dashboard for monitoring Claude Code token usage. GitHub: a13xperi/token-watch
 
-## Current State (v0.15+ — Pomodoro System + Audit + Skills + Auto-Roll)
+## Current State (v0.16+ — Advisor Engine + Engine Management + Directives Integration)
+
+**v0.16 features (shipped 2026-04-08):**
+- **Advisor engine expanded to 21 checks** (was 18): new checks `test_queue_backlog`, `stale_sessions_auto_cleanup`, `capacity_waste`
+- **Insight schema extended**: `auto_fixable` and `remediation_key` fields on each insight, laying groundwork for autonomous remediation
+- **Engine management system**: `_get_engine_status()` in data.py + `EngineTable` widget in tui.py — shows which checks are enabled, last run, and pass/fail state
+- **Directives integration**: Advisor reads `~/DIRECTIVES.md` for strategic context when synthesizing recommendations
+- **Account column on sessions table**: sessions now carry account (A/B/C) for capacity attribution
+- **Stale branches cleaned up**: `feat/test-queue` and `feat/notion-bug-sync` deleted from remote
 
 **Burn session additions (2026-04-08 02:00 UTC):**
 - **Auto-roll cycle items at boundaries** (`efc67d8`): `_auto_roll_stale_items()` catches open items from ANY past window (not just previous). Dedup by `(title, project)`, `[rolled]` prefix, idempotent. Rolled 29 stale items across 7 windows on first run. Called from `_check_and_score_completed_window()`.
@@ -42,12 +50,15 @@ Real-time terminal dashboard for monitoring Claude Code token usage. GitHub: a13
 
 ## What's Next
 
-### Remaining backlog (from Notion):
-1. Cycle navigator visible UI polish (Medium)
-2. Session monitor LaunchAgent (Medium)
-3. Better test hints — project-specific verify instructions (Medium)
-4. Smarter lane auto-assignment in Cycle Monitor (Medium)
-5. ~~Re-seed build_ledger with correct git timestamps~~ **Done** (burn session 2026-04-08)
+### Remaining backlog:
+1. **Dead code removal** — 4 functions identified, still pending removal
+2. **Exception logging cleanup** — 221 bare `except` blocks → replace with logged exceptions
+3. **Advisor autonomous remediation** — use `auto_fixable` + `remediation_key` to auto-fix what the advisor flags (e.g. stale sessions, capacity waste)
+4. **Cycle navigator UI polish** (Medium) — visible navigation improvements
+5. **Session monitor LaunchAgent** (Medium) — LaunchAgent to keep session monitor running on login
+6. Better test hints — project-specific verify instructions (Medium)
+7. Smarter lane auto-assignment in Cycle Monitor (Medium)
+8. ~~Re-seed build_ledger with correct git timestamps~~ **Done** (burn session 2026-04-08)
 
 ### Atlas (separate repos):
 - Portal PRs #168, #166 need a11y fix before merge
