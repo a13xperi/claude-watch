@@ -39,6 +39,8 @@ class Insight:
     action: str
     source: str
     data: dict = field(default_factory=dict)
+    auto_fixable: bool = False
+    remediation_key: str = ""
 
     def sort_key(self):
         return (SEVERITY_ORDER.get(self.severity, 9), self.category, self.title)
@@ -86,6 +88,14 @@ def _read_context_md() -> str:
         return ""
 
 
+def _read_directives_md() -> str:
+    """Read ~/DIRECTIVES.md, return text or empty string."""
+    try:
+        return (Path.home() / "DIRECTIVES.md").read_text()
+    except Exception:
+        return ""
+
+
 def _reset_seconds(reset_ts: str) -> Optional[int]:
     """Parse an ISO reset timestamp and return seconds until reset, or None."""
     if not reset_ts:
@@ -116,6 +126,8 @@ def _build_context() -> Dict[str, Any]:
         _get_system_health,
         _get_wire_messages,
         get_account_capacity_display,
+        _get_test_queue,
+        _get_utilization_analytics,
     )
 
     ctx: Dict[str, Any] = {}
@@ -127,6 +139,7 @@ def _build_context() -> Dict[str, Any]:
     ctx["window_scores"] = _get_window_scores(limit=20)
     ctx["current_cycle_id"] = _get_current_cycle_id()
     ctx["context_md"] = _read_context_md()
+    ctx["directives_md"] = _read_directives_md()
 
     # Supabase calls in parallel
     supabase_tasks = {
@@ -137,6 +150,8 @@ def _build_context() -> Dict[str, Any]:
         "session_tasks": lambda: _get_session_tasks(today_only=True),
         "wire_messages": lambda: _get_wire_messages(limit=50),
         "system_health": lambda: _get_system_health(),
+        "test_queue": lambda: _get_test_queue(),
+        "utilization_analytics": lambda: _get_utilization_analytics("24h"),
     }
 
     with ThreadPoolExecutor(max_workers=4) as pool:
@@ -154,6 +169,10 @@ def _build_context() -> Dict[str, Any]:
                     ctx[key] = {"messages": [], "total": 0, "unread": 0, "sessions": 0}
                 elif key == "system_health":
                     ctx[key] = {"claude_sessions": [], "infrastructure": [], "totals": {"cpu": 0, "mem_mb": 0, "mem_pct": 0}, "alerts": []}
+                elif key == "test_queue":
+                    ctx[key] = []
+                elif key == "utilization_analytics":
+                    ctx[key] = {"waste": {"waste_pct": 0}, "efficiency": {}, "fleet": {"utilization_pct": 0}, "suggestions": []}
                 else:
                     ctx[key] = []
 
@@ -428,6 +447,8 @@ def check_stale_tasks(ctx: Dict) -> List[Insight]:
             action="Review and prioritize or archive.",
             source="stale_tasks",
             data={"count": len(stale)},
+            auto_fixable=True,
+            remediation_key="task_archive",
         )]
     return []
 
@@ -484,6 +505,8 @@ def check_stuck_sessions(ctx: Dict) -> List[Insight]:
                 action="Check if stuck or kill.",
                 source="stuck_sessions",
                 data={"pid": pid, "age_secs": secs},
+                auto_fixable=True,
+                remediation_key="zombie_kill",
             )]
     return insights
 
@@ -613,6 +636,8 @@ def check_unread_wire(ctx: Dict) -> List[Insight]:
             action="Check Wire tab (w).",
             source="unread_wire",
             data={"unread": unread},
+            auto_fixable=True,
+            remediation_key="wire_cleanup",
         )]
     return []
 
@@ -667,6 +692,104 @@ def check_context_blockers(ctx: Dict) -> List[Insight]:
                 ))
                 if len(insights) >= 2:
                     break
+
+    return insights
+
+
+
+# --- Test Queue checks ---
+
+@advisor_check("test_queue_backlog", ["test_queue"])
+def check_test_queue_backlog(ctx: Dict) -> List[Insight]:
+    queue = ctx.get("test_queue", [])
+    pending = [item for item in queue if item.get("status") == "pending"]
+    count = len(pending)
+    if count > 50:
+        return [Insight(
+            category="QA", severity="critical",
+            title="QA bottleneck",
+            message=f"{count} pending test items — QA is bottlenecked.",
+            action="Run /push-to-test or triage in Test tab (x).",
+            source="test_queue_backlog",
+            data={"pending": count},
+        )]
+    if count > 20:
+        return [Insight(
+            category="QA", severity="warning",
+            title="QA backlog growing",
+            message=f"{count} pending test items — QA backlog growing.",
+            action="Run /push-to-test or triage in Test tab (x).",
+            source="test_queue_backlog",
+            data={"pending": count},
+        )]
+    return []
+
+
+# --- Stale Sessions checks ---
+
+@advisor_check("stale_sessions_auto_cleanup", ["peer_sessions"])
+def check_stale_sessions_auto_cleanup(ctx: Dict) -> List[Insight]:
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(hours=2)
+    insights = []
+    for peer in ctx.get("peer_sessions", []):
+        hb = peer.get("heartbeat_at", "")
+        if not hb:
+            continue
+        try:
+            hb_dt = datetime.fromisoformat(hb.replace("Z", "+00:00"))
+        except Exception:
+            continue
+        if hb_dt < cutoff:
+            age_hours = (now - hb_dt).total_seconds() / 3600
+            sid = peer.get("session_id", "?")
+            insights.append(Insight(
+                category="SESSION_HEALTH", severity="warning",
+                title=f"Stale session {sid[:12]}",
+                message=f"Session {sid} has stale heartbeat ({age_hours:.0f}h ago) — likely dead.",
+                action="Auto-cleanup: mark as done.",
+                source="stale_sessions_auto_cleanup",
+                data={"session_id": sid, "age_hours": round(age_hours, 1)},
+                auto_fixable=True,
+                remediation_key=f"cleanup_session:{sid}",
+            ))
+    return insights
+
+
+# --- Capacity Waste checks ---
+
+@advisor_check("capacity_waste", ["utilization_analytics"])
+def check_capacity_waste(ctx: Dict) -> List[Insight]:
+    analytics = ctx.get("utilization_analytics", {})
+    waste = analytics.get("waste", {})
+    fleet = analytics.get("fleet", {})
+    suggestions = analytics.get("suggestions", [])
+
+    insights = []
+    waste_pct = _sf(waste.get("waste_pct", 0))
+    utilization_pct = _sf(fleet.get("utilization_pct", 0))
+
+    if waste_pct > 30:
+        wasted_hours = waste.get("total_wasted_hours", 0)
+        reason = f"{wasted_hours:.0f}h wasted" if wasted_hours else "idle gaps between sessions"
+        insights.append(Insight(
+            category="EFFICIENCY", severity="warning",
+            title="High capacity waste",
+            message=f"{waste_pct:.0f}% capacity wasted in last 24h — {reason}.",
+            action=suggestions[0]["message"] if suggestions else "Consolidate sessions and reduce idle gaps.",
+            source="capacity_waste",
+            data={"waste_pct": waste_pct, "wasted_hours": wasted_hours},
+        ))
+
+    if utilization_pct > 0 and utilization_pct < 50:
+        insights.append(Insight(
+            category="EFFICIENCY", severity="info",
+            title="Low fleet efficiency",
+            message=f"Fleet efficiency at {utilization_pct:.0f}% — consider consolidating sessions.",
+            action=suggestions[0]["message"] if suggestions else "Consolidate sessions or switch to fewer active accounts.",
+            source="capacity_waste",
+            data={"utilization_pct": utilization_pct},
+        ))
 
     return insights
 

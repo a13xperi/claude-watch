@@ -2607,6 +2607,152 @@ def _get_system_health():
     return result
 
 
+
+def _get_engine_status():
+    # type: () -> Dict[str, Any]
+    """Unified engine status: merges sessions + health + per-session scoring + pressure."""
+    import re as _re
+
+    sessions_raw = _active_sessions()  # list of (pid, etime, directive, delta, source)
+    health = _get_system_health()       # dict with claude_sessions, totals, etc.
+    peers = _get_peer_sessions()
+
+    # Build PID->health lookup from system health claude_sessions
+    health_by_pid = {}  # type: Dict[str, Dict]
+    for hs in health.get("claude_sessions", []):
+        health_by_pid[hs["pid"]] = hs
+
+    # Collect local SIDs for peer dedup
+    local_sids = set()  # type: set
+    for item in sessions_raw:
+        local_sids.add("cc-{}".format(item[0]))
+    remote_peers = [p for p in peers if p.get("session_id", "") not in local_sids]
+
+    # Parse delta string to numeric percentage
+    def _parse_delta(delta_str):
+        # type: (str) -> float
+        if not delta_str or delta_str in ("?", "new"):
+            return 0.0
+        m = _re.search(r"[\d.]+", delta_str)
+        return float(m.group()) if m else 0.0
+
+    sessions = []  # type: List[Dict[str, Any]]
+    for item in sessions_raw:
+        pid, age, directive, delta = item[0], item[1], item[2], item[3]
+        source = item[4] if len(item) > 4 else "?"
+        sid = "cc-{}".format(pid)
+
+        # Cross-reference health data
+        hs = health_by_pid.get(pid, {})
+        mem_mb = hs.get("mem_mb", 0)
+        cpu = hs.get("cpu", 0.0)
+        status = hs.get("status", "active")
+        start_time = hs.get("start_time", "?")
+
+        # Last activity from ledger
+        secs_ago, last_tool = _session_last_activity(pid)
+
+        # Delta percentage
+        delta_pct = _parse_delta(delta)
+
+        # Health scoring
+        health_score = "green"
+        health_reason = ""
+
+        if status == "runaway":
+            health_score = "red"
+            health_reason = "runaway process"
+        elif secs_ago is not None and secs_ago > 1800:
+            health_score = "red"
+            health_reason = "idle >30m"
+        elif delta_pct > 30 and (secs_ago is None or secs_ago > 300):
+            health_score = "red"
+            health_reason = "high burn, no recent activity"
+        elif secs_ago is not None and secs_ago > 900:
+            health_score = "yellow"
+            health_reason = "idle >15m"
+        elif delta_pct > 25 and (secs_ago is None or secs_ago > 120):
+            health_score = "yellow"
+            health_reason = "elevated burn, sparse activity"
+        elif secs_ago is not None and secs_ago < 15:
+            health_score = "green"
+            health_reason = "active"
+        elif secs_ago is not None and secs_ago < 120:
+            health_score = "green"
+            health_reason = "recent"
+        else:
+            health_score = "green"
+            health_reason = "ok"
+
+        sessions.append({
+            "pid": pid,
+            "sid": sid,
+            "source": source,
+            "directive": directive,
+            "age": age,
+            "delta": delta,
+            "mem_mb": mem_mb,
+            "cpu": cpu,
+            "status": status,
+            "start_time": start_time,
+            "health": health_score,
+            "health_reason": health_reason,
+        })
+
+    # System pressure detection
+    totals = health.get("totals", {"cpu": 0, "mem_mb": 0, "mem_pct": 0, "system_mem_mb": 16384})
+    pressure_active = totals.get("mem_mb", 0) > 3072 or totals.get("cpu", 0) > 40
+    pressure_reason = ""
+    trim_order = []  # type: List[Dict[str, Any]]
+
+    if pressure_active:
+        reasons = []  # type: List[str]
+        if totals.get("mem_mb", 0) > 3072:
+            reasons.append("mem {:.1f}GB".format(totals["mem_mb"] / 1024))
+        if totals.get("cpu", 0) > 40:
+            reasons.append("cpu {:.0f}%".format(totals["cpu"]))
+        pressure_reason = "System pressure: " + ", ".join(reasons)
+
+        # Rank sessions by value (lower value = trim first)
+        scored = []  # type: List[tuple]
+        for s in sessions:
+            value = 50  # base
+            secs_ago_s, _ = _session_last_activity(s["pid"])
+            if secs_ago_s is not None:
+                if secs_ago_s < 30:
+                    value += 40  # actively working, high value
+                elif secs_ago_s < 120:
+                    value += 20
+                elif secs_ago_s > 900:
+                    value -= 30  # long idle, low value
+            else:
+                value -= 20  # no output at all
+            if s["health"] == "red":
+                value -= 25
+            elif s["health"] == "yellow":
+                value -= 10
+            scored.append((value, s))
+
+        scored.sort(key=lambda x: x[0])
+        for val, s in scored:
+            trim_order.append({
+                "sid": s["sid"],
+                "reason": s["health_reason"] or "low value",
+                "mem_freed_mb": s["mem_mb"],
+            })
+
+    return {
+        "sessions": sessions,
+        "peers": remote_peers,
+        "totals": totals,
+        "pressure": {
+            "active": pressure_active,
+            "reason": pressure_reason,
+            "trim_order": trim_order,
+        },
+    }
+
+
 # ── Rich panel builders (used by Rich version + Textual Static widgets) ──────
 
 def _token_pacing():
@@ -5644,25 +5790,6 @@ def _toggle_heartbeat(agent_id, enabled):
         return False
 
 
-_blocked_attempts_log = Path.home() / ".claude/logs/blocked-access.jsonl"
-
-
-def _log_blocked_attempt(system, agent_name="", detail=""):
-    """Log when a disabled system tries to access tokens."""
-    import json as _json
-    entry = {
-        "ts": datetime.now(timezone.utc).isoformat(),
-        "system": system,
-        "agent": agent_name,
-        "detail": detail,
-    }
-    try:
-        with open(_blocked_attempts_log, "a") as f:
-            f.write(_json.dumps(entry) + "\n")
-    except Exception:
-        pass
-
-
 _KNOWN_INTERVALS = {
     "DevOps Monitor": 3600, "Project Manager": 14400,
     "Process Auditor": 43200, "Ops Director": 86400,
@@ -5731,21 +5858,6 @@ def _get_blocked_attempts(minutes=60):
 
     attempts.sort(key=lambda x: x["ts"])
     return attempts
-
-
-def _get_heartbeat_runs(company_id, limit=10):
-    """Fetch recent heartbeat runs for a company."""
-    import urllib.request
-    import json as _json
-
-    url = f"{PAPERCLIP_BASE}/api/companies/{company_id}/heartbeat-runs?limit={limit}"
-    req = urllib.request.Request(url)
-    try:
-        with urllib.request.urlopen(req, timeout=5) as resp:
-            return _json.loads(resp.read())
-    except Exception as e:
-        _log.warning("Failed to fetch heartbeat runs: %s", e)
-        return []
 
 
 # ── Rules system ────────────────────────────────────────────────────────────

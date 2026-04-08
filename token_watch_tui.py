@@ -51,6 +51,7 @@ from token_watch_data import (
     _estimate_turn_cost,
     _get_session_turns,
     _get_system_health,
+    _get_engine_status,
     _get_usage_metrics,
     _gravity_center,
     _index_building,
@@ -75,7 +76,6 @@ from token_watch_data import (
     lookup_by_ccid,
     make_drain_panel,
     make_header,
-    make_sessions_panel,
     make_skills_panel,
     make_tool_stats,
     _build_full_audit,
@@ -244,10 +244,44 @@ class AccountCapacityPanel(Static):
         self.update(Panel(t, title="[bold]Account Capacity[/bold]", border_style="dim"))
 
 
-class ActiveSessionsTable(DataTable):
-    """Interactive active sessions table — Enter/f to focus the terminal."""
 
-    BORDER_TITLE = "Active Sessions (live)"
+# ── Shared helper functions (extracted from SystemHealthPanel for reuse) ──────
+
+def _mem_mini_gauge(mb):
+    """Mini memory gauge bar with color coding."""
+    pct = min(mb / 10, 100)  # scale: 1000MB = 100%
+    filled = min(int(pct * 3 / 100), 3)
+    color = "green" if mb < 300 else ("yellow" if mb < 500 else "red")
+    _F, _E = "\u2588", "\u2591"
+    bar = f"[{color}]{_F * filled}{_E * (3 - filled)}[/{color}]"
+    if mb >= 1024:
+        return f"{bar} {mb / 1024:.1f}GB"
+    return f"{bar} {mb}MB"
+
+
+def _gauge_bar(pct, width=10):
+    """Percentage gauge bar with color zones."""
+    filled = int(pct * width / 100)
+    color = "green" if pct < 40 else ("yellow" if pct < 70 else "red")
+    fill_chars = "█" * filled + "░" * (width - filled)
+    return f"[{color}]{fill_chars}[/{color}]"
+
+
+def _zone_label(pct):
+    """Return (label, color) for a percentage zone."""
+    if pct < 40:
+        return ("COOL", "green")
+    if pct < 70:
+        return ("WARM", "yellow")
+    if pct < 85:
+        return ("HOT", "red")
+    return ("REDLINE", "bold red")
+
+
+class EngineTable(DataTable):
+    """Engine management — unified session health + system pressure."""
+
+    BORDER_TITLE = "Engine Management (live)"
     BORDER_SUBTITLE = "Enter/f to focus terminal"
 
     BINDINGS = [
@@ -259,44 +293,40 @@ class ActiveSessionsTable(DataTable):
         self.zebra_stripes = False
         self.add_column("When", width=9, key="when")
         self.add_column("Session", width=10, key="session")
+        self.add_column("Acct", width=4, key="acct")
         self.add_column("Src", width=10, key="src")
         self.add_column("Co", width=8, key="co")
         self.add_column("Project", width=12, key="project")
         self.add_column("Mdl", width=10, key="mdl")
+        self.add_column("Mem", width=8, key="mem")
         self.add_column("Dur", width=12, key="dur")
         self.add_column("Used", width=11, key="used")
         self.add_column("Directive", key="directive")
 
     def refresh_rows(self):
-        """Rebuild the table from live session data + Supabase peers."""
-        from token_watch_data import _detect_source
+        """Rebuild the table from unified engine status with health scoring."""
+        engine = _get_engine_status()
+        engine_sessions = engine["sessions"]
+        remote_peers = engine["peers"]
+        pressure = engine["pressure"]
+        totals = engine["totals"]
 
-        sessions = _active_sessions()
         entries = _load_ledger(last_n=500)
         now_utc = datetime.now(timezone.utc)
         now_local = datetime.now()
 
-        # Collect local session IDs for dedup against peers
-        local_sids = set()  # type: set
-        for item in sessions:
-            local_sids.add("cc-{}".format(item[0]))
-
-        # Fetch peer sessions from Supabase, excluding local matches
-        peers = _get_peer_sessions()
-        remote_peers = [p for p in peers if p.get("session_id", "") not in local_sids]
-
-        n_local = len(sessions)
+        n_local = len(engine_sessions)
         n_peers = len(remote_peers)
         n_total = n_local + n_peers
         if n_total:
             if n_peers:
-                self.border_title = "Active Sessions (live) — {} ({} local, {} peers)".format(
+                self.border_title = "Engine Management (live) — {} ({} local, {} peers)".format(
                     n_total, n_local, n_peers
                 )
             else:
-                self.border_title = "Active Sessions (live) — {}".format(n_total)
+                self.border_title = "Engine Management (live) — {}".format(n_total)
         else:
-            self.border_title = "Active Sessions (live)"
+            self.border_title = "Engine Management (live)"
 
         try:
             cur_row = self.cursor_row
@@ -307,9 +337,9 @@ class ActiveSessionsTable(DataTable):
 
         self.clear()
 
-        if not sessions and not remote_peers:
+        if not engine_sessions and not remote_peers:
             self.add_row(
-                "", Text("--", style="dim"), "", "", "", "", "", "",
+                "", Text("--", style="dim"), "", "", "", "", "", "", "", "",
                 Text("no active sessions", style="dim"),
                 key="empty",
             )
@@ -337,10 +367,42 @@ class ActiveSessionsTable(DataTable):
                 except Exception:
                     pass
 
-        for item in sessions:
-            pid, age, directive, delta = item[0], item[1], item[2], item[3]
-            source = item[4] if len(item) > 4 else "?"
-            sid = f"cc-{pid}"
+        # Detect active account for local sessions
+        import json as _json
+        try:
+            with open("/tmp/statusline-debug.json") as _f:
+                _sd = _json.load(_f)
+            active_label = _sd.get("account", {}).get("label", "?")
+        except Exception:
+            active_label = "?"
+        acct_color_map = {"A": "cyan", "B": "magenta", "C": "yellow"}
+        acct_color_local = acct_color_map.get(active_label, "dim")
+
+        # Pressure alert row
+        if pressure["active"]:
+            trim_hints = []
+            for tr in pressure["trim_order"][:3]:
+                trim_hints.append("{} ({}, ~{}MB)".format(tr["sid"], tr["reason"], tr["mem_freed_mb"]))
+            pressure_text = "{} | trim: {}".format(
+                pressure["reason"], ", ".join(trim_hints) if trim_hints else "none"
+            )
+            self.add_row(
+                Text(""), Text(""), Text(""),
+                Text("⚠ PRESSURE", style="bold red"),
+                Text(""), Text(""), Text(""), Text(""), Text(""), Text(""),
+                Text(pressure_text, style="bold red"),
+                key="pressure-alert",
+            )
+
+        for session in engine_sessions:
+            pid = session["pid"]
+            sid = session["sid"]
+            age = session["age"]
+            directive = session["directive"]
+            delta = session["delta"]
+            source = session["source"]
+            mem_mb = session["mem_mb"]
+            health = session["health"]
 
             # Header row
             elapsed_s = _etime_to_secs(age)
@@ -368,7 +430,7 @@ class ActiveSessionsTable(DataTable):
             )
 
             # Derive project
-            project = "\u2014"
+            project = "—"
             if source in ("atlas-be", "atlas-fe"):
                 project = "atlas"
             elif source == "openclaw":
@@ -403,47 +465,47 @@ class ActiveSessionsTable(DataTable):
                 tool_name = "?"
                 token_delta = 0
 
-            # State detection
+            # State detection — use health score for dot color
+            dot_color = {"green": "bold green", "yellow": "bold yellow", "red": "bold red"}[health]
             if secs_since is not None and secs_since < 15:
                 state_txt = Text(f">> {tool_name[:12]}", style="bold green")
-                dot_color = "bold green"
             elif cpu > 20:
                 state_txt = Text("thinking...", style="bold yellow")
-                dot_color = "bold yellow"
             elif secs_since is not None and secs_since < 120:
                 state_txt = Text(f"~ {tool_name[:12]}", style="dim")
-                dot_color = "green"
             else:
                 state_txt = Text("idle", style="dim")
-                dot_color = "green"
+
+            # Memory gauge
+            mem_text = Text.from_markup(_mem_mini_gauge(mem_mb)) if mem_mb > 0 else Text("—", style="dim")
 
             self.add_row(
                 Text(start_str, style="dim"),
-                Text.from_markup(f"[{dot_color}]\u25cf [/{dot_color}][cyan]{sid}[/cyan]"),
+                Text.from_markup(f"[{dot_color}]● [/{dot_color}][cyan]{sid}[/cyan]"),
+                Text(active_label, style=acct_color_local),
                 Text(source, style=src_color),
                 Text(co_name, style=co_style),
                 Text(project, style="dim"),
                 Text(mdl, style=mdl_style),
+                mem_text,
                 Text(age, style="dim"),
                 Text(delta, style=color),
                 Text(directive),
                 key=f"active-{pid}",
             )
 
-            # Elapsed
+            # Sub-row: tool state detail
             if secs_since is not None:
                 m, s = divmod(secs_since, 60)
                 elapsed_str = f"{m}m{s:02d}s" if m else f"{s}s"
             else:
-                elapsed_str = "\u2014"
+                elapsed_str = "—"
 
-            # Tokens
             tok_str = (
                 f"{token_delta / 1000:.1f}k" if token_delta >= 1000
                 else str(token_delta)
             )
 
-            # CPU
             cpu_str = f"{cpu:.0f}%"
             cpu_style = "bold yellow" if cpu > 50 else ("dim" if cpu < 5 else "")
 
@@ -453,7 +515,9 @@ class ActiveSessionsTable(DataTable):
                 Text(""),
                 Text(""),
                 Text(""),
+                Text(""),
                 state_txt,
+                Text(""),
                 Text(f"ago: {elapsed_str}", style="dim"),
                 Text(f"tok: {tok_str}", style="dim"),
                 Text(f"cpu: {cpu_str}", style=cpu_style or ""),
@@ -463,15 +527,15 @@ class ActiveSessionsTable(DataTable):
             # Blank separator between sessions
             self.add_row(
                 Text(""), Text(""), Text(""), Text(""), Text(""),
-                Text(""), Text(""), Text(""), Text(""),
+                Text(""), Text(""), Text(""), Text(""), Text(""), Text(""),
                 key=f"gap-{pid}",
             )
 
-        # ── Remote peer sessions (from Supabase) ─────────────────────────
+        # ── Remote peer sessions (from Supabase) ─────
         for peer in remote_peers:
             p_sid = peer.get("session_id", "?")
-            p_repo = peer.get("repo", "\u2014")
-            p_task = peer.get("task_name", "\u2014") or "\u2014"
+            p_repo = peer.get("repo", "—")
+            p_task = peer.get("task_name", "—") or "—"
             p_account = peer.get("account", "?")
             p_tool = peer.get("tool", "?")
 
@@ -517,13 +581,15 @@ class ActiveSessionsTable(DataTable):
 
             self.add_row(
                 Text(claimed_str, style="dim"),
-                Text.from_markup("[blue]\u2601 [/blue][dim]{}[/dim]".format(p_sid)),
-                Text(p_tool, style="dim"),
+                Text.from_markup("[blue]☁ [/blue][dim]{}[/dim]".format(p_sid)),
                 Text(p_account, style=acct_color),
+                Text(p_tool, style="dim"),
+                Text(co_name, style=co_style),
                 Text(p_repo, style="dim"),
-                Text("\u2014", style="dim"),
+                Text("—", style="dim"),
+                Text("—", style="dim"),
                 Text(hb_str, style=hb_style),
-                Text("\u2014", style="dim"),
+                Text("—", style="dim"),
                 Text(p_task),
                 key="peer-{}".format(p_sid),
             )
@@ -531,9 +597,34 @@ class ActiveSessionsTable(DataTable):
             # Blank separator
             self.add_row(
                 Text(""), Text(""), Text(""), Text(""), Text(""),
-                Text(""), Text(""), Text(""), Text(""),
+                Text(""), Text(""), Text(""), Text(""), Text(""), Text(""),
                 key="peergap-{}".format(p_sid),
             )
+
+        # Totals footer row with gauges
+        mem_pct = totals.get("mem_pct", 0)
+        total_cpu = totals.get("cpu", 0)
+        total_mem = totals.get("mem_mb", 0)
+        sys_mem = totals.get("system_mem_mb", 16384)
+
+        mem_zone, mem_zc = _zone_label(mem_pct)
+        cpu_capped = min(total_cpu, 100)
+        cpu_zone, cpu_zc = _zone_label(cpu_capped)
+        mem_gb = total_mem / 1024
+        sys_gb = sys_mem / 1024
+
+        self.add_row(
+            Text(""),
+            Text.from_markup(
+                f"MEM {_gauge_bar(mem_pct)} {mem_gb:.1f}/{sys_gb:.0f}GB [{mem_zc}]{mem_zone}[/{mem_zc}]"
+            ),
+            Text(""), Text(""), Text(""),
+            Text.from_markup(
+                f"CPU {_gauge_bar(cpu_capped)} {total_cpu:.0f}% [{cpu_zc}]{cpu_zone}[/{cpu_zc}]"
+            ),
+            Text(""), Text(""), Text(""), Text(""), Text(""),
+            key="totals-footer",
+        )
 
         try:
             if cur_row < self.row_count:
@@ -1216,16 +1307,7 @@ class SystemHealthPanel(Static):
                        else ("cyan" if "atlas" in source else "dim"))
             )
 
-            def mem_mini_gauge(mb):
-                pct = min(mb / 10, 100)  # scale: 1000MB = 100%
-                filled = min(int(pct * 3 / 100), 3)
-                color = "green" if mb < 300 else ("yellow" if mb < 500 else "red")
-                bar = f"[{color}]{'█' * filled}{'░' * (3 - filled)}[/{color}]"
-                if mb >= 1024:
-                    return f"{bar} {mb / 1024:.1f}GB"
-                return f"{bar} {mb}MB"
-
-            mem_str = mem_mini_gauge(mem)
+            mem_str = _mem_mini_gauge(mem)
             if st == "runaway":
                 dot = "[bold red]⚠ [/bold red]"
                 status_str = f"[bold red]runaway[/bold red] ({directive[:20]})"
@@ -1286,33 +1368,18 @@ class SystemHealthPanel(Static):
         total_mem_str = f"{total_mem/1024:.1f}GB" if total_mem >= 1024 else f"{total_mem:.0f}MB"
         mem_pct_color = "red" if mem_pct > 80 else ("yellow" if mem_pct > 60 else "green")
 
-        # Summary gauge row
-        def gauge_bar(pct, width=10):
-            filled = int(pct * width / 100)
-            color = "green" if pct < 40 else ("yellow" if pct < 70 else "red")
-            return f"[{color}]{'█' * filled}{'░' * (width - filled)}[/{color}]"
-
-        def zone_label(pct):
-            if pct < 40:
-                return ("COOL", "green")
-            if pct < 70:
-                return ("WARM", "yellow")
-            if pct < 85:
-                return ("HOT", "red")
-            return ("REDLINE", "bold red")
-
-        mem_zone, mem_zc = zone_label(mem_pct)
+        mem_zone, mem_zc = _zone_label(mem_pct)
         cpu_capped = min(total_cpu, 100)
-        cpu_zone, cpu_zc = zone_label(cpu_capped)
+        cpu_zone, cpu_zc = _zone_label(cpu_capped)
         mem_gb = total_mem / 1024
         sys_gb = sys_mem / 1024
 
         t.add_row(
             "",
-            Text.from_markup(f"MEM {gauge_bar(mem_pct)} {mem_gb:.1f}GB/{sys_gb:.0f}GB [{mem_zc}]{mem_zone}[/{mem_zc}]"),
+            Text.from_markup(f"MEM {_gauge_bar(mem_pct)} {mem_gb:.1f}GB/{sys_gb:.0f}GB [{mem_zc}]{mem_zone}[/{mem_zc}]"),
             "",
             "",
-            Text.from_markup(f"CPU {gauge_bar(cpu_capped)} {total_cpu:.0f}% [{cpu_zc}]{cpu_zone}[/{cpu_zc}]"),
+            Text.from_markup(f"CPU {_gauge_bar(cpu_capped)} {total_cpu:.0f}% [{cpu_zc}]{cpu_zone}[/{cpu_zc}]"),
             "",
             "",
         )
@@ -3139,6 +3206,23 @@ class AccountCapacityView(LazyView):
             five_bar = self._bar(a["five_pct"])
             seven_bar = self._bar(a["seven_pct"])
 
+            # Sparklines from capacity history
+            from token_watch_data import _get_capacity_history
+            acct_history = [h for h in _get_capacity_history(limit=100) if h.get("account") == label]
+            five_vals = []
+            seven_vals = []
+            for h in acct_history:
+                try:
+                    five_vals.append(float(h.get("five_hour_used_pct", 0) or 0))
+                except (ValueError, TypeError):
+                    five_vals.append(0.0)
+                try:
+                    seven_vals.append(float(h.get("seven_day_used_pct", 0) or 0))
+                except (ValueError, TypeError):
+                    seven_vals.append(0.0)
+            five_spark = self._sparkline(five_vals)
+            seven_spark = self._sparkline(seven_vals)
+
             # Reset countdowns
             five_cd = _countdown(a["five_reset"]) if a["five_reset"] else "---"
             seven_cd = _countdown(a["seven_reset"]) if a["seven_reset"] else "---"
@@ -3175,9 +3259,11 @@ class AccountCapacityView(LazyView):
                 repos_line,
                 "",
                 "[bold]5h usage:[/bold]  " + five_bar,
+                "[dim]  trend:[/dim]  " + five_spark,
                 "[dim]  resets:[/dim] " + five_cd,
                 "",
                 "[bold]7d usage:[/bold]  " + seven_bar,
+                "[dim]  trend:[/dim]  " + seven_spark,
                 "[dim]  resets:[/dim] " + seven_cd,
                 "",
                 "[dim]data:[/dim] " + freshness,
@@ -3287,6 +3373,22 @@ class AccountCapacityView(LazyView):
             )
         except (ValueError, TypeError):
             return "[dim]{e}[/dim]  ---".format(e="░" * width)
+
+    @staticmethod
+    def _sparkline(values, width=20):
+        # type: (list, int) -> str
+        """Render an ASCII sparkline from percentage values (0-100)."""
+        _SPARKS = " ▁▂▃▄▅▆▇█"
+        if not values:
+            return "[dim]no history[/dim]"
+        # Take most recent `width` values, reverse to chronological (left=oldest, right=newest)
+        recent = list(reversed(values[:width]))
+        # Normalize against 100 (fixed scale for percentages)
+        chars = []
+        for v in recent:
+            idx = int(v * 8 / 100) if v > 0 else 0
+            chars.append(_SPARKS[min(idx, 8)])
+        return "".join(chars)
 
 
 
@@ -5888,8 +5990,7 @@ class ClaudeWatchApp(App):
                 yield TokenAttributionPanel(id="attribution")
                 yield Input(placeholder="Search sessions (ccid, project, directive)...", id="search-input")
                 yield UrgentAlerts(id="urgent")
-                yield SystemHealthPanel(id="system-health")
-                yield ActiveSessionsTable(id="active-sessions")
+                yield EngineTable(id="active-sessions")
                 yield SessionNarrativePanel(id="session-narrative")
                 yield SessionHistoryTable(id="session-history")
                 yield DrainPanel(id="drain")
@@ -6149,9 +6250,8 @@ class ClaudeWatchApp(App):
             self.query_one("#burndown", BurndownChart).update_content()
             self.query_one("#attribution", TokenAttributionPanel).update_content()
             self.query_one("#urgent", UrgentAlerts).update_content()
-            self.query_one("#active-sessions", ActiveSessionsTable).refresh_rows()
+            self.query_one("#active-sessions", EngineTable).refresh_rows()
             self.query_one("#session-narrative", SessionNarrativePanel).update_content()
-            self.query_one("#system-health", SystemHealthPanel).update_content()
             self.query_one("#session-history", SessionHistoryTable).refresh_rows()
             self.query_one("#tool-freq", ToolFrequency).update_content()
             self.query_one("#skills", SkillsPanel).update_content()

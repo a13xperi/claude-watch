@@ -125,13 +125,6 @@ Screen {
     max-height: 14;
 }
 
-/* ── Drain + Agents row ── */
-#drain-row {
-    layout: horizontal;
-    height: auto;
-    max-height: 14;
-}
-
 #drain {
     width: 1fr;
     height: auto;
@@ -176,12 +169,6 @@ Screen {
     max-height: 3;
     margin: 0 1;
     border: solid cyan;
-}
-
-/* ── System Health ── */
-#system-health {
-    height: auto;
-    margin: 0 0 1 0;
 }
 
 /* ── Drill-down screen ── */
