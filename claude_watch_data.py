@@ -5794,3 +5794,580 @@ def _get_rule_events(rule_name, limit=30):
     except FileNotFoundError:
         pass
     return events[-limit:]
+
+
+# ── Token Utilization Analytics ────────────────────────────────────────────
+
+_util_cache = {}  # type: Dict[str, Tuple[float, Dict]]
+
+
+def _get_utilization_analytics(window="24h"):
+    # type: (str) -> Dict[str, Any]
+    """Compute rolling-window token utilization analytics across all accounts.
+
+    Returns dict with: fleet metrics, per-account breakdown, waste analysis,
+    efficiency metrics, improvement suggestions, and heatmap data.
+    """
+    now = time.time()
+    cached = _util_cache.get(window)
+    if cached and (now - cached[0]) < 60:
+        return cached[1]
+
+    try:
+        result = _compute_utilization(window)
+    except Exception as e:
+        _log.warning("Utilization analytics error: %s", e)
+        result = _empty_analytics(window)
+
+    _util_cache[window] = (now, result)
+    return result
+
+
+def _empty_analytics(window):
+    # type: (str) -> Dict[str, Any]
+    return {
+        "window_label": window,
+        "accounts": [],
+        "fleet": {
+            "active_hours": 0, "available_hours": 0, "utilization_pct": 0,
+            "total_sessions": 0, "total_tokens": 0, "total_commits": 0,
+            "run_rate_day": 0, "overall_score": 0, "stars": "☆☆☆☆☆",
+        },
+        "waste": {"idle_gaps": [], "underused": [], "total_wasted_hours": 0, "waste_pct": 0},
+        "efficiency": {
+            "tokens_per_commit": 0, "commits_per_hour": 0, "tokens_per_hour": 0,
+            "parallelism_avg": 0, "parallelism_peak": 0, "avg_session_min": 0,
+            "model_split": {},
+        },
+        "suggestions": [],
+        "heatmap": {"A": [], "B": [], "C": [], "labels": []},
+    }
+
+
+def _compute_utilization(window):
+    # type: (str) -> Dict[str, Any]
+    now_dt = datetime.now(timezone.utc)
+    window_map = {"24h": 1, "72h": 3, "1w": 7, "1m": 30}
+    days = window_map.get(window, 1)
+    cutoff = now_dt - timedelta(days=days)
+    window_hours = days * 24.0
+
+    # ── Load data ────────────────────────────────────────────────────────
+    idx = _load_index()
+    ledger = _load_ledger()
+
+    # Filter sessions in window
+    sessions = []
+    for sid, entry in idx.items():
+        try:
+            lts = entry.get("last_ts", "")
+            if not lts:
+                continue
+            ts = datetime.fromisoformat(lts.replace("Z", "+00:00"))
+            if ts >= cutoff:
+                sessions.append(entry)
+        except Exception:
+            pass
+
+    # Filter ledger in window
+    ledger_in_window = []
+    for e in ledger:
+        try:
+            ts = datetime.fromisoformat(e["ts"].replace("Z", "+00:00"))
+            if ts >= cutoff:
+                ledger_in_window.append(e)
+        except Exception:
+            pass
+
+    # ── Account attribution ──────────────────────────────────────────────
+    # Build session_id → account mapping from session_locks
+    peer_sessions = _get_peer_sessions()
+    session_to_account = {}
+    for ps in peer_sessions:
+        sid = ps.get("session_id", "")
+        acct = ps.get("account", "")
+        if sid and acct:
+            session_to_account[sid] = acct
+
+    # Load account metadata
+    try:
+        accts_data = json.loads((Path.home() / ".claude/accounts.json").read_text())
+        accounts_meta = {a["label"]: a for a in accts_data.get("accounts", [])}
+        active_label = accts_data.get("active", "A")
+    except Exception:
+        accounts_meta = {}
+        active_label = "A"
+
+    # For sessions not in session_locks, assign to active account
+    for s in sessions:
+        ccid = s.get("ccid", "")
+        if ccid and ccid not in session_to_account:
+            session_to_account[ccid] = active_label
+
+    # ── Activity timeline ────────────────────────────────────────────────
+    per_account, heatmap = _compute_account_activity_timeline(
+        cutoff, now_dt, sessions, ledger_in_window, session_to_account
+    )
+
+    # ── Build ledger (commits) ───────────────────────────────────────────
+    build_data = _get_build_ledger(days=days, limit=500)
+    build_items = build_data.get("items", [])
+
+    # ── Account capacity (current) ───────────────────────────────────────
+    supa_capacity = _get_supabase_account_capacity()
+    cap_by_label = {}
+    for row in supa_capacity:
+        cap_by_label[row.get("account", "")] = row
+
+    # ── Per-account metrics ──────────────────────────────────────────────
+    account_labels = ["A", "B", "C"]
+    account_results = []
+    total_active_hours = 0
+    total_tokens = 0
+    total_sessions = 0
+
+    for label in account_labels:
+        meta = accounts_meta.get(label, {})
+        acct_data = per_account.get(label, {"active_hours": 0, "idle_hours": window_hours})
+        active_h = acct_data["active_hours"]
+        idle_h = acct_data["idle_hours"]
+        util_pct = (active_h / window_hours * 100) if window_hours > 0 else 0
+
+        # Count sessions and tokens for this account
+        acct_sessions = 0
+        acct_tokens = 0
+        for s in sessions:
+            ccid = s.get("ccid", "")
+            if session_to_account.get(ccid) == label:
+                acct_sessions += 1
+                acct_tokens += s.get("output_tokens", 0)
+
+        # Avg burn from window scores
+        scores = _get_window_scores(limit=50)
+        burn_vals = []
+        for sc in scores:
+            try:
+                sc_ts = datetime.fromisoformat(sc["window_start"].replace("Z", "+00:00"))
+                if sc_ts >= cutoff:
+                    burn_vals.append(_safe_float(sc.get("burn_pct", 0)))
+            except Exception:
+                pass
+        avg_burn = sum(burn_vals) / len(burn_vals) if burn_vals else 0
+
+        # Current 7d usage from Supabase
+        cap_row = cap_by_label.get(label, {})
+        seven_day = _safe_float(cap_row.get("seven_day_used_pct", 0))
+
+        score = _score_dimension(util_pct, 85.0)
+
+        account_results.append({
+            "label": label,
+            "name": meta.get("name", "?"),
+            "lane": meta.get("lane", "?"),
+            "active_hours": round(active_h, 1),
+            "idle_hours": round(idle_h, 1),
+            "avg_burn_pct": round(avg_burn, 1),
+            "seven_day_pct": round(seven_day, 1),
+            "sessions": acct_sessions,
+            "output_tokens": acct_tokens,
+            "utilization_pct": round(util_pct, 1),
+            "score": round(score, 1),
+        })
+
+        total_active_hours += active_h
+        total_tokens += acct_tokens
+        total_sessions += acct_sessions
+
+    # ── Fleet metrics ────────────────────────────────────────────────────
+    available_hours = window_hours * 3  # 3 accounts
+    fleet_util = (total_active_hours / available_hours * 100) if available_hours > 0 else 0
+    total_commits = len(build_items)
+
+    # Estimated cost
+    total_cost = sum(
+        _estimate_cost(s.get("output_tokens", 0), s.get("model", "sonnet"))
+        for s in sessions
+    )
+    run_rate = total_cost / max(days, 1)
+
+    # Fleet score: weighted from 5 dimensions
+    burn_vals_all = [a["avg_burn_pct"] for a in account_results]
+    avg_burn_fleet = sum(burn_vals_all) / len(burn_vals_all) if burn_vals_all else 0
+
+    # Gini coefficient for balance
+    active_arr = [a["active_hours"] for a in account_results]
+    total_a = sum(active_arr)
+    if total_a > 0 and len(active_arr) > 1:
+        sorted_a = sorted(active_arr)
+        n = len(sorted_a)
+        numerator = sum((2 * (i + 1) - n - 1) * sorted_a[i] for i in range(n))
+        gini = numerator / (n * total_a)
+    else:
+        gini = 0
+    equality = max(0, 1.0 - gini / 0.3) * 100
+
+    commits_per_hour = total_commits / max(total_active_hours, 0.1)
+
+    # Parallelism from ledger drain entries
+    para_vals = []
+    for e in ledger_in_window:
+        if e.get("type") == "tool_drain":
+            cs = e.get("cli_sessions", 0)
+            if cs > 0:
+                para_vals.append(cs)
+    para_avg = sum(para_vals) / len(para_vals) if para_vals else 1.0
+    para_peak = max(para_vals) if para_vals else 1
+
+    fleet_score_val = round(
+        _score_dimension(fleet_util, 85.0) * 0.30
+        + _score_dimension(avg_burn_fleet, 90.0) * 0.25
+        + _score_dimension(equality, 100.0) * 0.20
+        + _score_dimension(commits_per_hour, 0.4) * 0.15
+        + _score_dimension(para_avg, 2.5) * 0.10,
+        1,
+    )
+    fleet_score_val = round(fleet_score_val * 2) / 2  # snap to half-stars
+
+    fleet = {
+        "active_hours": round(total_active_hours, 1),
+        "available_hours": round(available_hours, 1),
+        "utilization_pct": round(fleet_util, 1),
+        "total_sessions": total_sessions,
+        "total_tokens": total_tokens,
+        "total_commits": total_commits,
+        "total_cost": round(total_cost, 2),
+        "run_rate_day": round(run_rate, 2),
+        "overall_score": fleet_score_val,
+        "stars": _stars_display(fleet_score_val),
+    }
+
+    # ── Waste analysis ───────────────────────────────────────────────────
+    waste = _compute_waste_analysis(per_account, heatmap, window_hours)
+
+    # ── Efficiency metrics ───────────────────────────────────────────────
+    efficiency = _compute_efficiency_metrics(
+        sessions, ledger_in_window, build_items, total_tokens, total_active_hours
+    )
+
+    # ── Suggestions ──────────────────────────────────────────────────────
+    analytics = {
+        "window_label": window,
+        "accounts": account_results,
+        "fleet": fleet,
+        "waste": waste,
+        "efficiency": efficiency,
+        "suggestions": [],
+        "heatmap": heatmap,
+    }
+    analytics["suggestions"] = _generate_utilization_suggestions(analytics)
+
+    return analytics
+
+
+def _compute_account_activity_timeline(cutoff, now_dt, sessions, ledger_entries, session_to_account):
+    # type: (datetime, datetime, list, list, dict) -> Tuple[Dict, Dict]
+    """Bucket activity into 5-min slots per account. Returns (per_account, heatmap)."""
+    total_seconds = (now_dt - cutoff).total_seconds()
+    total_hours = total_seconds / 3600
+    bucket_count = max(1, int(total_seconds / 300))  # 5-min buckets
+
+    # account → set of active bucket indices
+    active_buckets = defaultdict(set)  # type: Dict[str, set]
+
+    # Mark buckets from session time ranges
+    for s in sessions:
+        ccid = s.get("ccid", "")
+        acct = session_to_account.get(ccid, "")
+        if not acct:
+            continue
+        try:
+            fts = datetime.fromisoformat(s["first_ts"].replace("Z", "+00:00"))
+            lts = datetime.fromisoformat(s["last_ts"].replace("Z", "+00:00"))
+            start_bucket = max(0, int((fts - cutoff).total_seconds() / 300))
+            end_bucket = min(bucket_count - 1, int((lts - cutoff).total_seconds() / 300))
+            for b in range(start_bucket, end_bucket + 1):
+                active_buckets[acct].add(b)
+        except Exception:
+            pass
+
+    # Mark buckets from ledger entries
+    for e in ledger_entries:
+        session_id = e.get("session", "")
+        acct = session_to_account.get(session_id, "")
+        if not acct:
+            continue
+        try:
+            ts = datetime.fromisoformat(e["ts"].replace("Z", "+00:00"))
+            b = max(0, min(bucket_count - 1, int((ts - cutoff).total_seconds() / 300)))
+            active_buckets[acct].add(b)
+        except Exception:
+            pass
+
+    # Per-account stats
+    per_account = {}
+    for label in ["A", "B", "C"]:
+        active_count = len(active_buckets.get(label, set()))
+        active_hours = active_count * 5.0 / 60.0
+        idle_hours = total_hours - active_hours
+        per_account[label] = {
+            "active_hours": active_hours,
+            "idle_hours": max(0, idle_hours),
+            "active_buckets": active_buckets.get(label, set()),
+        }
+
+    # Build heatmap: hourly or daily buckets depending on window size
+    if total_hours <= 72:
+        # Hourly buckets
+        num_heatmap_buckets = min(int(total_hours) + 1, 72)
+        slots_per_hm = 12  # 12 five-min slots per hour
+        labels = []
+        for i in range(num_heatmap_buckets):
+            hr_dt = cutoff + timedelta(hours=i)
+            labels.append(hr_dt.strftime("%H"))
+    else:
+        # Daily buckets
+        num_heatmap_buckets = min(int(total_hours / 24) + 1, 31)
+        slots_per_hm = 288  # 288 five-min slots per day
+        labels = []
+        for i in range(num_heatmap_buckets):
+            day_dt = cutoff + timedelta(days=i)
+            labels.append(day_dt.strftime("%m/%d"))
+
+    heatmap = {"labels": labels}
+    for label in ["A", "B", "C"]:
+        buckets_set = active_buckets.get(label, set())
+        hm_data = []
+        for i in range(num_heatmap_buckets):
+            start_b = i * slots_per_hm
+            end_b = start_b + slots_per_hm
+            count = sum(1 for b in range(start_b, end_b) if b in buckets_set)
+            hm_data.append(count)
+        heatmap[label] = hm_data
+
+    return per_account, heatmap
+
+
+def _compute_waste_analysis(per_account, heatmap, window_hours):
+    # type: (Dict, Dict, float) -> Dict[str, Any]
+    """Identify idle gaps and underused accounts."""
+    labels = heatmap.get("labels", [])
+    a_data = heatmap.get("A", [])
+    b_data = heatmap.get("B", [])
+    c_data = heatmap.get("C", [])
+
+    # Find all-fleet-idle periods
+    idle_gaps = []
+    gap_start = None
+    for i in range(len(labels)):
+        a_val = a_data[i] if i < len(a_data) else 0
+        b_val = b_data[i] if i < len(b_data) else 0
+        c_val = c_data[i] if i < len(c_data) else 0
+        all_idle = (a_val == 0 and b_val == 0 and c_val == 0)
+        if all_idle:
+            if gap_start is None:
+                gap_start = i
+        else:
+            if gap_start is not None:
+                gap_len = i - gap_start
+                if gap_len >= 1:  # at least 1 bucket
+                    idle_gaps.append({
+                        "start_label": labels[gap_start] if gap_start < len(labels) else "?",
+                        "end_label": labels[i - 1] if (i - 1) < len(labels) else "?",
+                        "buckets": gap_len,
+                    })
+                gap_start = None
+    # Close trailing gap
+    if gap_start is not None:
+        gap_len = len(labels) - gap_start
+        if gap_len >= 1:
+            idle_gaps.append({
+                "start_label": labels[gap_start] if gap_start < len(labels) else "?",
+                "end_label": labels[-1] if labels else "?",
+                "buckets": gap_len,
+            })
+
+    # Underused accounts
+    underused = []
+    for label in ["A", "B", "C"]:
+        acct = per_account.get(label, {})
+        util = (acct.get("active_hours", 0) / window_hours * 100) if window_hours > 0 else 0
+        if util < 50:
+            underused.append({"label": label, "utilization_pct": round(util, 1)})
+
+    # Total wasted: fleet idle time
+    total_fleet_idle_buckets = sum(g["buckets"] for g in idle_gaps)
+    # Each bucket is 1 hour (hourly mode) or 1 day (daily mode)
+    is_hourly = len(labels) <= 72
+    if is_hourly:
+        total_wasted = total_fleet_idle_buckets  # hours
+    else:
+        total_wasted = total_fleet_idle_buckets * 24  # days → hours
+    waste_pct = (total_wasted / (window_hours * 3) * 100) if window_hours > 0 else 0
+
+    return {
+        "idle_gaps": idle_gaps,
+        "underused": underused,
+        "total_wasted_hours": round(total_wasted, 1),
+        "waste_pct": round(waste_pct, 1),
+    }
+
+
+def _compute_efficiency_metrics(sessions, ledger_entries, build_items, total_tokens, active_hours):
+    # type: (list, list, list, int, float) -> Dict[str, Any]
+    """Compute efficiency ratios for the analytics dashboard."""
+    total_commits = len(build_items)
+    tokens_per_commit = total_tokens / max(total_commits, 1)
+    commits_per_hour = total_commits / max(active_hours, 0.1)
+    tokens_per_hour = total_tokens / max(active_hours, 0.1)
+
+    # Parallelism from drain entries
+    para_vals = []
+    for e in ledger_entries:
+        if e.get("type") == "tool_drain":
+            cs = e.get("cli_sessions", 0)
+            if cs > 0:
+                para_vals.append(cs)
+    para_avg = sum(para_vals) / len(para_vals) if para_vals else 1.0
+    para_peak = max(para_vals) if para_vals else 1
+
+    # Average session duration
+    durations = []
+    for s in sessions:
+        d = s.get("duration", 0)
+        if d and d > 0:
+            durations.append(d / 60.0)  # seconds to minutes
+    avg_session_min = sum(durations) / len(durations) if durations else 0
+
+    # Model split
+    model_tokens = defaultdict(int)
+    for s in sessions:
+        model = (s.get("model", "") or "sonnet").lower()
+        if "opus" in model:
+            model_tokens["opus"] += s.get("output_tokens", 0)
+        elif "haiku" in model:
+            model_tokens["haiku"] += s.get("output_tokens", 0)
+        else:
+            model_tokens["sonnet"] += s.get("output_tokens", 0)
+    tok_total = sum(model_tokens.values()) or 1
+    model_split = {k: round(v / tok_total * 100, 1) for k, v in model_tokens.items()}
+
+    return {
+        "tokens_per_commit": round(tokens_per_commit),
+        "commits_per_hour": round(commits_per_hour, 2),
+        "tokens_per_hour": round(tokens_per_hour),
+        "parallelism_avg": round(para_avg, 1),
+        "parallelism_peak": para_peak,
+        "avg_session_min": round(avg_session_min, 1),
+        "model_split": model_split,
+    }
+
+
+def _generate_utilization_suggestions(analytics):
+    # type: (Dict) -> List[Dict[str, str]]
+    """Generate prioritized improvement suggestions from analytics data."""
+    suggestions = []
+    accounts = analytics.get("accounts", [])
+    fleet = analytics.get("fleet", {})
+    efficiency = analytics.get("efficiency", {})
+    waste = analytics.get("waste", {})
+
+    # Rule 1: Account imbalance — one high, one low
+    for a in accounts:
+        if a.get("seven_day_pct", 0) > 95:
+            for b in accounts:
+                if b["label"] != a["label"] and b.get("seven_day_pct", 0) < 50:
+                    suggestions.append({
+                        "priority": "high", "category": "rebalance",
+                        "message": f"Account {a['label']} at {a['seven_day_pct']}% weekly "
+                                   f"while {b['label']} at {b['seven_day_pct']}%. "
+                                   f"Shift work to {b['label']} before {a['label']} exhausts.",
+                    })
+                    break
+            break
+
+    # Rule 2: Low fleet utilization
+    if fleet.get("utilization_pct", 0) < 50:
+        wasted = waste.get("total_wasted_hours", 0)
+        suggestions.append({
+            "priority": "high", "category": "idle",
+            "message": f"Fleet utilization only {fleet['utilization_pct']}%. "
+                       f"{wasted:.0f}h of compute unused. Schedule background agents on idle accounts.",
+        })
+
+    # Rule 3: Session concentration
+    if accounts:
+        max_acct = max(accounts, key=lambda a: a.get("sessions", 0))
+        total_s = fleet.get("total_sessions", 1) or 1
+        if max_acct["sessions"] / total_s > 0.6 and total_s > 3:
+            suggestions.append({
+                "priority": "high", "category": "concentration",
+                "message": f"Account {max_acct['label']} handled {max_acct['sessions']}/{total_s} "
+                           f"sessions ({max_acct['sessions']/total_s*100:.0f}%). "
+                           f"Distribute work to avoid weekly limit exhaustion.",
+            })
+
+    # Rule 4: High tokens per commit
+    tpc = efficiency.get("tokens_per_commit", 0)
+    if tpc > 100000:
+        suggestions.append({
+            "priority": "med", "category": "efficiency",
+            "message": f"Averaging {tpc/1000:.0f}k tokens/commit. "
+                       f"Split tasks into smaller units to improve throughput.",
+        })
+
+    # Rule 5: Idle accounts
+    for a in accounts:
+        if a.get("idle_hours", 0) > 8 and analytics.get("window_label") == "24h":
+            suggestions.append({
+                "priority": "med", "category": "idle",
+                "message": f"Account {a['label']} idle {a['idle_hours']:.0f}h in 24h. "
+                           f"Run scheduled research or documentation agents there.",
+            })
+
+    # Rule 6: Low parallelism
+    para = efficiency.get("parallelism_avg", 0)
+    if para < 1.5 and fleet.get("total_sessions", 0) > 2:
+        suggestions.append({
+            "priority": "med", "category": "parallelism",
+            "message": f"Average parallelism {para:.1f}. "
+                       f"Running 2-3 sessions simultaneously maximizes 5h window throughput.",
+        })
+
+    # Rule 7: Opus-heavy model split
+    opus_pct = efficiency.get("model_split", {}).get("opus", 0)
+    if opus_pct > 80:
+        suggestions.append({
+            "priority": "low", "category": "model_mix",
+            "message": f"Opus usage is {opus_pct:.0f}% of tokens. "
+                       f"Use Sonnet for search/chat/review to extend account capacity.",
+        })
+
+    # Rule 8: Low burn
+    avg_burns = [a.get("avg_burn_pct", 0) for a in accounts]
+    fleet_burn = sum(avg_burns) / len(avg_burns) if avg_burns else 0
+    if fleet_burn < 60 and fleet_burn > 0:
+        suggestions.append({
+            "priority": "low", "category": "burn",
+            "message": f"Average 5h window burn {fleet_burn:.0f}%. "
+                       f"Aim for 80-95% to maximize each window before reset.",
+        })
+
+    # Rule 9: Low shipping velocity
+    cph = efficiency.get("commits_per_hour", 0)
+    if cph < 0.2 and fleet.get("total_commits", 0) > 0:
+        suggestions.append({
+            "priority": "low", "category": "shipping",
+            "message": f"Shipping {cph:.2f} commits/active-hour. "
+                       f"Consider smaller, more frequent commits.",
+        })
+
+    # Rule 10: Great utilization (positive feedback)
+    if fleet.get("utilization_pct", 0) > 85:
+        all_above_80 = all(a.get("seven_day_pct", 0) > 80 for a in accounts if a.get("seven_day_pct", 0) > 0)
+        if all_above_80 and accounts:
+            suggestions.append({
+                "priority": "info", "category": "positive",
+                "message": "Excellent fleet utilization. All accounts contributing well.",
+            })
+
+    return suggestions

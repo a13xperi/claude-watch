@@ -80,6 +80,9 @@ from claude_watch_data import (
     make_tool_stats,
     _build_full_audit,
     export_audit_markdown,
+    _get_utilization_analytics,
+    _stars_display,
+    _score_dimension,
 )
 
 class LazyView(ScrollableContainer):
@@ -126,7 +129,7 @@ def _start_hot_reload_watcher(app):
 
 _BACKUP_DIR = Path(f"/tmp/claude-watch-backup-{os.getpid()}")
 _SOURCE_DIR = Path(__file__).resolve().parent
-_BACKUP_FILES = ["claude_watch_tui.py", "claude_watch_data.py", "claude_watch.py", "claude_watch_tui.tcss"]
+_BACKUP_FILES = ["claude_watch_tui.py", "claude_watch_data.py", "claude_watch.py", "claude_watch_tui.tcss", "claude_watch_advisor.py"]
 
 
 def _backup_working_files():
@@ -1394,9 +1397,11 @@ class NavBar(Horizontal):
         ("Mission", "nav-mission"),
         ("Wire", "nav-wire"),
         ("Usage", "nav-usage"),
+        ("Analytics", "nav-analytics"),
         ("Rules", "nav-rules"),
         ("MCP", "nav-mcp"),
         ("Test", "nav-test"),
+        ("Advisor", "nav-advisor"),
     ]
 
     def compose(self) -> ComposeResult:
@@ -1405,6 +1410,7 @@ class NavBar(Horizontal):
             ("Dashboard", "nav-dashboard"),
             ("Cycles", "nav-cycles"),
             ("Usage", "nav-usage"),
+            ("Analytics", "nav-analytics"),
             ("Rules", "nav-rules"),
             ("Nav", "nav-open-nav"),
         ]
@@ -1446,6 +1452,8 @@ class NavigationScreen(Screen):
                 "nav-audit": "view-audit",
                 "nav-mission": "view-mission",
                 "nav-wire": "view-wire",
+                "nav-advisor": "view-advisor",
+                "nav-analytics": "view-analytics",
             }
             view_id = btn_map.get(view_key)
             if view_id:
@@ -5284,6 +5292,375 @@ class AuditView(LazyView):
         self.notify(f"Imported {count} items from sessions across all cycles")
 
 
+class AdvisorView(LazyView):
+    """Advisor — actionable intelligence synthesis."""
+
+    BINDINGS = [
+        Binding("R", "run_advisor", "Run Now"),
+    ]
+
+    def compose(self) -> ComposeResult:
+        yield Static(id="advisor-header")
+        yield Static(id="advisor-summary")
+        yield DataTable(id="advisor-table")
+
+    def load_content(self):
+        self._refresh_advisor()
+
+    def refresh_content(self):
+        now = time.time()
+        if not hasattr(self, '_last_refresh') or (now - self._last_refresh) > 60:
+            self._last_refresh = now
+            self._refresh_advisor()
+
+    def _refresh_advisor(self):
+        from claude_watch_advisor import run_advisor, SEVERITY_ORDER
+        self._last_refresh = time.time()
+        report = run_advisor()
+
+        severity_display = {
+            "critical": ("!!!", "bold red"),
+            "warning":  (" ! ", "yellow"),
+            "info":     (" i ", "blue"),
+            "positive": (" + ", "green"),
+        }
+
+        # Header
+        counts = report.summary
+        parts = []
+        for sev, label in [("critical", "Critical"), ("warning", "Warning"), ("info", "Info"), ("positive", "Positive")]:
+            n = counts.get(sev, 0)
+            if n > 0:
+                _, style = severity_display[sev]
+                parts.append(f"[{style}]{n} {label}[/{style}]")
+        header_text = (
+            f"[bold]Advisor[/bold]  "
+            f"[dim]{report.checks_run} checks · {report.duration_ms}ms · "
+            f"{len(report.insights)} insights[/dim]"
+        )
+        self.query_one("#advisor-header", Static).update(header_text)
+
+        summary_text = "  ".join(parts) if parts else "[dim]No insights[/dim]"
+        self.query_one("#advisor-summary", Static).update(summary_text)
+
+        # Table
+        table = self.query_one("#advisor-table", DataTable)
+        table.clear(columns=True)
+        table.cursor_type = "row"
+        table.zebra_stripes = True
+        table.add_column("", width=3)          # severity icon
+        table.add_column("Category", width=14)
+        table.add_column("Insight")
+        table.add_column("Action", width=40)
+
+        for ins in report.insights:
+            icon, style = severity_display.get(ins.severity, (" ? ", "white"))
+            table.add_row(
+                Text(icon, style=style),
+                Text(ins.category, style="bold"),
+                Text(ins.message),
+                Text(ins.action, style="dim"),
+            )
+
+    def action_run_advisor(self):
+        from claude_watch_advisor import _advisor_cache_ts
+        import claude_watch_advisor
+        claude_watch_advisor._advisor_cache = None
+        claude_watch_advisor._advisor_cache_ts = 0.0
+        self._last_refresh = 0
+        self._refresh_advisor()
+        self.notify("Advisor refreshed")
+
+
+class AnalyticsView(LazyView):
+    """Token utilization analytics — rolling 24h/72h/1w/1m efficiency coaching."""
+
+    _active_window = "24h"
+
+    BINDINGS = [
+        Binding("1", "window_24h", "24h"),
+        Binding("2", "window_72h", "72h"),
+        Binding("3", "window_1w", "1 Week"),
+        Binding("4", "window_1m", "1 Month"),
+    ]
+
+    def compose(self) -> ComposeResult:
+        yield Static(id="an-header")
+        yield Static(id="an-fleet")
+        with Horizontal(id="an-accounts-row"):
+            yield Static(id="an-acct-a")
+            yield Static(id="an-acct-b")
+            yield Static(id="an-acct-c")
+        yield Static(id="an-heatmap")
+        yield Static(id="an-waste")
+        yield DataTable(id="an-efficiency")
+        yield Static(id="an-suggestions")
+
+    def refresh_content(self):
+        now = time.time()
+        if not hasattr(self, '_last_refresh') or (now - self._last_refresh) > 30:
+            self._last_refresh = now
+            try:
+                self.query_one("#an-efficiency", DataTable).clear(columns=True)
+                self.load_content()
+            except Exception:
+                pass
+
+    def load_content(self):
+        from rich.panel import Panel
+        from rich.table import Table as RichTable
+
+        data = _get_utilization_analytics(self._active_window)
+        fleet = data.get("fleet", {})
+        accounts = data.get("accounts", [])
+        waste = data.get("waste", {})
+        efficiency = data.get("efficiency", {})
+        suggestions = data.get("suggestions", [])
+        heatmap = data.get("heatmap", {})
+
+        # ── Header ───────────────────────────────────────────────────
+        self.query_one("#an-header", Static).update(
+            f"[bold]Token Analytics — {self._active_window}[/bold]  "
+            f"[dim]Press 1=24h  2=72h  3=1w  4=1m[/dim]"
+        )
+
+        # ── Fleet Scorecard ──────────────────────────────────────────
+        util_pct = fleet.get("utilization_pct", 0)
+        bar_len = max(1, int(util_pct / 100 * 30))
+        bar_color = "green" if util_pct > 70 else ("yellow" if util_pct > 40 else "red")
+        bar = f"[{bar_color}]{'█' * bar_len}[/{bar_color}]{'░' * (30 - bar_len)}"
+
+        tokens_k = fleet.get("total_tokens", 0) / 1000
+        tok_str = f"{tokens_k:.0f}k" if tokens_k < 1000 else f"{tokens_k/1000:.1f}M"
+
+        fleet_text = (
+            f"  Utilization: [bold]{fleet.get('stars', '☆☆☆☆☆')}[/bold] "
+            f"({fleet.get('overall_score', 0)}/5)     "
+            f"Fleet: [cyan]{fleet.get('active_hours', 0)}h[/cyan] / "
+            f"{fleet.get('available_hours', 0)}h active "
+            f"({util_pct}%)\n"
+            f"  {bar}  {util_pct}% utilized\n"
+            f"  Sessions: [cyan]{fleet.get('total_sessions', 0)}[/cyan]  "
+            f"Commits: [cyan]{fleet.get('total_commits', 0)}[/cyan]  "
+            f"Tokens: [cyan]{tok_str}[/cyan]  "
+            f"Run Rate: [yellow]${fleet.get('run_rate_day', 0):.2f}/day[/yellow]"
+        )
+        self.query_one("#an-fleet", Static).update(
+            Panel(fleet_text, title=f"Fleet Utilization — {self._active_window}",
+                  border_style="bold cyan")
+        )
+
+        # ── Account Cards ────────────────────────────────────────────
+        acct_colors = {"A": "cyan", "B": "magenta", "C": "yellow"}
+        acct_widgets = {"A": "#an-acct-a", "B": "#an-acct-b", "C": "#an-acct-c"}
+
+        for acct in accounts:
+            label = acct.get("label", "?")
+            color = acct_colors.get(label, "white")
+            widget_id = acct_widgets.get(label)
+            if not widget_id:
+                continue
+
+            a_util = acct.get("utilization_pct", 0)
+            a_bar_len = max(1, int(a_util / 100 * 20))
+            a_bar_color = "green" if a_util > 70 else ("yellow" if a_util > 40 else "red")
+            a_bar = f"[{a_bar_color}]{'█' * a_bar_len}[/{a_bar_color}]{'░' * (20 - a_bar_len)}"
+
+            tok_k = acct.get("output_tokens", 0) / 1000
+            tok_s = f"{tok_k:.0f}k" if tok_k < 1000 else f"{tok_k/1000:.1f}M"
+
+            a_score = _score_dimension(a_util, 85.0)
+            a_stars = _stars_display(a_score)
+
+            card = (
+                f"Lane: {acct.get('lane', '?')}\n"
+                f"Active: [{color}]{acct.get('active_hours', 0)}h[/{color}] / "
+                f"{acct.get('active_hours', 0) + acct.get('idle_hours', 0):.0f}h\n"
+                f"{a_bar}  {a_util}%\n"
+                f"5h avg burn: {acct.get('avg_burn_pct', 0)}%    "
+                f"7d: {acct.get('seven_day_pct', 0)}%\n"
+                f"Sessions: {acct.get('sessions', 0)}    Tokens: {tok_s}\n"
+                f"Score: {a_stars} ({a_score:.1f})"
+            )
+            self.query_one(widget_id, Static).update(
+                Panel(card, title=f"Account {label} ({acct.get('name', '?')})",
+                      border_style=color)
+            )
+
+        # Fill empty cards for missing accounts
+        for label in ["A", "B", "C"]:
+            if not any(a["label"] == label for a in accounts):
+                widget_id = acct_widgets.get(label)
+                if widget_id:
+                    self.query_one(widget_id, Static).update(
+                        Panel("[dim]No data[/dim]",
+                              title=f"Account {label}",
+                              border_style="dim")
+                    )
+
+        # ── Activity Heatmap ─────────────────────────────────────────
+        labels = heatmap.get("labels", [])
+        if labels:
+            is_hourly = len(labels) <= 72
+            bucket_label = "hourly" if is_hourly else "daily"
+            max_slots = 12 if is_hourly else 288
+
+            header_line = "      " + " ".join(f"{l:>2}" for l in labels[:48])
+            rows = []
+            for acct_label in ["A", "B", "C"]:
+                color = acct_colors.get(acct_label, "white")
+                row_parts = []
+                acct_data = heatmap.get(acct_label, [])
+                for i, val in enumerate(acct_data[:48]):
+                    if val > max_slots * 0.5:
+                        row_parts.append(f"[{color}]██[/{color}]")
+                    elif val > max_slots * 0.25:
+                        row_parts.append(f"[{color}]▓▓[/{color}]")
+                    elif val > 0:
+                        row_parts.append(f"[dim]░░[/dim]")
+                    else:
+                        row_parts.append("  ")
+                rows.append(f"  {acct_label}:  " + " ".join(row_parts))
+
+            hm_text = f"{header_line}\n" + "\n".join(rows)
+            self.query_one("#an-heatmap", Static).update(
+                Panel(hm_text,
+                      title=f"Activity ({self._active_window}, {bucket_label})",
+                      border_style="dim")
+            )
+        else:
+            self.query_one("#an-heatmap", Static).update(
+                Panel("[dim]No activity data[/dim]", title="Activity", border_style="dim")
+            )
+
+        # ── Waste Analysis ───────────────────────────────────────────
+        waste_lines = []
+        wasted_h = waste.get("total_wasted_hours", 0)
+        waste_p = waste.get("waste_pct", 0)
+        waste_lines.append(
+            f"Total Fleet Idle: [bold]{wasted_h}h[/bold] ({waste_p}% of available compute)"
+        )
+        for gap in waste.get("idle_gaps", [])[:5]:
+            waste_lines.append(
+                f"  [red]Idle gap[/red]: {gap['start_label']} — {gap['end_label']} "
+                f"({gap['buckets']} {'hours' if len(labels) <= 72 else 'days'})"
+            )
+        for u in waste.get("underused", []):
+            waste_lines.append(
+                f"  [yellow]Underused[/yellow]: Account {u['label']} at {u['utilization_pct']}%"
+            )
+        if not waste.get("idle_gaps") and not waste.get("underused"):
+            waste_lines.append("  [green]No significant waste detected[/green]")
+
+        self.query_one("#an-waste", Static).update(
+            Panel("\n".join(waste_lines), title="Waste Analysis", border_style="red")
+        )
+
+        # ── Efficiency Metrics Table ─────────────────────────────────
+        table = self.query_one("#an-efficiency", DataTable)
+        table.cursor_type = "row"
+        table.zebra_stripes = True
+        table.add_column("Metric", width=22)
+        table.add_column("Value", width=12)
+        table.add_column("Benchmark", width=12)
+        table.add_column("Status", width=10)
+
+        def _status(good, warn):
+            # type: (bool, bool) -> Tuple[str, str]
+            if good:
+                return "Good", "green"
+            elif warn:
+                return "Watch", "yellow"
+            return "Action", "red"
+
+        tph = efficiency.get("tokens_per_hour", 0)
+        s, sc = _status(tph >= 20000, tph >= 10000)
+        table.add_row(
+            Text("Tokens/Active Hour"), Text(f"{tph/1000:.1f}k", justify="right"),
+            Text("20k+"), Text(s, style=sc),
+        )
+
+        cph = efficiency.get("commits_per_hour", 0)
+        s, sc = _status(cph >= 0.3, cph >= 0.15)
+        table.add_row(
+            Text("Commits/Active Hour"), Text(f"{cph:.2f}", justify="right"),
+            Text("0.3+"), Text(s, style=sc),
+        )
+
+        tpc = efficiency.get("tokens_per_commit", 0)
+        s, sc = _status(tpc < 80000, tpc < 120000)
+        table.add_row(
+            Text("Tokens/Commit"), Text(f"{tpc/1000:.0f}k", justify="right"),
+            Text("<80k"), Text(s, style=sc),
+        )
+
+        para = efficiency.get("parallelism_avg", 0)
+        s, sc = _status(para >= 2.0, para >= 1.2)
+        table.add_row(
+            Text("Avg Parallelism"), Text(f"{para:.1f}", justify="right"),
+            Text("2.0+"), Text(s, style=sc),
+        )
+
+        dur = efficiency.get("avg_session_min", 0)
+        s, sc = _status(20 <= dur <= 60, 10 <= dur <= 90)
+        table.add_row(
+            Text("Avg Session Duration"), Text(f"{dur:.0f}m", justify="right"),
+            Text("20-60m"), Text(s, style=sc),
+        )
+
+        opus_pct = efficiency.get("model_split", {}).get("opus", 0)
+        s, sc = _status(50 <= opus_pct <= 70, 35 <= opus_pct <= 85)
+        table.add_row(
+            Text("Model Split (Opus)"), Text(f"{opus_pct:.0f}%", justify="right"),
+            Text("50-70%"), Text(s, style=sc),
+        )
+
+        # ── Suggestions ──────────────────────────────────────────────
+        if suggestions:
+            sug_lines = []
+            priority_styles = {
+                "high": "red bold", "med": "yellow bold",
+                "low": "dim", "info": "green bold",
+            }
+            for sug in suggestions:
+                p = sug.get("priority", "info")
+                style = priority_styles.get(p, "white")
+                label = p.upper()
+                sug_lines.append(f"[{style}]{label}[/{style}] {sug['message']}")
+            self.query_one("#an-suggestions", Static).update(
+                Panel("\n".join(sug_lines), title="Improvement Suggestions",
+                      border_style="green")
+            )
+        else:
+            self.query_one("#an-suggestions", Static).update(
+                Panel("[dim]No suggestions — utilization looks healthy[/dim]",
+                      title="Improvement Suggestions", border_style="green")
+            )
+
+    def action_window_24h(self):
+        self._active_window = "24h"
+        self._reload()
+
+    def action_window_72h(self):
+        self._active_window = "72h"
+        self._reload()
+
+    def action_window_1w(self):
+        self._active_window = "1w"
+        self._reload()
+
+    def action_window_1m(self):
+        self._active_window = "1m"
+        self._reload()
+
+    def _reload(self):
+        try:
+            self.query_one("#an-efficiency", DataTable).clear(columns=True)
+        except Exception:
+            pass
+        self.load_content()
+
+
 class ClaudeWatchApp(App):
     CSS_PATH = "claude_watch_tui.tcss"
     TITLE = "claude-watch"
@@ -5305,9 +5682,11 @@ class ClaudeWatchApp(App):
         Binding("A", "toggle_accounts", "Accounts"),
         Binding("w", "show_wire", "Wire"),
         Binding("M", "show_mission", "Mission"),
+        Binding("v", "show_advisor", "Advisor"),
         Binding("[", "prev_cycle", "Prev Cycle"),
         Binding("]", "next_cycle", "Next Cycle"),
         Binding("0", "all_cycles", "All Cycles"),
+        Binding("t", "show_analytics", "Analytics"),
         Binding("g", "show_rules", "Rules"),
         Binding("w", "show_attribution", "Who?"),
         Binding("slash", "start_search", "Search"),
@@ -5353,6 +5732,8 @@ class ClaudeWatchApp(App):
             yield MissionControlView(id="view-mission")
             yield WireView(id="view-wire")
             yield RulesView(id="view-rules")
+            yield AdvisorView(id="view-advisor")
+            yield AnalyticsView(id="view-analytics")
         yield Footer()
 
     def switch_view(self, view_id: str) -> None:
@@ -5380,6 +5761,8 @@ class ClaudeWatchApp(App):
             "view-audit": "nav-audit",
             "view-wire": "nav-wire",
             "view-mission": "nav-mission",
+            "view-advisor": "nav-advisor",
+            "view-analytics": "nav-analytics",
         }
         active_nav = nav_map.get(view_id, "")
         for btn in self.query("#nav-bar Button"):
@@ -5699,6 +6082,12 @@ class ClaudeWatchApp(App):
     def action_show_mission(self):
         self.switch_view("view-mission")
 
+    def action_show_advisor(self):
+        self.switch_view("view-advisor")
+
+    def action_show_analytics(self):
+        self.switch_view("view-analytics")
+
     def _ensure_cycle_list(self):
         """Load cycle list if not loaded."""
         if not self._cycle_list:
@@ -5759,6 +6148,8 @@ class ClaudeWatchApp(App):
             "nav-audit": "view-audit",
             "nav-wire": "view-wire",
             "nav-mission": "view-mission",
+            "nav-advisor": "view-advisor",
+            "nav-analytics": "view-analytics",
         }
         btn_id = event.button.id or ""
         if not btn_id.startswith("nav-"):
@@ -6114,6 +6505,75 @@ def _cli_snapshot():
     console.print(panel)
 
 
+def _cli_advisor(args):
+    """Run advisor and print insights to terminal."""
+    import json as _json
+    from claude_watch_advisor import run_advisor
+
+    report = run_advisor(force_refresh=True)
+
+    if getattr(args, 'json', False) or not sys.stdout.isatty():
+        payload = {
+            "timestamp": report.timestamp,
+            "duration_ms": report.duration_ms,
+            "checks_run": report.checks_run,
+            "summary": report.summary,
+            "insights": [
+                {
+                    "category": i.category,
+                    "severity": i.severity,
+                    "title": i.title,
+                    "message": i.message,
+                    "action": i.action,
+                }
+                for i in report.insights
+            ],
+        }
+        print(_json.dumps(payload, indent=2))
+        return
+
+    from rich.console import Console
+    from rich.panel import Panel
+    from rich.table import Table as RichTable
+
+    console = Console()
+
+    severity_display = {
+        "critical": ("!!!", "bold red"),
+        "warning":  (" ! ", "yellow"),
+        "info":     (" i ", "blue"),
+        "positive": (" + ", "green"),
+    }
+
+    # Summary line
+    parts = []
+    for sev, label in [("critical", "Critical"), ("warning", "Warning"), ("info", "Info"), ("positive", "Positive")]:
+        n = report.summary.get(sev, 0)
+        if n > 0:
+            _, style = severity_display[sev]
+            parts.append(f"[{style}]{n} {label}[/{style}]")
+    summary_line = "  ".join(parts) if parts else "[dim]No insights[/dim]"
+
+    # Table
+    t = RichTable(show_header=True, header_style="bold cyan", box=None, padding=(0, 1), expand=True)
+    t.add_column("", width=3, no_wrap=True)
+    t.add_column("Category", width=14, no_wrap=True)
+    t.add_column("Insight")
+    t.add_column("Action", width=40, style="dim")
+
+    for ins in report.insights:
+        icon, style = severity_display.get(ins.severity, (" ? ", "white"))
+        t.add_row(f"[{style}]{icon}[/{style}]", f"[bold]{ins.category}[/bold]", ins.message, ins.action)
+
+    panel = Panel(
+        t,
+        title=f"[bold]Advisor[/bold]  {summary_line}",
+        subtitle=f"[dim]{report.checks_run} checks · {report.duration_ms}ms[/dim]",
+        border_style="magenta",
+    )
+    console.print(panel)
+
+
 def main():
     import argparse
     import sys
@@ -6122,6 +6582,8 @@ def main():
     parser.add_argument("-l", "--list", action="store_true", help="List recent sessions")
     parser.add_argument("--context", action="store_true", help="Include resume context (with --session)")
     parser.add_argument("--snapshot", action="store_true", help="Print compact capacity snapshot and exit")
+    parser.add_argument("--advisor", action="store_true", help="Run advisor and print insights")
+    parser.add_argument("--json", action="store_true", help="Output in JSON format (use with --advisor or --snapshot)")
     args = parser.parse_args()
 
     if args.session:
@@ -6132,6 +6594,9 @@ def main():
         return
     if args.snapshot:
         _cli_snapshot()
+        return
+    if args.advisor:
+        _cli_advisor(args)
         return
 
     while True:

@@ -443,6 +443,21 @@ DataTable > .datatable--header {
 #audit-cycles { height: 1fr; border: solid gold; border-title-color: white; border-title-style: bold; }
 #audit-footer { height: auto; max-height: 2; padding: 0 1; }
 
+/* ── Advisor View ── */
+#advisor-header { height: auto; max-height: 3; padding: 0 1; }
+#advisor-summary { height: auto; max-height: 2; padding: 0 1; }
+#advisor-table { height: 1fr; border: solid magenta; border-title-color: white; border-title-style: bold; }
+
+/* ── Analytics View ── */
+#an-header { height: auto; max-height: 2; padding: 0 1; }
+#an-fleet { height: auto; max-height: 8; padding: 0 1; margin: 0 0 1 0; }
+#an-accounts-row { layout: horizontal; height: auto; max-height: 14; }
+#an-acct-a, #an-acct-b, #an-acct-c { width: 1fr; height: auto; padding: 0 1; }
+#an-heatmap { height: auto; max-height: 8; padding: 0 1; margin: 0 0 1 0; }
+#an-waste { height: auto; max-height: 10; padding: 0 1; margin: 0 0 1 0; }
+#an-efficiency { height: auto; max-height: 12; border: solid green; border-title-color: white; }
+#an-suggestions { height: auto; max-height: 12; padding: 0 1; margin: 0 0 1 0; }
+
 /* ── Navigation Screen ── */
 #navscreen-header { height: auto; max-height: 2; padding: 1 2; }
 #navscreen-grid { padding: 1 2; }
