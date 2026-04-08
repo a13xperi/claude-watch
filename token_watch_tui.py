@@ -301,11 +301,20 @@ class SystemStatusPanel(Static):
         sys_gb = sys_mem / 1024
 
         parts = []
-        # Pressure alert
+        # Pressure alert with trim recommendations
         if pressure["active"]:
-            trim_sids = [tr["sid"] for tr in pressure["trim_order"][:3]]
-            trim_note = ", ".join(trim_sids) if trim_sids else "none"
-            parts.append(f"[bold red]\u26a0 {pressure['reason']}[/bold red]  [red]trim: {trim_note}[/red]")
+            parts.append(f"[bold red]\u26a0 {pressure['reason']}[/bold red]")
+            for tr in pressure["trim_order"][:3]:
+                directive = tr.get("directive", "\u2014")[:35] or "\u2014"
+                age = tr.get("age", "?")
+                delta = tr.get("delta", "?")
+                mem = tr.get("mem_freed_mb", 0)
+                parts.append(
+                    f"  [red]\u2192[/red] [bold]{tr['sid']}[/bold]  "
+                    f"[dim]{directive}[/dim]  "
+                    f"age: {age}  used: {delta}  mem: {mem}MB  "
+                    f"[dim italic]({tr.get('reason', '')})[/dim italic]"
+                )
 
         # Gauges
         parts.append(
@@ -875,8 +884,12 @@ class TokenAttributionPanel(Static):
         except Exception:
             bar_width = 50
 
-        # Build single-line bar — normalize so bar always fits in one row
+        # Build single-line bar with minimum segment widths so small consumers stay visible
         display_sessions = [s for s in sessions if s["pct_used"] >= 0.3]
+        n_segments = len(display_sessions) + (1 if unaccounted > 0.5 else 0)
+        min_cols = 8  # minimum width per segment
+        reserved = min_cols * max(n_segments, 1)
+        extra = max(0, bar_width - reserved)
         sum_pct = sum(s["pct_used"] for s in display_sessions) + max(unaccounted, 0)
         if sum_pct <= 0:
             sum_pct = 1
@@ -884,13 +897,13 @@ class TokenAttributionPanel(Static):
         bar_chars = []
         for s in display_sessions:
             pct = s["pct_used"]
-            cols = max(1, int(pct / sum_pct * bar_width))
+            cols = min_cols + int(pct / sum_pct * extra)
             color = s["color"]
             label = f"{pct:.0f}%"
             segment = label.center(cols) if cols >= len(label) + 2 else "\u2588" * cols
             bar_chars.append(f"[bold white on {color}]{segment}[/]")
         if unaccounted > 0.5:
-            cols = max(1, int(unaccounted / sum_pct * bar_width))
+            cols = min_cols + int(unaccounted / sum_pct * extra)
             segment = f"{unaccounted:.0f}%".center(cols) if cols >= 6 else "\u2591" * cols
             bar_chars.append(f"[dim]{segment}[/dim]")
         bar_line = "".join(bar_chars)
@@ -5994,14 +6007,14 @@ class DispatchDetailScreen(Screen):
 
     def __init__(self, task: dict, **kwargs):
         super().__init__(**kwargs)
-        self._task = task
+        self._dispatch_item = task
 
     def compose(self) -> ComposeResult:
         yield Static(id="dd-header")
         yield ScrollableContainer(Static(id="dd-body"), id="dd-scroll")
 
     def on_mount(self):
-        t = self._task
+        t = self._dispatch_item
         pri_colors = {"critical": "red", "high": "yellow", "medium": "white", "low": "dim"}
         pri = t.get("priority", "medium")
         pc = pri_colors.get(pri, "white")
@@ -6020,7 +6033,7 @@ class DispatchDetailScreen(Screen):
 
     def action_copy_prompt(self):
         import subprocess
-        prompt = self._task.get("dispatch_prompt", "")
+        prompt = self._dispatch_item.get("dispatch_prompt", "")
         try:
             subprocess.run(["pbcopy"], input=prompt.encode(), check=True)
             self.notify("Copied to clipboard")
