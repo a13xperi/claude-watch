@@ -5919,6 +5919,9 @@ def _compute_utilization(window):
     for row in cap_display:
         cap_by_label[row.get("label", "")] = row
 
+    # Fetch capacity history for inactive account fallback
+    cap_history = _get_capacity_history(limit=200)
+
     # ── Per-account metrics ──────────────────────────────────────────────
     account_labels = ["A", "B", "C"]
     account_results = []
@@ -5942,14 +5945,39 @@ def _compute_utilization(window):
                 acct_sessions += 1
                 acct_tokens += s.get("output_tokens", 0)
 
-        # Current capacity from live data (active acct) or Supabase (inactive)
+        # Current capacity: live for active account, history for inactive
         cap_row = cap_by_label.get(label, {})
-        five_pct = cap_row.get("five_pct")
-        seven_day = cap_row.get("seven_pct")
-        # Convert non-numeric values to 0
-        five_pct = _safe_float(five_pct, 0) if five_pct not in (None, "—") else None
-        seven_day = _safe_float(seven_day, 0) if seven_day not in (None, "—") else None
-        snapshot_age = cap_row.get("snapshot_age_min", 999)
+        is_active = cap_row.get("is_active", False)
+
+        if is_active:
+            # Active account — use live data
+            five_pct = cap_row.get("five_pct")
+            seven_day = cap_row.get("seven_pct")
+            five_pct = _safe_float(five_pct, 0) if five_pct not in (None, "—") else None
+            seven_day = _safe_float(seven_day, 0) if seven_day not in (None, "—") else None
+            snapshot_age = cap_row.get("snapshot_age_min", 0)
+        else:
+            # Inactive account — find most recent history entry
+            hist = [h for h in cap_history if h.get("account") == label]
+            if hist:
+                latest = hist[0]  # sorted desc by snapshot_at
+                five_pct = _safe_float(latest.get("five_hour_used_pct"), 0)
+                seven_day = _safe_float(latest.get("seven_day_used_pct"), 0)
+                # Compute age from history snapshot
+                try:
+                    snap_ts = datetime.fromisoformat(
+                        latest["snapshot_at"].replace("Z", "+00:00")
+                    )
+                    snapshot_age = (now_dt - snap_ts).total_seconds() / 60
+                except Exception:
+                    snapshot_age = 999
+            else:
+                # No history — fall back to Supabase account_capacity (stale)
+                five_pct = cap_row.get("five_pct")
+                seven_day = cap_row.get("seven_pct")
+                five_pct = _safe_float(five_pct, 0) if five_pct not in (None, "—") else None
+                seven_day = _safe_float(seven_day, 0) if seven_day not in (None, "—") else None
+                snapshot_age = cap_row.get("snapshot_age_min", 999)
 
         score = _score_dimension(util_pct, 85.0)
 
@@ -6372,3 +6400,52 @@ def _generate_utilization_suggestions(analytics):
             })
 
     return suggestions
+
+
+# ── Capacity History ───────────────────────────────────────────────────────
+
+_cap_hist_cache = None  # type: Optional[Tuple[float, List]]
+
+
+def _get_capacity_history(account=None, since=None, limit=500):
+    # type: (Optional[str], Optional[str], int) -> List[Dict[str, Any]]
+    """Fetch capacity history from Supabase account_capacity_history table.
+
+    Returns list of dicts sorted by snapshot_at DESC.
+    Cached for 60 seconds.
+    """
+    global _cap_hist_cache
+    now = time.time()
+    if _cap_hist_cache is not None:
+        cached_at, cached_data = _cap_hist_cache
+        if now - cached_at < 60:
+            # Apply filters on cached data
+            result = cached_data
+            if account:
+                result = [r for r in result if r.get("account") == account]
+            return result[:limit]
+
+    import urllib.request
+    url = (
+        "{base}/account_capacity_history"
+        "?order=snapshot_at.desc&limit={limit}"
+    ).format(base=_SUPABASE_URL, limit=limit)
+    if since:
+        url += "&snapshot_at=gte.{since}".format(since=since)
+
+    req = urllib.request.Request(url, headers={
+        "apikey": _SUPABASE_KEY,
+        "Authorization": "Bearer " + _SUPABASE_KEY,
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            rows = json.loads(resp.read())
+        _cap_hist_cache = (now, rows)
+        if account:
+            rows = [r for r in rows if r.get("account") == account]
+        return rows[:limit]
+    except Exception as e:
+        _log.warning("Failed to fetch capacity history: %s", e)
+        if _cap_hist_cache is not None:
+            return _cap_hist_cache[1][:limit]
+        return []
