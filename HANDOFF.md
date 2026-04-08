@@ -3,44 +3,62 @@
 ## What This Is
 Real-time terminal dashboard for monitoring Claude Code token usage. GitHub: a13xperi/claude-watch
 
-## Current State (v0.7 — Token Access + Rules + Pomodoro Gridlines)
+## Current State (v0.15 — Pomodoro System + Audit + Skills)
 
-**v0.7 features (shipped 2026-04-08):**
-- **Token Access Control**: Panel in Usage tab showing all 23 Paperclip heartbeat agents grouped by company. Click → full toggle screen, Enter to flip on/off via Paperclip API. Suppressed run detection infers missed runs from known intervals.
-- **Rules tab** (g key): Lists all 11 rules (7 hooks, 1 budget, 3 permissions). Shows trigger/block counts per cycle from permissions.jsonl + battlestation.log. Click rule → event detail.
-- **Cycle source breakdown**: Token Distribution table in cycle detail view showing per-source token split within a 5h window.
-- **Cycle start + end times**: Both columns in Cycles list view.
-- **3-bar banner**: Top bar shows Time/5h/7d remaining with colored bars (red=low, green=plenty). Bars fill right-to-left showing remaining resources.
-- **8-row burndown chart**: Taller chart filling full vertical space. Right-side info panel with Used/Left, 5h/7d bars, zones, account, verdict, budget, score.
-- **Pomodoro gridlines**: Dotted vertical lines at 30-min intervals in burndown (10 blocks per 5h window).
-- **Navigation screen**: "Nav" button opens full-screen tab menu for narrow windows.
+**v0.15 features (shipped 2026-04-08):**
+- **Full Pomodoro system**: 10 x 30-min blocks per 5h cycle with real per-block stats
+  - `_get_pomodoro_stats(cycle_id)` — slices token ledger + sessions into 30-min buckets
+  - `_get_current_pomodoro()` — returns current block number (1-10)
+  - `P9/10` indicator in cycle banner (color-coded: cyan→white→yellow→red)
+  - Mini Pomodoro strip in burndown right panel: `P: ████████▓░ 9/10`
+  - Per-block budget tracking: `P9: 0.0% (budget: 10%)`
+  - Cycle detail sessions grouped by Pomodoro block with separator rows
+  - Accomplishment summary in Cycle Monitor showing what got done per block
+  - Block assign (`b` key) — modal to assign cycle items to Pomodoro blocks
+  - Auto-claim notifications when block transitions
+- **Auto-populate cycle items** from session data on window boundary
+- **Test detail screen**: Enter on test queue item → full detail with verify instructions, p/f/s keys
+- **Audit tab** (`a` key): Full cross-cycle audit view via `_build_full_audit()`
+- **Wire tab** (`w` key): Inter-session messaging
+- **Mission Control** (`M` key): Everything built, grouped by company/project
 
-**All 23 Paperclip heartbeats disabled** — re-enable via Token Access toggle or manually via API.
+**v0.7-v0.14 features (also shipped this session):**
+- Token Access Control, Rules tab, cycle source breakdown
+- 3-bar banner (Time/5h/7d), 8-row burndown chart
+- Pomodoro gridlines, Navigation screen
+- Cycle Monitor with freeform items, project selector, lanes
+- Multi-account capacity view, CSV export, system notifications
+- Session history with tool call sub-rows, click-to-focus
 
-## What's Next — Pomodoro System
+**Skills created/verified:**
+- `/audit` — CLI audit reports without TUI
+- `/close-cycle` — cycle report + roll forward
+- `/park` — capture ideas to build_ledger
 
-The gridlines are visual only. Next session builds the full Pomodoro execution framework:
+## What's Next
 
-1. Per-Pomodoro stats — `_get_pomodoro_stats(cycle_id)` slicing existing data into 30-min buckets
-2. "P7/10" indicator in the top banner
-3. Per-block token budget vs actual in burndown right panel
-4. Pomodoro planning UI — assign tasks to blocks
-5. Cycle detail grouped by Pomodoro instead of flat session list
-6. Auto-claim next planned task when block completes
+### Remaining backlog (from Notion):
+1. Cycle navigator visible UI polish (Medium)
+2. Session monitor LaunchAgent (Medium)
+3. Better test hints — project-specific verify instructions (Medium)
+4. Smarter lane auto-assignment in Cycle Monitor (Medium)
+5. Re-seed build_ledger with correct git timestamps (Medium)
 
-Default template: P1-2 plan (20%), P3-8 build (60%), P9 assign next (10%), P10 close (10%).
-
-See memory: `project_pomodoro_system.md`
-
-## Start Command
-```
-Build the Pomodoro system — read project_pomodoro_system.md memory
-```
+### Atlas (separate repos):
+- Portal PRs #168, #166 need a11y fix before merge
+- Portal PR #170 (Anil package) ready to merge
+- 13 test items in test queue from push-to-test
+- 7 portal + 6 backend GitHub issues open
 
 ## Key Files
 | File | Purpose |
 |---|---|
-| claude_watch_data.py | Data layer — Paperclip API, rules system, heartbeat management |
-| claude_watch_tui.py | All Textual UI (~5500 lines) |
+| claude_watch_data.py | Data layer — Pomodoro stats, cycle items, Paperclip API, audit |
+| claude_watch_tui.py | All Textual UI (~5800 lines) |
 | claude_watch_tui.tcss | Styles |
 | paperclip_agents.json | UUID → company/agent name mapping |
+
+## Start Command
+```
+Pick up the latest handoff
+```
