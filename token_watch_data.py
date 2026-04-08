@@ -396,30 +396,36 @@ def _raise_terminal_window(search_text):
 
 
 def focus_session_terminal(pid):
-    # type: (str) -> bool
+    # type: (str) -> tuple
     """Bring the terminal window for a claude session to the front.
 
-    Tries multiple strategies to match the right terminal window:
-    1. Conversation title (first user message) — matches terminal tab title
-    2. Directive text — fallback
-    3. Generic terminal activation — last resort
+    Returns (success: bool, hint: str).
+    hint contains directive/title info so caller can show it to the user.
     """
-    # Strategy 1: match by conversation title (what Warp actually shows)
-    title = _get_conversation_title(pid)
-    if title and _raise_terminal_window(title):
-        return True
-
-    # Strategy 2: match by directive
     directive = ""
     try:
         directive = Path(f"/tmp/claude-directive-{pid}").read_text().strip()
-    except Exception as e:
-        _log.debug("_focus_session_terminal: %s", e)
+    except Exception:
         pass
-    if directive and directive != "\u2014" and _raise_terminal_window(directive):
-        return True
+    hint = directive or f"cc-{pid}"
 
-    # Strategy 3: just activate the most likely terminal
+    # Strategy 1: match by conversation title
+    title = _get_conversation_title(pid)
+    if title and _raise_terminal_window(title):
+        return (True, hint)
+
+    # Strategy 2: match by directive
+    if directive and directive != "\u2014" and _raise_terminal_window(directive):
+        return (True, hint)
+
+    # Strategy 3: match by significant words from directive (Warp uses session names)
+    if directive and directive != "\u2014":
+        words = [w for w in directive.split() if len(w) > 3][:3]
+        for word in words:
+            if _raise_terminal_window(word.lower()):
+                return (True, hint)
+
+    # Strategy 4: activate Warp (brings it to front, user finds the right tab)
     for app_name in ("Warp", "iTerm", "Terminal"):
         try:
             r = subprocess.run(
@@ -427,10 +433,10 @@ def focus_session_terminal(pid):
                 timeout=3, capture_output=True, text=True,
             )
             if r.returncode == 0:
-                break
-        except Exception as e:
-            _log.debug("focus_session_terminal: %s", e)
-    return False
+                return (False, hint)
+        except Exception:
+            pass
+    return (False, hint)
 
 
 def _session_last_activity(session_id):
@@ -2533,14 +2539,23 @@ def _get_token_attribution():
         if delta > 0:
             session_deltas[curr["session"]] += delta
 
-    # Build session list
+    # Build session list — scale to current window if tokens rolled off
     total_attributed = sum(session_deltas.values())
+    rolled_off = max(0, total_attributed - current_five_pct)
     unaccounted = max(0, current_five_pct - total_attributed)
+
+    # Scale factor: if attributed > current, scale down proportionally
+    # so displayed percentages sum to current_five_pct
+    if total_attributed > current_five_pct and total_attributed > 0:
+        scale = current_five_pct / total_attributed
+    else:
+        scale = 1.0
 
     sessions = []  # type: List[Dict]
     color_idx = 0
     for sid, meta in session_meta.items():
-        pct_used = session_deltas.get(sid, 0)
+        raw_pct = session_deltas.get(sid, 0)
+        pct_used = raw_pct * scale
         model_counts = meta["model_counts"]
         dominant_model = max(model_counts, key=model_counts.get) if model_counts else "?"
         sessions.append({
@@ -2565,6 +2580,7 @@ def _get_token_attribution():
     result = {
         "total_used_pct": round(current_five_pct, 1),
         "unaccounted_pct": round(unaccounted, 1),
+        "rolled_off_pct": round(rolled_off, 1),
         "sessions": sessions,
     }  # type: Dict[str, Any]
     _attribution_cache = result
@@ -2863,6 +2879,9 @@ def _get_engine_status():
                 "sid": s["sid"],
                 "reason": s["health_reason"] or "low value",
                 "mem_freed_mb": s["mem_mb"],
+                "age": s["age"],
+                "delta": s["delta"],
+                "directive": s["directive"],
             })
 
     return {

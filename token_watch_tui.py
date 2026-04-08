@@ -706,11 +706,11 @@ class EngineTable(DataTable):
         """Handle 'f' key — focus the terminal for the currently highlighted session."""
         pid = self._get_pid_from_cursor()
         if pid:
-            ok = focus_session_terminal(pid)
+            ok, hint = focus_session_terminal(pid)
             if ok:
-                self.app.notify("Focused terminal", severity="information", timeout=2)
+                self.app.notify(f"Focused: {hint}", severity="information", timeout=2)
             else:
-                self.app.notify("No matching window", severity="warning", timeout=2)
+                self.app.notify(f"Opened Warp — find: {hint}", severity="warning", timeout=3)
 
     def _focus_terminal_for_row(self, row_key):
         """Extract PID from row key and focus the corresponding terminal."""
@@ -725,11 +725,11 @@ class EngineTable(DataTable):
         elif key_str.startswith("gap-"):
             pid = key_str.replace("gap-", "")
         if pid and pid != "empty":
-            ok = focus_session_terminal(pid)
+            ok, hint = focus_session_terminal(pid)
             if ok:
-                self.app.notify("Focused terminal", severity="information", timeout=2)
+                self.app.notify(f"Focused: {hint}", severity="information", timeout=2)
             else:
-                self.app.notify("No matching window", severity="warning", timeout=2)
+                self.app.notify(f"Opened Warp — find: {hint}", severity="warning", timeout=3)
 
 
 class ToolFrequency(Static):
@@ -884,38 +884,90 @@ class TokenAttributionPanel(Static):
         except Exception:
             bar_width = 50
 
-        # Build single-line bar with minimum segment widths so small consumers stay visible
-        display_sessions = [s for s in sessions if s["pct_used"] >= 0.3]
-        n_segments = len(display_sessions) + (1 if unaccounted > 0.5 else 0)
-        min_cols = 8  # minimum width per segment
+        # Filter sessions: >= 1% get bar + legend, < 1% collapse into "others"
+        display_sessions = [s for s in sessions if s["pct_used"] >= 1.0]
+        others = [s for s in sessions if 0 < s["pct_used"] < 1.0]
+        others_pct = sum(s["pct_used"] for s in others)
+        others_tok = sum(s.get("output_tokens", 0) or 0 for s in others)
+
+        # Segments: display_sessions + others (if any) + unaccounted
+        all_segments = list(display_sessions)
+        has_others = others_pct > 0.1 and len(others) > 0
+        has_unaccounted = unaccounted > 0.5
+        n_segments = len(all_segments) + (1 if has_others else 0) + (1 if has_unaccounted else 0)
+        min_cols = 8
         reserved = min_cols * max(n_segments, 1)
         extra = max(0, bar_width - reserved)
-        sum_pct = sum(s["pct_used"] for s in display_sessions) + max(unaccounted, 0)
+        sum_pct = sum(s["pct_used"] for s in all_segments) + others_pct + max(unaccounted, 0)
         if sum_pct <= 0:
             sum_pct = 1
 
         bar_chars = []
-        for s in display_sessions:
+        for s in all_segments:
             pct = s["pct_used"]
             cols = min_cols + int(pct / sum_pct * extra)
             color = s["color"]
             label = f"{pct:.0f}%"
             segment = label.center(cols) if cols >= len(label) + 2 else "\u2588" * cols
             bar_chars.append(f"[bold white on {color}]{segment}[/]")
-        if unaccounted > 0.5:
+        if has_others:
+            cols = min_cols + int(others_pct / sum_pct * extra)
+            label = f"{others_pct:.0f}%"
+            segment = label.center(cols) if cols >= len(label) + 2 else "\u2591" * cols
+            bar_chars.append(f"[bold white on grey50]{segment}[/]")
+        if has_unaccounted:
             cols = min_cols + int(unaccounted / sum_pct * extra)
             segment = f"{unaccounted:.0f}%".center(cols) if cols >= 6 else "\u2591" * cols
             bar_chars.append(f"[dim]{segment}[/dim]")
         bar_line = "".join(bar_chars)
 
-        # Build legend — always visible
+        # Legend — uses same display_sessions so colors match the bar exactly
+        # Enrich with company/project from engine status
+        from token_watch_data import _get_engine_status
+        engine = _get_engine_status()
+        _sid_info = {}
+        for _es in engine.get("sessions", []):
+            _sid_info[_es["sid"]] = _es
+        for _ep in engine.get("peers", []):
+            _sid_info[_ep.get("session_id", "")] = _ep
+
         legend_parts = []
-        for s in sessions:
+        for s in display_sessions:
             pct = s["pct_used"]
-            if pct < 0.3:
-                continue
             color = s["color"]
-            directive = s["directive"][:40] if s["directive"] else s["session_id"][:16]
+            sid = s["session_id"]
+
+            # Build label: [company/project] directive or session_id
+            directive = s["directive"]
+            if not directive or directive == "\u2014":
+                _pid = sid.replace("cc-", "") if sid.startswith("cc-") else ""
+                try:
+                    directive = open(f"/tmp/claude-directive-{_pid}").read().strip()
+                except Exception:
+                    directive = ""
+            if not directive or directive == "\u2014":
+                directive = sid[:16]
+
+            # Get company/project context from engine data
+            info = _sid_info.get(sid, {})
+            project = info.get("repo", "") or ""
+            if not project:
+                d_lower = directive.lower()
+                for p in ("atlas", "paperclip", "openclaw", "frank", "token-watch", "token watch"):
+                    if p in d_lower:
+                        project = p
+                        break
+            co = ""
+            if project:
+                co, _ = _project_to_company(project)
+
+            prefix = ""
+            if co and project:
+                prefix = f"[dim]{co}/{project}[/dim] "
+            elif project:
+                prefix = f"[dim]{project}[/dim] "
+
+            directive = directive[:40]
             out_tokens = s.get("output_tokens", 0) or 0
             if out_tokens >= 1_000_000:
                 tok_str = f"{out_tokens / 1_000_000:.1f}M tok"
@@ -923,10 +975,17 @@ class TokenAttributionPanel(Static):
                 tok_str = f"{out_tokens / 1_000:.0f}K tok"
             else:
                 tok_str = f"{out_tokens} tok"
-            legend_parts.append(f"[{color}]\u2588\u2588[/{color}] {directive}  [bold]{pct:.1f}%[/bold]  [dim]{tok_str}[/dim]")
-        if unaccounted > 0.5:
+            legend_parts.append(f"[{color}]\u2588\u2588[/{color}] {prefix}{directive}  [bold]{pct:.1f}%[/bold]  [dim]{tok_str}[/dim]")
+        if has_others:
+            if others_tok >= 1_000_000:
+                ot_str = f"{others_tok / 1_000_000:.1f}M tok"
+            elif others_tok >= 1_000:
+                ot_str = f"{others_tok / 1_000:.0f}K tok"
+            else:
+                ot_str = f"{others_tok} tok"
+            legend_parts.append(f"[grey50]\u2591\u2591[/grey50] [dim]+ {len(others)} others  {others_pct:.1f}%  {ot_str}[/dim]")
+        if has_unaccounted:
             legend_parts.append(f"[dim]\u2591\u2591 rolled off window  {unaccounted:.1f}%[/dim]")
-
         content = bar_line + "\n" + "\n".join(legend_parts)
         self.update(Panel(
             content,
@@ -1510,24 +1569,41 @@ class NavBar(Horizontal):
         self._active = active
 
     # All tabs — used by NavScreen and button routing
+    # Grouped by function for the clustered nav layout
+    ALL_TAB_GROUPS = [
+        ("Core", [
+            ("Dashboard", "nav-dashboard"),
+            ("Health", "nav-health"),
+            ("Capacity", "nav-capacity"),
+        ]),
+        ("Work", [
+            ("Cycle", "nav-sessions"),
+            ("Projects", "nav-projects"),
+            ("Dispatch", "nav-dispatch"),
+            ("Inbox", "nav-inbox"),
+        ]),
+        ("Intelligence", [
+            ("Mission", "nav-mission"),
+            ("Advisor", "nav-advisor"),
+            ("Analytics", "nav-analytics"),
+            ("Audit", "nav-audit"),
+        ]),
+        ("Operations", [
+            ("Wire", "nav-wire"),
+            ("Test", "nav-test"),
+            ("Rules", "nav-rules"),
+            ("MCP", "nav-mcp"),
+        ]),
+        ("History", [
+            ("Cycles", "nav-cycles"),
+            ("Usage", "nav-usage"),
+            ("Leaderboard", "nav-leaderboard"),
+        ]),
+    ]
+
+    # Flat list for backward compat
     ALL_TABS = [
-        ("Dashboard", "nav-dashboard"),
-        ("Health", "nav-health"),
-        ("Cycle", "nav-sessions"),
-        ("Projects", "nav-projects"),
-        ("Leaderboard", "nav-leaderboard"),
-        ("Cycles", "nav-cycles"),
-        ("Audit", "nav-audit"),
-        ("Mission", "nav-mission"),
-        ("Wire", "nav-wire"),
-        ("Usage", "nav-usage"),
-        ("Analytics", "nav-analytics"),
-        ("Rules", "nav-rules"),
-        ("MCP", "nav-mcp"),
-        ("Test", "nav-test"),
-        ("TW Advisor", "nav-advisor"),
-        ("Inbox", "nav-inbox"),
-        ("Dispatch", "nav-dispatch"),
+        tab for _, tabs in ALL_TAB_GROUPS for tab in tabs
     ]
 
     def compose(self) -> ComposeResult:
@@ -1556,8 +1632,11 @@ class NavigationScreen(Screen):
     def compose(self) -> ComposeResult:
         yield Static("[bold]Navigation[/bold]  [dim]click a tab or press Esc to go back[/dim]", id="navscreen-header")
         with Vertical(id="navscreen-grid"):
-            for label, btn_id in NavBar.ALL_TABS:
-                yield Button(label, id=f"ns-{btn_id}", variant="default")
+            for group_name, tabs in NavBar.ALL_TAB_GROUPS:
+                yield Static(f"[dim]{group_name}[/dim]", classes="navscreen-group-label")
+                with Horizontal(classes="navscreen-row"):
+                    for label, btn_id in tabs:
+                        yield Button(label, id=f"ns-{btn_id}", variant="default", classes="navscreen-btn")
 
     def on_button_pressed(self, event):
         btn_id = event.button.id or ""
@@ -1580,6 +1659,8 @@ class NavigationScreen(Screen):
                 "nav-advisor": "view-advisor",
                 "nav-analytics": "view-analytics",
                 "nav-dispatch": "view-dispatch",
+                "nav-capacity": "view-capacity",
+                "nav-inbox": "view-inbox",
             }
             view_id = btn_map.get(view_key)
             if view_id:
@@ -3537,8 +3618,7 @@ class SessionHistoryTable(DataTable):
                 group = date.strftime("%b %-d")
 
             if group != current_group:
-                sep = f"— {group} —"
-                self.add_row(Text(sep, style="dim"), "", "", "", "", "", "", "", "", "", "", key=f"sep-{group}")
+                self.add_row("", "", "", "", "", "", "", "", "", "", Text(f"— {group} —", style="bold dim"), key=f"sep-{group}")
                 current_group = group
 
             when_str = s["last_ts"].astimezone().strftime("%H:%M:%S")
@@ -6248,6 +6328,105 @@ class DispatchView(LazyView):
             self.notify("Copy failed", severity="error")
 
 
+class ExpensiveTurnsView(LazyView):
+    """Costliest individual turns across all sessions."""
+
+    BINDINGS = [
+        Binding("1", "window_1d", "1 Day"),
+        Binding("2", "window_3d", "3 Days"),
+        Binding("3", "window_7d", "7 Days"),
+    ]
+
+    _active_days = 3
+
+    def compose(self) -> ComposeResult:
+        yield Static(id="et-header")
+        yield Static(id="et-model-summary")
+        yield DataTable(id="et-table")
+
+    def load_content(self):
+        self._loaded = True
+        self._refresh()
+
+    def refresh_content(self):
+        self._refresh()
+
+    def _refresh(self):
+        from token_watch_data import _get_expensive_turns, _model_cost_stats, _estimate_turn_cost, _format_cost
+
+        days = self._active_days
+        turns = _get_expensive_turns(limit=50, days=days)
+        model_stats = _model_cost_stats(days=days)
+
+        # Header
+        total_turns = sum(m["turns"] for m in model_stats.values())
+        total_cost_pct = sum(m["total_pct"] for m in model_stats.values())
+        self.query_one("#et-header", Static).update(
+            f"[bold]Expensive Turns[/bold]  [dim]({days}d window)[/dim]  "
+            f"{total_turns} turns  {total_cost_pct:.1f}% total budget  "
+            f"[dim italic]1/2/3 to change window[/dim italic]"
+        )
+
+        # Model summary - one line per model showing avg cost
+        model_lines = []
+        for model, stats in sorted(model_stats.items(), key=lambda x: x[1]["avg_tokens"], reverse=True):
+            model_lines.append(
+                f"  [bold]{model}[/bold]: {stats['turns']} turns  "
+                f"avg {stats['avg_tokens']}tok ({stats['avg_pct']:.2f}%/turn)  "
+                f"total {stats['total_pct']:.1f}%"
+            )
+        self.query_one("#et-model-summary", Static).update(
+            Panel("\n".join(model_lines) if model_lines else "[dim]no data[/dim]",
+                  title="[bold]Model Cost Breakdown[/bold]", border_style="yellow")
+        )
+
+        # Table
+        table = self.query_one("#et-table", DataTable)
+        if not table.columns:
+            table.add_column("Session", width=12)
+            table.add_column("Turn", width=5)
+            table.add_column("In", width=8)
+            table.add_column("Out", width=8)
+            table.add_column("Cost", width=7)
+            table.add_column("~5h%", width=6)
+            table.add_column("Model", width=10)
+            table.add_column("Tools", width=20)
+            table.add_column("Prompt")
+        table.clear()
+
+        for t in turns:
+            cost = _estimate_turn_cost(t["tokens_in"], t["tokens_out"], t["model"])
+            cost_str = _format_cost(cost)
+            pct_style = "bold red" if t["pct_est"] > 2 else ("yellow" if t["pct_est"] > 1 else "dim")
+
+            in_str = f"{t['tokens_in']/1000:.1f}k" if t['tokens_in'] >= 1000 else str(t['tokens_in'])
+            out_str = f"{t['tokens_out']/1000:.1f}k" if t['tokens_out'] >= 1000 else str(t['tokens_out'])
+
+            table.add_row(
+                Text(t["session_short"]),
+                Text(str(t["turn"])),
+                Text(in_str, style="dim"),
+                Text(out_str),
+                Text(cost_str, style="green"),
+                Text(f"{t['pct_est']:.1f}%", style=pct_style),
+                Text(t["model"]),
+                Text(t["tools"][:20], style="dim"),
+                Text(t["prompt"]),
+            )
+
+    def action_window_1d(self):
+        self._active_days = 1
+        self._refresh()
+
+    def action_window_3d(self):
+        self._active_days = 3
+        self._refresh()
+
+    def action_window_7d(self):
+        self._active_days = 7
+        self._refresh()
+
+
 class ClaudeWatchApp(App):
     CSS_PATH = "token_watch_tui.tcss"
     TITLE = "Token Watch"
@@ -6282,6 +6461,7 @@ class ClaudeWatchApp(App):
         Binding("tab", "focus_next", "Next panel", show=False),
         Binding("shift+tab", "focus_previous", "Prev panel", show=False),
         Binding("R", "reload_build", "Reload", show=False),
+        Binding("E", "show_expensive_turns", "Expensive"),
     ]
 
     _filter_text = ""
@@ -6325,6 +6505,7 @@ class ClaudeWatchApp(App):
             yield InboxView(id="view-inbox")
             yield AnalyticsView(id="view-analytics")
             yield DispatchView(id="view-dispatch")
+            yield ExpensiveTurnsView(id="view-expensive-turns")
         yield Footer()
 
     def switch_view(self, view_id: str) -> None:
@@ -6355,6 +6536,8 @@ class ClaudeWatchApp(App):
             "view-advisor": "nav-advisor",
             "view-analytics": "nav-analytics",
             "view-dispatch": "nav-dispatch",
+            "view-inbox": "nav-inbox",
+            "view-expensive-turns": "nav-dashboard",
         }
         active_nav = nav_map.get(view_id, "")
         for btn in self.query("#nav-bar Button"):
@@ -6685,6 +6868,9 @@ class ClaudeWatchApp(App):
 
     def action_show_dispatch(self):
         self.switch_view("view-dispatch")
+
+    def action_show_expensive_turns(self):
+        self.switch_view("view-expensive-turns")
 
     def _ensure_cycle_list(self):
         """Load cycle list if not loaded."""

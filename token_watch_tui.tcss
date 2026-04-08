@@ -451,8 +451,10 @@ DataTable > .datatable--header {
 
 /* ── Navigation Screen ── */
 #navscreen-header { height: auto; max-height: 2; padding: 1 2; }
-#navscreen-grid { padding: 1 2; }
-#navscreen-grid Button { width: 100%; height: 3; margin: 0 0 1 0; }
+#navscreen-grid { padding: 1 2; height: auto; }
+.navscreen-group-label { height: 1; margin: 1 0 0 0; }
+.navscreen-row { height: auto; width: 100%; }
+.navscreen-btn { width: 1fr; height: 3; margin: 0 1 0 0; min-width: 12; }
 
 /* -- Dispatch View -- */
 #dispatch-header { height: auto; max-height: 3; padding: 0 1; }

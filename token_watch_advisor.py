@@ -806,6 +806,60 @@ def check_directive_alignment(ctx: Dict) -> List[Insight]:
     return insights
 
 
+# --- Pipeline checks ---
+
+@advisor_check("unclaimed_continuations", ["project_tasks"])
+def check_unclaimed_continuations(ctx: Dict) -> List[Insight]:
+    """Flag next-session prompts sitting unclaimed in the dispatch queue."""
+    tasks = ctx.get("project_tasks", [])
+    continuations = [
+        t for t in tasks
+        if t.get("status") == "ready"
+        and t.get("source") in ("close-session", "expired-session")
+        and t.get("priority") in ("high", "critical")
+    ]
+
+    if not continuations:
+        return []
+
+    now = datetime.now(timezone.utc)
+    old_continuations = []
+    for c in continuations:
+        created = c.get("created_at", "")
+        try:
+            ct = datetime.fromisoformat(created.replace("Z", "+00:00"))
+            age_hours = (now - ct).total_seconds() / 3600
+            if age_hours > 2:
+                old_continuations.append((c, age_hours))
+        except Exception:
+            old_continuations.append((c, 99))
+
+    insights: List[Insight] = []
+
+    if len(continuations) >= 3:
+        names = ", ".join(c.get("task_name", "?")[:30] for c in continuations[:3])
+        insights.append(Insight(
+            category="PIPELINE", severity="warning",
+            title=f"{len(continuations)} unclaimed continuations",
+            message=f"Session continuations sitting unclaimed: {names}.",
+            action="Run /dispatch to pick one up, or archive stale ones.",
+            source="unclaimed_continuations",
+            data={"count": len(continuations)},
+        ))
+    elif old_continuations:
+        c, hours = old_continuations[0]
+        insights.append(Insight(
+            category="PIPELINE", severity="info",
+            title="Continuation aging",
+            message=f'"{c.get("task_name", "?")[:40]}" unclaimed for {hours:.0f}h.',
+            action="Claim via /dispatch or review if still relevant.",
+            source="unclaimed_continuations",
+            data={"task_name": c.get("task_name"), "age_hours": round(hours, 1)},
+        ))
+
+    return insights
+
+
 # --- Test Queue checks ---
 
 @advisor_check("test_queue_backlog", ["test_queue"])
