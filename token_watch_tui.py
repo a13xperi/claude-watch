@@ -6013,23 +6013,87 @@ class DispatchDetailScreen(Screen):
         yield Static(id="dd-header")
         yield ScrollableContainer(Static(id="dd-body"), id="dd-scroll")
 
+    def _format_age_detail(self, ts):
+        if not ts:
+            return "?"
+        try:
+            from datetime import datetime, timezone
+            dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+            delta = datetime.now(timezone.utc) - dt
+            hours = delta.total_seconds() / 3600
+            date_str = dt.strftime("%b %-d, %H:%M")
+            if hours < 24:
+                return date_str + " (" + str(int(hours)) + "h ago)"
+            return date_str + " (" + str(int(hours / 24)) + "d ago)"
+        except Exception:
+            return ts[:19] if ts else "?"
+
+    def _find_unlocks(self, task_id):
+        try:
+            from token_watch_data import _get_dispatch_queue
+            data = _get_dispatch_queue()
+            unlocks = []
+            tid = str(task_id)
+            for item in data.get("queue", []) + data.get("active", []):
+                blocked = item.get("blocked_by") or ""
+                if tid in str(blocked):
+                    name = item.get("task_name", "?")[:40]
+                    unlocks.append("#" + str(item["id"]) + " " + name)
+            return unlocks
+        except Exception:
+            return []
+
     def on_mount(self):
         t = self._dispatch_item
-        pri_colors = {"critical": "red", "high": "yellow", "medium": "white", "low": "dim"}
+        pri_colors = {"critical": "red bold", "high": "yellow", "medium": "white", "low": "dim"}
         pri = t.get("priority", "medium")
         pc = pri_colors.get(pri, "white")
 
         self.query_one("#dd-header", Static).update(
-            f"[bold]#{t.get('id', '?')}[/bold]  "
-            f"[{pc}]{pri.upper()}[/{pc}]  "
-            f"[cyan]{t.get('project', '?')}[/cyan]  "
-            f"[dim]source={t.get('source', '?')}  tier={t.get('tier', '?')}  "
-            f"~{t.get('est_tokens_k', '?')}kT[/dim]  "
-            f"[dim italic]c=copy  esc=back[/dim italic]"
+            "[bold]#" + str(t.get("id", "?")) + "[/bold]  "
+            "[" + pc + "]" + pri.upper() + "[/" + pc + "]  "
+            "[cyan]" + str(t.get("project", "?")) + "[/cyan]  "
+            "[dim italic]c=copy  esc=back[/dim italic]"
         )
 
-        prompt = t.get("dispatch_prompt", "(no prompt)")
-        self.query_one("#dd-body", Static).update(f"\n{prompt}\n")
+        lines = []
+        lines.append("[bold]" + str(t.get("task_name", "?")) + "[/bold]")
+        lines.append("")
+
+        logged = self._format_age_detail(t.get("created_at", ""))
+        session = t.get("created_by_session") or "?"
+        source = t.get("source") or "?"
+        tier = t.get("tier") or "?"
+        difficulty = t.get("difficulty") or "?"
+        points = str(t.get("points") or 0)
+        tokens = str(t.get("est_tokens_k") or 0)
+        runs = str(t.get("run_count") or 0)
+        blocked_by = str(t.get("blocked_by") or "none")
+
+        sep = "[dim]" + chr(9472) * 60 + "[/dim]"
+        lines.append(sep)
+        lines.append("  [bold]Priority:[/bold]    [" + pc + "]" + pri + "[/" + pc + "]        [bold]Difficulty:[/bold]  " + difficulty)
+        lines.append("  [bold]Points:[/bold]      " + points + "              [bold]Est tokens:[/bold] ~" + tokens + "kT")
+        lines.append("  [bold]Tier:[/bold]        " + tier + "             [bold]Run count:[/bold]  " + runs)
+        lines.append("  [bold]Source:[/bold]      " + source + "           [bold]Session:[/bold]    " + session)
+        lines.append("  [bold]Logged:[/bold]      " + logged)
+        lines.append("  [bold]Blocked by:[/bold]  " + blocked_by)
+
+        unlocks = self._find_unlocks(t.get("id"))
+        if unlocks:
+            joined = ", ".join(unlocks)
+            lines.append("  [bold green]Unlocks:[/bold green]    " + joined)
+        else:
+            lines.append("  [bold]Unlocks:[/bold]    [dim]nothing[/dim]")
+
+        lines.append(sep)
+        lines.append("")
+        lines.append("[bold cyan]Dispatch Prompt[/bold cyan]")
+        lines.append("")
+        lines.append(t.get("dispatch_prompt", "(no prompt)"))
+
+        body = chr(10).join(lines)
+        self.query_one("#dd-body", Static).update(body)
 
     def action_copy_prompt(self):
         import subprocess
