@@ -5604,13 +5604,20 @@ class ClaudeWatchApp(App):
             except Exception:
                 pass
 
-        # Auto-score completed windows (keep unconditional)
+        # Auto-score completed windows + cycle rollover (keep unconditional)
         from claude_watch_data import _check_and_score_completed_window
         new_score = _check_and_score_completed_window()
         if new_score:
-            stars = new_score.get("stars", "")
-            ov = new_score.get("overall", 0)
-            self.notify(f"Window scored: {stars} ({ov})", severity="information", timeout=10)
+            rolled = new_score.get("rolled", 0)
+            if "stars" in new_score:
+                stars = new_score.get("stars", "")
+                ov = new_score.get("overall", 0)
+                msg = f"Window scored: {stars} ({ov})"
+                if rolled:
+                    msg += f" | {rolled} items rolled to new cycle"
+                self.notify(msg, severity="information", timeout=10)
+            elif rolled:
+                self.notify(f"{rolled} cycle items rolled to new window", severity="information", timeout=8)
 
         # System notifications on spike (keep unconditional)
         try:

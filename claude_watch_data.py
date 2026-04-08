@@ -3649,19 +3649,35 @@ def _check_and_score_completed_window():
             return None
         _last_scored_window = window_key
 
+        prev_reset = window_start
+        prev_start = prev_reset - timedelta(hours=5)
+
+        # Auto-populate cycle items from session accomplishments
+        try:
+            _populate_cycle_from_sessions(cycle_id=prev_start.isoformat())
+        except Exception:
+            pass
+
+        # Auto-roll open cycle items from previous window to current
+        rolled = _roll_cycle_items(prev_start.isoformat(), window_key)
+
         existing = _get_window_scores(limit=5)
         for s in existing:
             if s.get("window_start") == window_key:
+                if rolled > 0:
+                    return {"rolled": rolled}
                 return None
 
-        prev_reset = window_start
-        prev_start = prev_reset - timedelta(hours=5)
         score = _score_window(prev_start, prev_reset)
         if score and score.get("burn_pct", 0) > 1:
             streak = _get_streak(existing)
             score["streak"] = (streak + 1) if score["overall"] >= 4.0 else 0
+            score["rolled"] = rolled
             _save_window_score(score)
             return score
+
+        if rolled > 0:
+            return {"rolled": rolled}
     except Exception:
         pass
     return None
