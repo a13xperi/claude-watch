@@ -3658,8 +3658,8 @@ def _check_and_score_completed_window():
         except Exception:
             pass
 
-        # Auto-roll open cycle items from previous window to current
-        rolled = _roll_cycle_items(prev_start.isoformat(), window_key)
+        # Auto-roll open cycle items from ALL past windows to current (catch-up)
+        rolled = _auto_roll_stale_items(window_key)
 
         existing = _get_window_scores(limit=5)
         for s in existing:
@@ -4886,14 +4886,17 @@ def _get_next_pomodoro_task():
 
 def _roll_cycle_items(old_window_start, new_window_start):
     # type: (str, str) -> int
-    """Roll open items from old window to new window. Returns count rolled."""
+    """Roll open items from old window to new window. Returns count rolled.
+    Deduplicates by (title, project) so re-runs are safe."""
     import urllib.request
+    from urllib.parse import quote
     config = _get_battlestation_config()
+
     # Fetch open items from old window
     url = (
         f"{_SUPABASE_URL}/cycle_items"
         f"?user_id=eq.{config['user_id']}"
-        f"&window_start=eq.{old_window_start}"
+        f"&window_start=eq.{quote(old_window_start)}"
         f"&status=eq.open"
         f"&order=created_at.asc"
     )
@@ -4907,17 +4910,78 @@ def _roll_cycle_items(old_window_start, new_window_start):
     except Exception:
         return 0
 
+    if not open_items:
+        return 0
+
+    # Fetch existing items in the target window for dedup
+    target_url = (
+        f"{_SUPABASE_URL}/cycle_items"
+        f"?user_id=eq.{config['user_id']}"
+        f"&window_start=eq.{quote(new_window_start)}"
+        f"&order=created_at.asc"
+    )
+    existing_keys = set()  # type: set
+    try:
+        req = urllib.request.Request(target_url, headers={
+            "apikey": _SUPABASE_KEY,
+            "Authorization": f"Bearer {_SUPABASE_KEY}",
+        })
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            target_items = json.loads(resp.read())
+        for ti in target_items:
+            # Dedup key: strip any existing "[rolled]" prefix for comparison
+            raw_title = re.sub(r"^\[rolled\]\s*", "", ti.get("title", ""))
+            existing_keys.add((raw_title.lower().strip(), (ti.get("project") or "").lower()))
+    except Exception:
+        pass
+
+    # Format source cycle label for annotation
+    try:
+        dt = datetime.fromisoformat(old_window_start.replace("Z", "+00:00"))
+        cycle_label = dt.astimezone().strftime("%b %d %H:%M")
+    except Exception:
+        cycle_label = old_window_start[:16]
+
     rolled = 0
     now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     for item in open_items:
+        title = item.get("title", "")
+        project = item.get("project", "")
+
+        # Dedup: skip if already exists in target window
+        raw_title = re.sub(r"^\[rolled\]\s*", "", title)
+        dedup_key = (raw_title.lower().strip(), project.lower())
+        if dedup_key in existing_keys:
+            # Already exists — just mark original as rolled without cloning
+            try:
+                patch_data = json.dumps({"status": "rolled", "resolved_at": now_iso}).encode()
+                req = urllib.request.Request(
+                    f"{_SUPABASE_URL}/cycle_items?id=eq.{item['id']}",
+                    data=patch_data,
+                    headers={
+                        "apikey": _SUPABASE_KEY,
+                        "Authorization": f"Bearer {_SUPABASE_KEY}",
+                        "Content-Type": "application/json",
+                    },
+                    method="PATCH",
+                )
+                urllib.request.urlopen(req, timeout=5)
+            except Exception:
+                pass
+            continue
+
+        # Annotate title with rolled prefix
+        rolled_title = f"[rolled] {title}" if not title.startswith("[rolled]") else title
+
         # Clone to new window
         clone_payload = {
             "user_id": config["user_id"],
             "window_start": new_window_start,
             "category": item.get("category", ""),
-            "title": item.get("title", ""),
+            "title": rolled_title,
             "status": "open",
-            "project": item.get("project", ""),
+            "project": project,
+            "source_ref": item.get("source_ref", ""),
         }
         try:
             data = json.dumps(clone_payload).encode()
@@ -4953,7 +5017,78 @@ def _roll_cycle_items(old_window_start, new_window_start):
         except Exception:
             pass
 
+        # Track for dedup within this run
+        existing_keys.add(dedup_key)
+
     return rolled
+
+
+def _auto_roll_stale_items(current_window_start=None):
+    # type: (Optional[str]) -> int
+    """Catch-up roll: find ALL open cycle_items in past windows and roll them
+    to the current window. Handles gaps where TUI wasn't running during
+    cycle boundaries. Idempotent — safe to call multiple times.
+
+    Returns total count of items rolled."""
+    import urllib.request
+    from urllib.parse import quote
+
+    # Determine current window
+    if not current_window_start:
+        current_window_start = _get_current_cycle_id()
+    if not current_window_start:
+        return 0
+
+    config = _get_battlestation_config()
+
+    # Fetch ALL open items across all windows
+    url = (
+        f"{_SUPABASE_URL}/cycle_items"
+        f"?user_id=eq.{config['user_id']}"
+        f"&status=eq.open"
+        f"&order=window_start.asc"
+    )
+    try:
+        req = urllib.request.Request(url, headers={
+            "apikey": _SUPABASE_KEY,
+            "Authorization": f"Bearer {_SUPABASE_KEY}",
+        })
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            all_open = json.loads(resp.read())
+    except Exception:
+        return 0
+
+    # Parse current window start for comparison
+    try:
+        current_dt = datetime.fromisoformat(current_window_start.replace("Z", "+00:00"))
+    except Exception:
+        return 0
+
+    # Group stale items by their source window
+    stale_windows = {}  # type: Dict[str, list]
+    for item in all_open:
+        ws = item.get("window_start", "")
+        try:
+            ws_dt = datetime.fromisoformat(ws.replace("Z", "+00:00"))
+            # Only roll from windows strictly before the current one
+            if ws_dt < current_dt - timedelta(minutes=5):
+                if ws not in stale_windows:
+                    stale_windows[ws] = []
+                stale_windows[ws].append(item)
+        except Exception:
+            continue
+
+    if not stale_windows:
+        return 0
+
+    total_rolled = 0
+    for old_ws in sorted(stale_windows.keys()):
+        count = _roll_cycle_items(old_ws, current_window_start)
+        total_rolled += count
+
+    _log.info(f"Auto-roll catch-up: rolled {total_rolled} items from "
+              f"{len(stale_windows)} past window(s) to {current_window_start}")
+    return total_rolled
 
 
 # ── Test Queue ────────────────────────────────────────────────────────────────
