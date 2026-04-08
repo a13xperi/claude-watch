@@ -67,6 +67,8 @@ from claude_watch_data import (
     _update_test_item,
     _delete_test_item,
     _import_atlas_qa_tests,
+    _scrape_cycle_sessions,
+    _populate_cycle_from_sessions,
     export_session_history_csv,
     focus_session_terminal,
     get_account_capacity_display,
@@ -76,6 +78,8 @@ from claude_watch_data import (
     make_sessions_panel,
     make_skills_panel,
     make_tool_stats,
+    _build_full_audit,
+    export_audit_markdown,
 )
 
 class LazyView(ScrollableContainer):
@@ -763,7 +767,7 @@ class TokenAttributionPanel(Static):
             label = f"{pct:.0f}%"
             segment = label.center(cols) if cols >= len(label) + 2 else "█" * cols
             bar_chars.append(f"[bold white on {color}]{segment}[/]")
-            directive = s["directive"][:20] if s["directive"] else s["session_id"][:12]
+            directive = s["directive"][:35] if s["directive"] else s["session_id"][:16]
             legend_parts.append(f"[{color}]■[/] {directive} ({pct:.1f}%)")
         if unaccounted > 0.5:
             cols = max(1, int(unaccounted / total * bar_width)) if total > 0 else 1
@@ -771,7 +775,7 @@ class TokenAttributionPanel(Static):
             bar_chars.append(f"[dim]{segment}[/dim]")
             legend_parts.append(f"[dim]░ rolled out ({unaccounted:.1f}%)[/dim]")
         bar_line = "".join(bar_chars)
-        legend_line = "  ".join(legend_parts)
+        legend_line = "\n".join(legend_parts)
         content_str = bar_line + chr(10) + legend_line
         self.update(Panel(
             content_str,
@@ -841,14 +845,23 @@ class BurndownChart(Static):
             col_min = col * mins_total / chart_width
             ideal_at.append(max(0.0, 100.0 * (1.0 - col_min / mins_total)))
 
+        # Pomodoro markers — columns that fall on 30-minute boundaries
+        pomo_cols = set()
+        for pomo_min in range(30, int(mins_total), 30):
+            pomo_col = int(pomo_min / mins_total * chart_width)
+            if 0 < pomo_col < chart_width:
+                pomo_cols.add(pomo_col)
+
         # Budget per 10 minutes (to use it all evenly)
         budget_per_10 = (remaining / mins_to_reset * 10) if mins_to_reset > 0 else 0
 
-        # Render 3 chart rows
+        # Render 8 chart rows (fills full vertical space)
+        num_rows = 8
+        row_height = 100.0 / num_rows
         rows = []
-        for row_idx in range(3):
-            row_min = (2 - row_idx) * 33.3
-            row_max = row_min + 33.3
+        for row_idx in range(num_rows):
+            row_min = (num_rows - 1 - row_idx) * row_height
+            row_max = row_min + row_height
             chars = []
             for col in range(chart_width):
                 val, zone = full_data[col]
@@ -859,13 +872,18 @@ class BurndownChart(Static):
                     chars.append("[bold white]│[/bold white]")
                     continue
 
+                # Pomodoro 30-min boundary — dotted vertical line
+                if col in pomo_cols:
+                    chars.append("[dim]·[/dim]")
+                    continue
+
                 # Map value to block char
                 if val <= row_min:
                     block = " "
                 elif val >= row_max:
                     block = "█"
                 else:
-                    frac = (val - row_min) / 33.3
+                    frac = (val - row_min) / row_height
                     idx = int(frac * 8)
                     block = self._BLOCKS[min(idx, 8)]
 
@@ -1074,28 +1092,29 @@ class BurndownChart(Static):
         five_zone, five_zcolor = _token_zone(five)
         seven_zone, seven_zcolor = _token_zone(seven)
 
-        # Build right-side lines (aligned with chart rows)
+        # Build right-side lines (aligned with 8 chart rows + border + axis = 10 lines)
         r = [
             f"  [bold {used_color}]{used_pct:.0f}% Used[/bold {used_color}]  [bold {left_color}]{remaining:.0f}% Left[/bold {left_color}]",
             f"  [bold]5h[/bold] {mini_bar(five)} {_safe_float(five):.0f}%  [dim]resets {reset_str}[/dim]",
             f"  [bold]7d[/bold] {mini_bar(seven)} {_safe_float(seven):.0f}%  [dim]{_reset_day(sr)[:10]}[/dim]",
             f"  [{five_zcolor}]{five_zone}[/{five_zcolor}] 5h  [{seven_zcolor}]{seven_zone}[/{seven_zcolor}] 7d",
             f"  [{acct_color}]Acct {label}[/{acct_color}]: {name} [dim]({lane})[/dim]",
-            f"  {pace_str}",
+            "",
             f"  {verdict}",
-            score_line,
+            f"  [{remaining_color}]{remaining:.0f}% left[/{remaining_color}]  [{budget_color}]Budget: {budget_per_10:.1f}%/10m[/{budget_color}]",
+            f"  {pace_str}",
+            f"  {score_line}",
         ]
 
-        lines = [
-            f"100%│{rows[0]}│{r[0]}",
-            f"    │{rows[1]}│{r[1]}",
-            f"  0%│{rows[2]}│{r[2]}",
-            f"    └{border_str}┘{r[3]}",
-            f"     [dim]{axis_str}[/dim]{r[4]}",
-            r[5],
-            r[6],
-            r[7],
-        ]
+        lines = []
+        for i in range(num_rows):
+            ylbl = "100%" if i == 0 else ("  0%" if i == num_rows - 1 else "    ")
+            right = r[i] if i < len(r) else ""
+            lines.append(f"{ylbl}\u2502{rows[i]}\u2502{right}")
+        r_border = r[num_rows] if num_rows < len(r) else ""
+        r_axis = r[num_rows + 1] if num_rows + 1 < len(r) else ""
+        lines.append(f"    \u2514{border_str}\u2518{r_border}")
+        lines.append(f"     [dim]{axis_str}[/dim]{r_axis}")
 
         content = "\n".join(lines)
         self.update(
@@ -1118,8 +1137,7 @@ class SystemHealthPanel(Static):
         t.add_column("When", width=9, no_wrap=True)
         t.add_column("Process", width=10, no_wrap=True)
         t.add_column("Src", width=10, no_wrap=True)
-        t.add_column("Co", width=8, no_wrap=True)
-        t.add_column("Project", width=12, no_wrap=True)
+        t.add_column("Project", width=18, no_wrap=True)
         t.add_column("Mdl", width=10, no_wrap=True)
         t.add_column("Mem", width=8, justify="right", no_wrap=True)
         t.add_column("Status", overflow="ellipsis", no_wrap=True)
@@ -1187,12 +1205,12 @@ class SystemHealthPanel(Static):
             start_time = s.get("start_time", "?")
             mdl = _abbrev_model(model_map.get(f"cc-{pid}", "?"))
             mdl_style = "magenta" if "opus" in mdl else ("cyan" if "sonnet" in mdl else "dim")
+            project_display = f"[{co_style}]{co_name}[/{co_style}]/[dim]{project}[/dim]"
             t.add_row(
                 f"[dim]{start_time}[/dim]",
                 f"{dot}[cyan]cc-{pid}[/cyan]",
                 f"[{src_color}]{source}[/{src_color}]",
-                f"[{co_style}]{co_name}[/{co_style}]",
-                f"[dim]{project}[/dim]",
+                project_display,
                 f"[{mdl_style}]{mdl}[/{mdl_style}]",
                 Text.from_markup(mem_str),
                 status_str,
@@ -1217,7 +1235,6 @@ class SystemHealthPanel(Static):
             t.add_row(
                 "",
                 f"[dim]{display_name}[/dim]",
-                "",
                 "",
                 "",
                 "",
@@ -1261,7 +1278,6 @@ class SystemHealthPanel(Static):
             Text.from_markup(f"MEM {gauge_bar(mem_pct)} {mem_gb:.1f}GB/{sys_gb:.0f}GB [{mem_zc}]{mem_zone}[/{mem_zc}]"),
             "",
             "",
-            "",
             Text.from_markup(f"CPU {gauge_bar(cpu_capped)} {total_cpu:.0f}% [{cpu_zc}]{cpu_zone}[/{cpu_zc}]"),
             "",
             "",
@@ -1270,7 +1286,6 @@ class SystemHealthPanel(Static):
         t.add_row(
             "",
             "[bold]Total AI stack[/bold]",
-            "",
             "",
             "",
             "",
@@ -1337,22 +1352,81 @@ class NavBar(Horizontal):
         super().__init__(**kwargs)
         self._active = active
 
+    # All tabs — used by NavScreen and button routing
+    ALL_TABS = [
+        ("Dashboard", "nav-dashboard"),
+        ("Health", "nav-health"),
+        ("Cycle", "nav-sessions"),
+        ("Projects", "nav-projects"),
+        ("Leaderboard", "nav-leaderboard"),
+        ("Cycles", "nav-cycles"),
+        ("Audit", "nav-audit"),
+        ("Mission", "nav-mission"),
+        ("Wire", "nav-wire"),
+        ("Usage", "nav-usage"),
+        ("Rules", "nav-rules"),
+        ("MCP", "nav-mcp"),
+        ("Test", "nav-test"),
+    ]
+
     def compose(self) -> ComposeResult:
+        # Compact top bar — key tabs + Nav button for the rest
         buttons = [
             ("Dashboard", "nav-dashboard"),
-            ("Health", "nav-health"),
-            ("Cycle", "nav-sessions"),
-            ("Projects", "nav-projects"),
-            ("Leaderboard", "nav-leaderboard"),
             ("Cycles", "nav-cycles"),
             ("Usage", "nav-usage"),
-            ("MCP", "nav-mcp"),
-            ("Test", "nav-test"),
+            ("Rules", "nav-rules"),
+            ("Nav", "nav-open-nav"),
         ]
         for label, btn_id in buttons:
             variant = "primary" if btn_id == self._active else "default"
             yield Button(label, id=btn_id, variant=variant)
 
+
+
+class NavigationScreen(Screen):
+    """Full-screen navigation — all tabs as large buttons."""
+
+    BINDINGS = [
+        Binding("escape", "pop_screen", "Back"),
+        Binding("q", "pop_screen", "Back"),
+    ]
+
+    def compose(self) -> ComposeResult:
+        yield Static("[bold]Navigation[/bold]  [dim]click a tab or press Esc to go back[/dim]", id="navscreen-header")
+        with Vertical(id="navscreen-grid"):
+            for label, btn_id in NavBar.ALL_TABS:
+                yield Button(label, id=f"ns-{btn_id}", variant="default")
+
+    def on_button_pressed(self, event):
+        btn_id = event.button.id or ""
+        if btn_id.startswith("ns-nav-"):
+            view_key = btn_id[3:]  # strip "ns-" prefix → "nav-xxx"
+            # Map nav button to view
+            btn_map = {
+                "nav-dashboard": "view-dashboard",
+                "nav-sessions": "view-sessions",
+                "nav-projects": "view-projects",
+                "nav-leaderboard": "view-leaderboard",
+                "nav-usage": "view-usage",
+                "nav-mcp": "view-mcp",
+                "nav-cycles": "view-cycles",
+                "nav-test": "view-test",
+                "nav-rules": "view-rules",
+                "nav-audit": "view-audit",
+                "nav-mission": "view-mission",
+                "nav-wire": "view-wire",
+            }
+            view_id = btn_map.get(view_key)
+            if view_id:
+                self.app.pop_screen()
+                self.app.switch_view(view_id)
+            elif view_key == "nav-health":
+                self.app.pop_screen()
+                self.app.action_toggle_health()
+
+    def action_pop_screen(self):
+        self.app.pop_screen()
 
 
 class HealthScreen(Screen):
@@ -1633,11 +1707,247 @@ class DailySparklinePanel(Static):
         ))
 
 
+class TokenAccessPanel(Static):
+    """Shows token access systems with toggles to enable/disable heartbeats."""
+
+    _STATUS_ON = "[bold green]●[/bold green]"
+    _STATUS_OFF = "[bold red]○[/bold red]"
+    _STATUS_MIXED = "[bold yellow]◐[/bold yellow]"
+
+    def update_content(self):
+        from claude_watch_data import _get_paperclip_heartbeats, _get_blocked_attempts
+
+        try:
+            agents = _get_paperclip_heartbeats()
+        except Exception:
+            agents = []
+        blocked = _get_blocked_attempts(minutes=60)
+
+        # Group agents by company
+        companies = {}  # type: dict
+        for a in agents:
+            co = a.get("companyName", "?")
+            if co not in companies:
+                companies[co] = []
+            companies[co].append(a)
+
+        lines = []
+        lines.append("[bold]Token Access[/bold]  [dim]click to manage · shows what can burn tokens[/dim]")
+        lines.append("")
+        lines.append(f"  {self._STATUS_ON} [green]CLI[/green] [dim](always on)[/dim]")
+
+        for co_name, co_agents in sorted(companies.items()):
+            active = [a for a in co_agents if a.get("heartbeatEnabled") and a.get("schedulerActive")]
+            total = len(co_agents)
+            n_active = len(active)
+
+            if n_active == 0:
+                status = self._STATUS_OFF
+                style = "red"
+            elif n_active < total:
+                status = self._STATUS_MIXED
+                style = "yellow"
+            else:
+                status = self._STATUS_ON
+                style = "green"
+
+            agent_parts = []
+            for a in co_agents:
+                name = a.get("agentName", "?")
+                on = a.get("heartbeatEnabled", False) and a.get("schedulerActive", False)
+                interval = a.get("intervalSec", 0)
+                if interval >= 86400:
+                    freq = f"{interval // 86400}d"
+                elif interval >= 3600:
+                    freq = f"{interval // 3600}h"
+                elif interval >= 60:
+                    freq = f"{interval // 60}m"
+                else:
+                    freq = f"{interval}s" if interval else "—"
+
+                dot = "[green]●[/green]" if on else "[red]○[/red]"
+                agent_parts.append(f"{dot} {name}({freq})")
+
+            detail = "  ".join(agent_parts)
+            lines.append(f"  {status} [{style}]{co_name}[/{style}] ({n_active}/{total})  {detail}")
+
+        if blocked:
+            lines.append("")
+            lines.append(f"  [yellow]⚠ {len(blocked)} blocked attempt(s) in last hour[/yellow]")
+
+        self.update(Panel(
+            "\n".join(lines),
+            title="[bold]Token Access Control[/bold]",
+            border_style="magenta",
+        ))
+
+    def on_click(self):
+        self.app.push_screen(TokenAccessScreen())
+
+
+class TokenAccessScreen(Screen):
+    """Full screen for toggling individual agent heartbeats."""
+
+    BINDINGS = [
+        Binding("escape", "pop_screen", "Back"),
+        Binding("r", "refresh", "Refresh"),
+    ]
+
+    def compose(self) -> ComposeResult:
+        yield Static(id="taccess-header")
+        yield DataTable(id="taccess-table")
+        yield Static(id="taccess-blocked-header")
+        yield DataTable(id="taccess-blocked")
+        yield Static(id="taccess-footer")
+
+    def on_mount(self):
+        self._load()
+
+    def _load(self):
+        from claude_watch_data import _get_paperclip_heartbeats, _get_blocked_attempts
+
+        agents = _get_paperclip_heartbeats()
+        blocked = _get_blocked_attempts(minutes=60)
+
+        self.query_one("#taccess-header", Static).update(
+            "[bold]Token Access Control[/bold]  [dim]Enter to toggle selected agent · Esc to go back[/dim]"
+        )
+
+        table = self.query_one("#taccess-table", DataTable)
+        table.clear(columns=True)
+        table.cursor_type = "row"
+        table.zebra_stripes = True
+        table.add_column("Status", width=8)
+        table.add_column("Company", width=14)
+        table.add_column("Agent", width=22)
+        table.add_column("Frequency", width=12)
+        table.add_column("Last Run", width=14)
+        table.add_column("Agent ID", width=38)
+
+        # CLI row (not toggleable)
+        table.add_row(
+            Text("● ON", style="green"),
+            Text("—", style="dim"),
+            Text("CLI (human sessions)", style="green"),
+            Text("—", style="dim"),
+            Text("—", style="dim"),
+            Text("always-on", style="dim"),
+        )
+
+        for a in agents:
+            on = a.get("heartbeatEnabled", False)
+            active = a.get("schedulerActive", False)
+            interval = a.get("intervalSec", 0)
+
+            if interval >= 86400:
+                freq = f"every {interval // 86400}d"
+            elif interval >= 3600:
+                freq = f"every {interval // 3600}h"
+            elif interval >= 60:
+                freq = f"every {interval // 60}m"
+            else:
+                freq = f"every {interval}s" if interval else "manual"
+
+            last = a.get("lastHeartbeatAt", "")
+            age_str = ""
+            if last:
+                try:
+                    last_dt = datetime.fromisoformat(last.replace("Z", "+00:00"))
+                    age_min = (datetime.now(timezone.utc) - last_dt).total_seconds() / 60
+                    if age_min < 60:
+                        age_str = f"{age_min:.0f}m ago"
+                    elif age_min < 1440:
+                        age_str = f"{age_min / 60:.0f}h ago"
+                    else:
+                        age_str = f"{age_min / 1440:.0f}d ago"
+                except Exception:
+                    pass
+
+            status_text = "● ON" if on else "○ OFF"
+            status_style = "green" if (on and active) else ("yellow" if on else "red")
+
+            table.add_row(
+                Text(status_text, style=status_style),
+                Text(a.get("companyName", "?"), style="cyan"),
+                Text(a.get("agentName", "?"), style="white" if on else "dim"),
+                Text(freq, style="dim"),
+                Text(age_str if age_str else "—", style="dim"),
+                Text(a.get("id", "?"), style="dim"),
+            )
+
+        # Blocked attempts
+        self.query_one("#taccess-blocked-header", Static).update(
+            f"[bold]Blocked Attempts[/bold]  [dim]{len(blocked)} in last hour[/dim]"
+            if blocked else "[bold]Blocked Attempts[/bold]  [dim]none in last hour[/dim]"
+        )
+
+        bt = self.query_one("#taccess-blocked", DataTable)
+        bt.clear(columns=True)
+        bt.cursor_type = "none"
+        bt.zebra_stripes = True
+        bt.add_column("Time", width=20)
+        bt.add_column("System", width=16)
+        bt.add_column("Agent", width=24)
+        bt.add_column("Detail")
+
+        for b in blocked[-20:]:
+            bt.add_row(
+                Text(b.get("ts", "?")[:19], style="dim"),
+                Text(b.get("system", "?"), style="yellow"),
+                Text(b.get("agent", "?"), style="white"),
+                Text(b.get("detail", ""), style="dim"),
+            )
+
+        self.query_one("#taccess-footer", Static).update(
+            "[dim]Enter = toggle selected agent · r = refresh · Esc = back[/dim]"
+        )
+
+    def on_data_table_row_selected(self, event):
+        from claude_watch_data import _get_paperclip_heartbeats, _toggle_heartbeat
+
+        table = self.query_one("#taccess-table", DataTable)
+        row_idx = event.cursor_row
+
+        # Row 0 is CLI (not toggleable)
+        if row_idx == 0:
+            return
+
+        agents = _get_paperclip_heartbeats()
+        agent_idx = row_idx - 1
+        if agent_idx >= len(agents):
+            return
+
+        agent = agents[agent_idx]
+        new_state = not agent.get("heartbeatEnabled", False)
+        if _toggle_heartbeat(agent["id"], new_state):
+            self._load()
+
+    def action_refresh(self):
+        import claude_watch_data
+        claude_watch_data._heartbeat_cache = (0.0, [])
+        self._load()
+
+    def action_pop_screen(self):
+        self.app.pop_screen()
+
+
 class UsageMetricsView(LazyView):
+
+    def refresh_content(self):
+        now = time.time()
+        if not hasattr(self, '_last_refresh') or (now - self._last_refresh) > 30:
+            self._last_refresh = now
+            try:
+                self.query_one("#metrics-table", DataTable).clear(columns=True)
+                self.query_one("#scores-table", DataTable).clear(columns=True)
+                self.load_content()
+            except Exception:
+                pass
 
     def compose(self) -> ComposeResult:
         yield Static(id="metrics-header")
         yield DailySparklinePanel(id="metrics-sparkline")
+        yield TokenAccessPanel(id="token-access")
         yield DataTable(id="metrics-table")
         yield Static(id="metrics-summary")
         yield Static(id="scores-header")
@@ -1646,6 +1956,10 @@ class UsageMetricsView(LazyView):
     def load_content(self):
         metrics, total = _get_usage_metrics(days=7)
         self.query_one("#metrics-sparkline", DailySparklinePanel).update_content()
+        try:
+            self.query_one("#token-access", TokenAccessPanel).update_content()
+        except Exception:
+            pass
         _, seven, _, _ = _current_pct()
 
         # Estimate total cost across all sources
@@ -1756,6 +2070,17 @@ class UsageMetricsView(LazyView):
 
 class MCPStatsView(LazyView):
 
+    def refresh_content(self):
+        now = time.time()
+        if not hasattr(self, '_last_refresh') or (now - self._last_refresh) > 30:
+            self._last_refresh = now
+            try:
+                self.query_one("#mcp-servers-table", DataTable).clear(columns=True)
+                self.query_one("#mcp-actions-table", DataTable).clear(columns=True)
+                self.load_content()
+            except Exception:
+                pass
+
     def compose(self) -> ComposeResult:
         yield Static(id="mcp-header")
         with Horizontal(id="mcp-body"):
@@ -1828,6 +2153,7 @@ class SessionTasksView(LazyView):
         Binding("d", "delete_item", "Delete"),
         Binding("slash", "start_filter", "Filter"),
         Binding("a", "show_all", "All"),
+        Binding("i", "import_cycle_sessions", "Import sessions"),
     ]
 
     def compose(self) -> ComposeResult:
@@ -1853,6 +2179,14 @@ class SessionTasksView(LazyView):
             yield Static(id="cm-lane-2")
             yield Static(id="cm-lane-3")
         yield Static(id="cm-prev")
+
+    def refresh_content(self):
+        """Auto-refresh every 10s when this tab is visible."""
+        now = time.time()
+        if not hasattr(self, '_last_refresh') or (now - self._last_refresh) > 10:
+            self._last_refresh = now
+            if hasattr(self, '_items'):
+                self._reload()
 
     def load_content(self):
         self._category = "task"
@@ -1889,6 +2223,16 @@ class SessionTasksView(LazyView):
         dt.add_column("Age", width=6)
 
         self._reload()
+
+    def action_import_cycle_sessions(self):
+        from claude_watch_data import _populate_cycle_from_sessions, _get_current_cycle
+        cycle = _get_current_cycle()
+        if cycle:
+            count = _populate_cycle_from_sessions(cycle_id=cycle["cycle_id"])
+            self._reload()
+            self.notify(f"Imported {count} items from current cycle sessions")
+        else:
+            self.notify("No current cycle detected")
 
     @staticmethod
     def _fmt_age(created_at_str):
@@ -1975,6 +2319,10 @@ class SessionTasksView(LazyView):
                 st_icon = self.STATUS_ICONS.get(status, "\u25cf")
                 st_style = "green" if status == "done" else ("dim" if status == "rolled" else "")
                 title = item.get("title", "")[:45]
+                ref = item.get("source_ref", "")
+                if ref:
+                    short_ref = ref.split(":")[0][-8:] if ":" in ref else ref[-8:]
+                    title = f"{title} [dim][{short_ref}][/dim]"
                 project = item.get("project", "")[:12]
                 # Derive company from project
                 item_proj_lower = (item.get("project") or "").lower()
@@ -2332,6 +2680,16 @@ class SessionTasksView(LazyView):
 class ProjectBoardView(LazyView):
     """Project Monitor — strategic task board."""
 
+    def refresh_content(self):
+        now = time.time()
+        if not hasattr(self, '_last_refresh') or (now - self._last_refresh) > 30:
+            self._last_refresh = now
+            try:
+                self.query_one("#pboard-table", DataTable).clear(columns=True)
+                self.load_content()
+            except Exception:
+                pass
+
     def compose(self) -> ComposeResult:
         yield Static(id="pboard-header")
         yield Static(id="pboard-summary")
@@ -2503,6 +2861,12 @@ class ProjectBoardView(LazyView):
 
 class AccountCapacityView(LazyView):
     """Full-screen multi-account capacity view (A / B / C)."""
+
+    def refresh_content(self):
+        now = time.time()
+        if not hasattr(self, '_last_refresh') or (now - self._last_refresh) > 30:
+            self._last_refresh = now
+            self.load_content()
 
     def compose(self) -> ComposeResult:
         yield Static(id="cap-header")
@@ -2983,6 +3347,16 @@ class CallHistoryTable(DataTable):
 class LeaderboardView(LazyView):
     """Multiplayer leaderboard — team competition on window scores."""
 
+    def refresh_content(self):
+        now = time.time()
+        if not hasattr(self, '_last_refresh') or (now - self._last_refresh) > 30:
+            self._last_refresh = now
+            try:
+                self.query_one("#lb-table", DataTable).clear(columns=True)
+                self.load_content()
+            except Exception:
+                pass
+
     def compose(self) -> ComposeResult:
         yield Static(id="lb-header")
         yield DataTable(id="lb-table")
@@ -3061,6 +3435,48 @@ class CyclesView(LazyView):
         yield Static(id="cycles-current")
         yield DataTable(id="cycles-list")
 
+    def refresh_content(self):
+        """Auto-refresh the current cycle banner every 15s."""
+        now = time.time()
+        if not hasattr(self, '_last_refresh') or (now - self._last_refresh) > 15:
+            self._last_refresh = now
+            from claude_watch_data import (
+                _get_current_cycle, _get_cycle_sessions,
+                _countdown, _current_pct,
+            )
+            try:
+                panel = self.query_one("#cycles-current", Static)
+            except Exception:
+                return
+            current = _get_current_cycle()
+            if not current:
+                panel.update("[dim]No active cycle[/dim]")
+                return
+            five, _seven, five_reset, _sr = _current_pct()
+            reset_str = _countdown(five_reset) if five_reset else "?"
+            try:
+                burn_pct = float(five)
+            except (ValueError, TypeError):
+                burn_pct = 0.0
+            bar_len = 20
+            filled = int(burn_pct / 100 * bar_len)
+            bar = "\u2588" * filled + "\u2591" * (bar_len - filled)
+            bar_color = "green" if burn_pct < 50 else ("yellow" if burn_pct < 80 else "red")
+            sessions = _get_cycle_sessions(current["cycle_id"])
+            projects = sorted({s.get("project", "?") for s in sessions if s.get("project")})
+            proj_str = ", ".join(projects[:5]) if projects else "\u2014"
+            from claude_watch_data import _get_cycle_plan
+            plan = _get_cycle_plan(current["cycle_id"])
+            plan_str = "[green]plan set[/green]" if plan else "[dim]no plan[/dim]"
+            panel.update(
+                f"[bold]CURRENT CYCLE[/bold]  resets in {reset_str}\n"
+                f"  [{bar_color}]{bar}[/{bar_color}] {burn_pct:.0f}%  "
+                f"[bold]{current['session_count']}[/bold] sessions  "
+                f"Projects: {proj_str}  {plan_str}  "
+                f"Cost: {current['cost_str']}  "
+                f"Gravity: [cyan]{current['gravity_label'] or chr(8212)}[/cyan]"
+            )
+
     def load_content(self):
         from claude_watch_data import (
             _get_current_cycle, _get_all_cycles, _get_cycle_sessions,
@@ -3108,10 +3524,11 @@ class CyclesView(LazyView):
         dt.cursor_type = "row"
         dt.zebra_stripes = True
         dt.add_column("#", width=4)
-        dt.add_column("When", width=18)
+        dt.add_column("Start", width=18)
+        dt.add_column("End", width=10)
         dt.add_column("Peak%", width=7)
         dt.add_column("Sessions", width=9)
-        dt.add_column("Projects", width=20)
+        dt.add_column("Projects", width=18)
         dt.add_column("Stars", width=10)
         dt.add_column("Cost", width=8)
         dt.add_column("Gravity", width=14)
@@ -3124,9 +3541,15 @@ class CyclesView(LazyView):
             rank += 1
             try:
                 start_dt = datetime.fromisoformat(c["start_ts"])
-                when_str = start_dt.strftime("%b %-d %-I:%M %p")
+                start_str = start_dt.strftime("%b %-d %-I:%M %p")
             except Exception:
-                when_str = c["start_ts"][:16]
+                start_str = c["start_ts"][:16]
+
+            try:
+                end_dt = datetime.fromisoformat(c["end_ts"])
+                end_str = end_dt.strftime("%-I:%M %p")
+            except Exception:
+                end_str = "?"
 
             peak = c.get("peak_five_pct", 0)
             peak_color = "green" if peak >= 80 else ("yellow" if peak >= 40 else "dim")
@@ -3140,7 +3563,8 @@ class CyclesView(LazyView):
             self._cycle_map[row_key] = c
             dt.add_row(
                 Text(str(rank), justify="right"),
-                Text(when_str),
+                Text(start_str),
+                Text(end_str, style="dim"),
                 Text(f"{peak:.0f}%", style=peak_color, justify="right"),
                 Text(str(c.get("session_count", 0)), justify="right"),
                 Text(proj_str),
@@ -3152,7 +3576,7 @@ class CyclesView(LazyView):
 
         if rank == 0:
             dt.add_row("", Text("No past cycles recorded yet", style="dim"),
-                        "", "", "", "", "", "")
+                        "", "", "", "", "", "", "")
 
     def on_data_table_row_selected(self, event):
         row_key = str(event.row_key.value) if hasattr(event.row_key, 'value') else str(event.row_key)
@@ -3182,6 +3606,8 @@ class CycleDetailScreen(Screen):
         yield Static(id="cdetail-header")
         yield Static(id="cdetail-scores")
         yield Static(id="cdetail-accomplishments")
+        yield Static(id="cdetail-sources-header")
+        yield DataTable(id="cdetail-sources")
         yield DataTable(id="cdetail-sessions")
         yield Static(id="cdetail-plan")
 
@@ -3251,6 +3677,52 @@ class CycleDetailScreen(Screen):
             acc_lines.append(f"  Skills: {', '.join(skills[:10])}")
         acc_panel.update("\n".join(acc_lines))
 
+        # ── Source Breakdown ──
+        sessions = _get_cycle_sessions(c["cycle_id"])
+        by_source = {}  # type: dict
+        cycle_total = 0
+        for s in sessions:
+            src = s.get("source", "?")
+            tokens = s.get("output_tokens", 0) or 0
+            if src not in by_source:
+                by_source[src] = {"output_tokens": 0, "sessions": 0}
+            by_source[src]["output_tokens"] += tokens
+            by_source[src]["sessions"] += 1
+            cycle_total += tokens
+
+        self.query_one("#cdetail-sources-header", Static).update(
+            f"[bold]Token Distribution[/bold]  [dim]{len(by_source)} sources · "
+            f"{cycle_total / 1000:.0f}k total output[/dim]"
+        )
+
+        src_table = self.query_one("#cdetail-sources", DataTable)
+        src_table.cursor_type = "none"
+        src_table.zebra_stripes = True
+        src_table.add_column("Source", width=20)
+        src_table.add_column("Sessions", width=9)
+        src_table.add_column("Output Tok", width=11)
+        src_table.add_column("% of Cycle", width=11)
+        src_table.add_column("Share")
+
+        sorted_sources = sorted(by_source.items(), key=lambda x: x[1]["output_tokens"], reverse=True)
+        for src, data in sorted_sources:
+            out = data["output_tokens"]
+            out_str = f"{out / 1000:.1f}k" if out >= 1000 else str(out)
+            pct = (out / cycle_total * 100) if cycle_total else 0
+            bar_len = max(1, int(pct / 2.5))
+            bar = "\u2588" * bar_len + "\u2591" * (40 - bar_len)
+            src_style = "yellow" if ("/" in src or src == "paperclip") else (
+                "green" if src == "cli" else ("cyan" if "atlas" in src else "dim")
+            )
+            bar_color = "yellow" if ("/" in src) else ("green" if src == "cli" else "cyan")
+            src_table.add_row(
+                Text(src, style=src_style),
+                Text(str(data["sessions"]), justify="right"),
+                Text(out_str, justify="right"),
+                Text(f"{pct:.1f}%", justify="right"),
+                Text(bar[:40], style=bar_color),
+            )
+
         # ── Sessions DataTable ──
         dt = self.query_one("#cdetail-sessions", DataTable)
         dt.cursor_type = "row"
@@ -3262,7 +3734,6 @@ class CycleDetailScreen(Screen):
         dt.add_column("Cost", width=8)
         dt.add_column("Directive", width=30)
 
-        sessions = _get_cycle_sessions(c["cycle_id"])
         self._session_map = {}  # row_key -> session dict
 
         for i, s in enumerate(sessions):
@@ -3734,8 +4205,162 @@ class TokenAttributionScreen(Screen):
 
 
 
+class RulesView(LazyView):
+    """Rules — all active hooks, budget limits, and permission rules with trigger history."""
+
+    def compose(self) -> ComposeResult:
+        yield Static(id="rules-header")
+        yield DataTable(id="rules-table")
+        yield Static(id="rules-detail-header")
+        yield DataTable(id="rules-detail")
+
+    def load_content(self):
+        from claude_watch_data import _get_rules_summary
+
+        rules, block_events = _get_rules_summary()
+
+        total_triggers = sum(r.get("triggers", 0) for r in rules)
+        total_blocks = sum(r.get("blocks", 0) for r in rules)
+        active_count = sum(1 for r in rules if r.get("enabled"))
+
+        self.query_one("#rules-header", Static).update(
+            f"[bold]Rules[/bold]  [dim]{active_count} active rules · "
+            f"{total_triggers} triggers this cycle · "
+            f"{total_blocks} blocks this cycle[/dim]"
+        )
+
+        dt = self.query_one("#rules-table", DataTable)
+        dt.cursor_type = "row"
+        dt.zebra_stripes = True
+        dt.add_column("Type", width=12)
+        dt.add_column("Name", width=20)
+        dt.add_column("Phase", width=12)
+        dt.add_column("Status", width=8)
+        dt.add_column("Triggers", width=9)
+        dt.add_column("Blocks", width=8)
+        dt.add_column("Last Triggered", width=16)
+        dt.add_column("Description")
+
+        self._rules_list = rules
+
+        for i, r in enumerate(rules):
+            rtype = r["type"]
+            type_style = "magenta" if rtype == "hook" else ("yellow" if rtype == "budget" else "cyan")
+            enabled = r.get("enabled", True)
+            status = "ON" if enabled else "OFF"
+            status_style = "green" if enabled else "red"
+            blocks = r.get("blocks", 0)
+            block_style = "bold red" if blocks > 0 else "dim"
+
+            last = r.get("last_triggered", "")
+            if last:
+                try:
+                    last_dt = datetime.fromisoformat(last.replace("Z", "+00:00"))
+                    age_min = (datetime.now(timezone.utc) - last_dt).total_seconds() / 60
+                    if age_min < 60:
+                        last_str = f"{age_min:.0f}m ago"
+                    elif age_min < 1440:
+                        last_str = f"{age_min / 60:.0f}h ago"
+                    else:
+                        last_str = f"{age_min / 1440:.0f}d ago"
+                except Exception:
+                    last_str = last[:16]
+            else:
+                last_str = "\u2014"
+
+            dt.add_row(
+                Text(rtype, style=type_style),
+                Text(r["name"], style="white" if enabled else "dim"),
+                Text(r.get("phase", "\u2014"), style="dim"),
+                Text(status, style=status_style),
+                Text(str(r.get("triggers", 0)), justify="right"),
+                Text(str(blocks), style=block_style, justify="right"),
+                Text(last_str, style="dim"),
+                Text(r.get("desc", ""), style="dim"),
+                key=f"rule-{i}",
+            )
+
+        # Block events detail
+        self.query_one("#rules-detail-header", Static).update(
+            f"[bold]Recent Blocks[/bold]  [dim]{len(block_events)} this cycle · "
+            f"select a rule above to filter[/dim]"
+        )
+
+        bt = self.query_one("#rules-detail", DataTable)
+        bt.cursor_type = "none"
+        bt.zebra_stripes = True
+        bt.add_column("Time", width=22)
+        bt.add_column("Rule", width=18)
+        bt.add_column("Detail")
+
+        for evt in block_events[-20:]:
+            bt.add_row(
+                Text(evt.get("ts", "?"), style="dim"),
+                Text(evt.get("rule", "?"), style="yellow"),
+                Text(evt.get("detail", "")[:80], style="white"),
+            )
+
+        if not block_events:
+            bt.add_row(
+                Text("\u2014", style="dim"),
+                Text("No blocks this cycle", style="dim"),
+                Text("", style="dim"),
+            )
+
+    def on_data_table_row_selected(self, event):
+        """When a rule row is selected, filter the detail table to show only that rule's events."""
+        from claude_watch_data import _get_rule_events
+
+        row_key = str(event.row_key.value) if hasattr(event.row_key, 'value') else str(event.row_key)
+        if not row_key.startswith("rule-"):
+            return
+
+        try:
+            idx = int(row_key.split("-")[1])
+            rule = self._rules_list[idx]
+        except (IndexError, ValueError):
+            return
+
+        rule_name = rule["name"]
+        events = _get_rule_events(rule_name, limit=30)
+
+        self.query_one("#rules-detail-header", Static).update(
+            f"[bold]Events for {rule_name}[/bold]  [dim]{len(events)} total[/dim]"
+        )
+
+        bt = self.query_one("#rules-detail", DataTable)
+        bt.clear(columns=True)
+        bt.cursor_type = "none"
+        bt.zebra_stripes = True
+        bt.add_column("Time", width=22)
+        bt.add_column("Level", width=8)
+        bt.add_column("Detail")
+
+        for evt in events:
+            level = evt.get("level", "?")
+            level_style = "red" if level == "WARN" else ("yellow" if level == "INFO" else "dim")
+            bt.add_row(
+                Text(evt.get("ts", "?"), style="dim"),
+                Text(level, style=level_style),
+                Text(evt.get("detail", "")[:80], style="white"),
+            )
+
+        if not events:
+            bt.add_row(
+                Text("\u2014", style="dim"),
+                Text("\u2014", style="dim"),
+                Text(f"No events for {rule_name}", style="dim"),
+            )
+
+
 class TestQueueView(LazyView):
     """Test Queue — things that need manual verification after shipping."""
+
+    def refresh_content(self):
+        now = time.time()
+        if not hasattr(self, '_last_refresh') or (now - self._last_refresh) > 15:
+            self._last_refresh = now
+            self._reload_data()
 
     BINDINGS = [
         Binding("p", "mark_pass", "Pass"),
@@ -3745,6 +4370,7 @@ class TestQueueView(LazyView):
         Binding("i", "import_qa", "Import QA"),
         Binding("r", "reload", "Reload"),
         Binding("a", "toggle_all", "All/Pending"),
+        Binding("y", "import_sessions", "Import Sessions"),
     ]
 
     def __init__(self, **kwargs):
@@ -3766,9 +4392,9 @@ class TestQueueView(LazyView):
         status_filter = None if self._show_all else "pending"
         project_filter = self._filter_project if self._filter_project else None
         self._items = _get_test_queue(project=project_filter, status=status_filter)
-        self._render()
+        self._render_table()
 
-    def _render(self):
+    def _render_table(self):
         pending = sum(1 for i in self._items if i.get("status") == "pending")
         passed  = sum(1 for i in self._items if i.get("status") == "pass")
         failed  = sum(1 for i in self._items if i.get("status") == "fail")
@@ -3799,8 +4425,8 @@ class TestQueueView(LazyView):
         dt.zebra_stripes = True
         dt.add_column("#",       width=4)
         dt.add_column("Project", width=10)
-        dt.add_column("Title",   width=46)
-        dt.add_column("Src",     width=9)
+        dt.add_column("Title",   width=42)
+        dt.add_column("Src",     width=13)
         dt.add_column("Route",   width=14)
         dt.add_column("Pri",     width=5)
         dt.add_column("Age",     width=6)
@@ -3841,7 +4467,19 @@ class TestQueueView(LazyView):
 
                 src = item.get("source", "—")
                 src_ref = item.get("source_ref", "")
-                src_display = src[:4] + (f"/{src_ref[:4]}" if src_ref else "")
+                if src == "session" and src_ref:
+                    # Look up session slug for readable display
+                    from claude_watch_data import _get_session_history
+                    slug = ""
+                    for _s in _get_session_history():
+                        if _s.get("session_id", "").startswith(src_ref[:8]):
+                            slug = _s.get("slug", "")[:12]
+                            break
+                    src_display = slug if slug else f"cc/{src_ref[:6]}"
+                elif src == "qa":
+                    src_display = f"qa/{src_ref[:4]}" if src_ref else "qa"
+                else:
+                    src_display = src[:8] if src else "—"
 
                 dt.add_row(
                     str(idx),
@@ -3858,7 +4496,7 @@ class TestQueueView(LazyView):
         self.query_one("#tq-footer", Static).update(
             "[dim]p[/dim]=pass  [dim]f[/dim]=fail  [dim]s[/dim]=skip  "
             "[dim]d[/dim]=delete  [dim]i[/dim]=import Atlas QA  "
-            "[dim]a[/dim]=toggle all/pending  [dim]r[/dim]=reload"
+            "[dim]y[/dim]=import sessions  [dim]a[/dim]=toggle all/pending  [dim]r[/dim]=reload"
         )
 
     def _get_selected_id(self):
@@ -3912,12 +4550,328 @@ class TestQueueView(LazyView):
                 f"[red]Import failed: {e}[/red]"
             )
 
+    def action_import_sessions(self):
+        self.query_one("#tq-header", Static).update(
+            "[yellow]Scraping cycle sessions...[/yellow]"
+        )
+        try:
+            count = _scrape_cycle_sessions()
+            self._reload_data()
+            if count == 0:
+                self.query_one("#tq-header", Static).update(
+                    "[dim]All cycle sessions already scraped (nothing new)[/dim]"
+                )
+        except Exception as e:
+            self.query_one("#tq-header", Static).update(
+                f"[red]Session scrape failed: {e}[/red]"
+            )
+
     def action_reload(self):
         self._reload_data()
 
     def action_toggle_all(self):
         self._show_all = not self._show_all
         self._reload_data()
+
+
+class MissionControlView(LazyView):
+    """Mission Control — unified view of everything built, grouped by company/project."""
+
+    def refresh_content(self):
+        now = time.time()
+        if not hasattr(self, '_last_refresh') or (now - self._last_refresh) > 15:
+            self._last_refresh = now
+            try:
+                self.query_one("#mission-table", DataTable).clear(columns=True)
+                self.load_content()
+            except Exception:
+                pass
+
+    def compose(self) -> ComposeResult:
+        yield Static(id="mission-header")
+        yield DataTable(id="mission-table")
+
+    def load_content(self):
+        from claude_watch_data import _get_build_ledger
+        data = _get_build_ledger(days=1, limit=100)
+        stats = data["stats"]
+
+        self.query_one("#mission-header", Static).update(
+            f"[bold]Mission Control[/bold]  "
+            f"[dim]{stats['total']} items shipped  ·  "
+            f"[yellow]{stats['untested']} untested[/yellow]  ·  "
+            f"[cyan]{stats['decisions']} decisions[/cyan]  ·  "
+            f"{stats['sessions']} sessions  ·  "
+            f"{stats['projects']} projects[/dim]"
+        )
+
+        table = self.query_one("#mission-table", DataTable)
+        table.cursor_type = "row"
+        table.zebra_stripes = True
+        table.add_column("", width=2)       # status icon
+        table.add_column("Time", width=6)
+        table.add_column("Title", width=35)
+        table.add_column("How to Verify", width=40)
+        table.add_column("Session", width=7)
+        table.add_column("Files", width=4)
+        table.add_column("Test", width=8)
+
+        status_icons = {
+            "tested": ("\u2713", "green"),
+            "untested": ("\u25CB", "yellow"),
+            "failed": ("\u2717", "red"),
+        }
+        type_styles = {
+            "feature": ("feat", "bold"),
+            "fix": ("fix", "red"),
+            "refactor": ("refac", "blue"),
+            "decision": ("\u25B3", "cyan"),
+            "docs": ("docs", "dim"),
+            "test": ("test", "green"),
+            "chore": ("chore", "dim"),
+            "infra": ("infra", "magenta"),
+        }
+
+        # Company display order
+        company_order = ["delphi", "kaa", "frank", "personal"]
+        company_labels = {"delphi": "DELPHI", "kaa": "KAA", "frank": "FRANK", "personal": "PERSONAL"}
+
+        for co in company_order:
+            projects = data["by_company"].get(co, {})
+            if not projects:
+                continue
+            for proj in sorted(projects.keys()):
+                items = projects[proj]
+                # Separator row
+                label = f"{company_labels.get(co, co.upper())} / {proj}"
+                table.add_row(
+                    Text(""),
+                    Text(""),
+                    Text(f"\u2500\u2500 {label} \u2500\u2500", style="dim bold"),
+                    Text(""),
+                    Text(""),
+                    Text(""),
+                    Text(""),
+                )
+
+                for item in items:
+                    ts = item.get("created_at", "")
+                    if "T" in ts:
+                        ts = ts.split("T")[1][:5]
+
+                    test = item.get("test_status", "untested")
+                    icon, icon_style = status_icons.get(test, ("?", "white"))
+                    if item.get("item_type") == "decision":
+                        icon, icon_style = ("\u25B3", "cyan")
+
+                    type_label, type_style = type_styles.get(item.get("item_type", ""), ("?", "white"))
+
+                    files = item.get("files") or []
+                    file_count = str(len(files)) if files else ""
+
+                    hint = item.get("test_hint", "") or ""
+                    table.add_row(
+                        Text(icon, style=icon_style),
+                        Text(ts, style="dim"),
+                        Text(item.get("title", "")[:35]),
+                        Text(hint[:40], style="italic"),
+                        Text(item.get("session_id", "").replace("cc-", ""), style="dim"),
+                        Text(file_count, style="dim"),
+                        Text(test, style=icon_style),
+                    )
+
+
+class WireView(LazyView):
+    """Wire — inter-session message log."""
+
+    def refresh_content(self):
+        now = time.time()
+        if not hasattr(self, '_last_refresh') or (now - self._last_refresh) > 15:
+            self._last_refresh = now
+            try:
+                self.query_one("#wire-table", DataTable).clear(columns=True)
+                self.load_content()
+            except Exception:
+                pass
+
+    def compose(self) -> ComposeResult:
+        yield Static(id="wire-header")
+        yield DataTable(id="wire-table")
+
+    def load_content(self):
+        from claude_watch_data import _get_wire_messages
+        data = _get_wire_messages(limit=50)
+
+        self.query_one("#wire-header", Static).update(
+            f"[bold]Wire — Inter-Session Messages[/bold]  "
+            f"[dim]{data['total']} messages  ·  "
+            f"{data['sessions']} sessions  ·  "
+            f"{data['unread']} unread[/dim]"
+        )
+
+        table = self.query_one("#wire-table", DataTable)
+        table.cursor_type = "row"
+        table.zebra_stripes = True
+        table.add_column("Time", width=8)
+        table.add_column("From", width=11)
+        table.add_column("To", width=11)
+        table.add_column("Type", width=10)
+        table.add_column("Message")
+
+        type_styles = {
+            "ack": "green",
+            "question": "yellow",
+            "info": "blue",
+            "status": "cyan",
+            "file_release": "magenta",
+            "patch": "red",
+        }
+
+        for m in data["messages"]:
+            ts = m["created_at"]
+            if "T" in ts:
+                ts = ts.split("T")[1][:8]
+            style = type_styles.get(m["type"], "white")
+            type_icons = {
+                "ack": "ACK",
+                "question": "? Q",
+                "info": "i",
+                "status": ">>",
+                "file_release": "FILE",
+                "patch": "PATCH",
+            }
+            type_label = type_icons.get(m["type"], m["type"])
+            read_mark = "" if m["read"] else " *"
+            table.add_row(
+                Text(ts, style="dim"),
+                Text(m["from"].replace("cc-", ""), style="bold"),
+                Text(m["to"].replace("cc-", ""), style="dim"),
+                Text(type_label, style=style),
+                Text(f"{m['message']}{read_mark}"),
+            )
+
+
+class AuditView(LazyView):
+    """Comprehensive audit of all cycles and sessions."""
+
+    BORDER_TITLE = "Cycle Audit"
+
+    BINDINGS = [
+        Binding("e", "export_audit", "Export MD"),
+        Binding("r", "reload_audit", "Reload"),
+        Binding("i", "import_sessions", "Import"),
+    ]
+
+    def compose(self) -> ComposeResult:
+        yield Static(id="audit-header")
+        yield Static(id="audit-projects")
+        yield DataTable(id="audit-cycles")
+        yield Static(id="audit-footer")
+
+    def load_content(self):
+        self._refresh_audit()
+
+    def _refresh_audit(self):
+        from claude_watch_data import _build_full_audit
+        audit = _build_full_audit()
+        totals = audit["totals"]
+
+        # Header — executive summary
+        header_text = (
+            f"[bold]Cycle Audit[/bold]  "
+            f"[cyan]{totals['cycle_count']}[/cyan] cycles  "
+            f"[cyan]{totals['total_sessions']}[/cyan] sessions  "
+            f"[cyan]{totals['total_commits']}[/cyan] commits  "
+            f"[cyan]{totals['cost_str']}[/cyan] cost  "
+            f"[cyan]{totals['avg_score']:.1f}/5.0[/cyan] avg score  "
+            f"[cyan]{len(audit['by_project_global'])}[/cyan] projects"
+        )
+        self.query_one("#audit-header", Static).update(header_text)
+
+        # Projects summary — RichTable in a Panel
+        from rich.table import Table as RichTable
+        from rich.panel import Panel
+        pt = RichTable(show_header=True, header_style="bold", box=None, padding=(0, 2), expand=True)
+        pt.add_column("Project", no_wrap=True)
+        pt.add_column("Sessions", justify="right", no_wrap=True)
+        pt.add_column("Commits", justify="right", no_wrap=True)
+        pt.add_column("Files Ed", justify="right", no_wrap=True)
+        pt.add_column("Files New", justify="right", no_wrap=True)
+        pt.add_column("Cost", justify="right", no_wrap=True)
+
+        # Sort projects by session count descending
+        for proj, stats in sorted(audit["by_project_global"].items(), key=lambda x: x[1]["sessions"], reverse=True):
+            from claude_watch_data import _format_cost
+            pt.add_row(
+                f"[cyan]{proj}[/cyan]",
+                str(stats["sessions"]),
+                str(stats["commits"]),
+                str(stats["files_edited"]),
+                str(stats["files_created"]),
+                _format_cost(stats["cost"]),
+            )
+        self.query_one("#audit-projects", Static).update(Panel(pt, title="[bold]Cross-Project Summary[/bold]", border_style="yellow"))
+
+        # Cycles DataTable
+        table = self.query_one("#audit-cycles", DataTable)
+        table.clear(columns=True)
+        table.add_columns("#", "Date", "Time", "Score", "Sessions", "Peak%", "Cost", "Done/Plan", "Projects", "Gravity")
+        table.border_title = f"All Cycles ({totals['cycle_count']})"
+
+        self._cycle_data = {}  # store for drill-down
+        for i, cycle in enumerate(audit["cycles"], 1):
+            from datetime import datetime as _dt
+            try:
+                start = _dt.fromisoformat(cycle["start_ts"].replace("Z", "+00:00"))
+                date_str = start.strftime("%b %d")
+                time_str = start.astimezone().strftime("%H:%M")
+            except Exception:
+                date_str = "?"
+                time_str = "?"
+
+            stars = cycle.get("stars", "")
+            score = f"{cycle.get('overall_score', 0):.1f}" if cycle.get("overall_score") else "\u2014"
+            peak = f"{cycle.get('peak_five_pct', 0):.0f}%"
+            done = cycle.get("items_done", 0)
+            total_items = done + cycle.get("items_open", 0) + cycle.get("items_rolled", 0)
+            done_plan = f"{done}/{total_items}" if total_items else "\u2014"
+
+            projects = ", ".join(sorted(cycle.get("by_project", {}).keys())[:3])
+            if len(cycle.get("by_project", {})) > 3:
+                projects += f" +{len(cycle['by_project']) - 3}"
+
+            gravity = (cycle.get("gravity_label", "") or "")[:40]
+
+            row_key = table.add_row(
+                str(i), date_str, time_str, f"{stars} {score}",
+                str(cycle.get("session_count", 0)), peak,
+                cycle.get("cost_str", "\u2014"), done_plan, projects, gravity
+            )
+            self._cycle_data[row_key] = cycle
+
+        # Footer
+        self.query_one("#audit-footer", Static).update(
+            "[dim]e[/dim] Export MD  [dim]r[/dim] Reload  [dim]Enter[/dim] Cycle detail"
+        )
+
+    def action_export_audit(self):
+        import os
+        from datetime import datetime
+        from claude_watch_data import export_audit_markdown
+        ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+        filepath = os.path.expanduser(f"~/Downloads/cycle-audit-{ts}.md")
+        export_audit_markdown(filepath)
+        self.notify(f"Exported to {filepath}")
+
+    def action_reload_audit(self):
+        self._refresh_audit()
+        self.notify("Audit refreshed")
+
+    def action_import_sessions(self):
+        from claude_watch_data import _populate_cycle_from_sessions
+        count = _populate_cycle_from_sessions()  # all cycles
+        self._refresh_audit()
+        self.notify(f"Imported {count} items from sessions across all cycles")
 
 
 class ClaudeWatchApp(App):
@@ -3938,6 +4892,10 @@ class ClaudeWatchApp(App):
         Binding("h", "toggle_health", "Health"),
         Binding("y", "show_cycles", "Cycles"),
         Binding("x", "show_test", "Test"),
+        Binding("A", "show_audit", "Audit"),
+        Binding("w", "show_wire", "Wire"),
+        Binding("M", "show_mission", "Mission"),
+        Binding("g", "show_rules", "Rules"),
         Binding("w", "show_attribution", "Who?"),
         Binding("slash", "start_search", "Search"),
         Binding("tab", "focus_next", "Next panel", show=False),
@@ -3953,9 +4911,9 @@ class ClaudeWatchApp(App):
         from textual.widgets import Input, Footer
         yield ReloadBanner(id="reload-banner")
         yield NavBar(id="nav-bar")
+        yield Static(id="cycle-banner")
         with ContentSwitcher(initial="view-dashboard", id="content-switcher"):
             with ScrollableContainer(id="view-dashboard"):
-                yield TokenHeader(id="header")
                 yield AccountCapacityPanel(id="account-capacity")
                 yield BurndownChart(id="burndown")
                 yield TokenAttributionPanel(id="attribution")
@@ -3978,6 +4936,10 @@ class ClaudeWatchApp(App):
             yield LeaderboardView(id="view-leaderboard")
             yield CyclesView(id="view-cycles")
             yield TestQueueView(id="view-test")
+            yield AuditView(id="view-audit")
+            yield MissionControlView(id="view-mission")
+            yield WireView(id="view-wire")
+            yield RulesView(id="view-rules")
         yield Footer()
 
     def switch_view(self, view_id: str) -> None:
@@ -4001,6 +4963,10 @@ class ClaudeWatchApp(App):
             "view-leaderboard": "nav-leaderboard",
             "view-cycles": "nav-cycles",
             "view-test": "nav-test",
+            "view-rules": "nav-rules",
+            "view-audit": "nav-audit",
+            "view-wire": "nav-wire",
+            "view-mission": "nav-mission",
         }
         active_nav = nav_map.get(view_id, "")
         for btn in self.query("#nav-bar Button"):
@@ -4013,7 +4979,6 @@ class ClaudeWatchApp(App):
         # Hide search input, account capacity, and header (merged into burndown)
         self.query_one("#search-input").display = False
         self.query_one("#account-capacity").display = False
-        self.query_one("#header").display = False
         self.set_interval(1.0, self.refresh_data)
         self.refresh_data()
         # Start hot-reload watcher in background
@@ -4100,12 +5065,85 @@ class ClaudeWatchApp(App):
         t = threading.Thread(target=_build_or_update_index, daemon=True)
         t.start()
 
+    def _update_cycle_banner(self):
+        """Update the global cycle status banner shown on all tabs."""
+        from claude_watch_data import (
+            _get_current_cycle, _get_cycle_sessions,
+            _countdown, _current_pct,
+        )
+        try:
+            banner = self.query_one("#cycle-banner", Static)
+        except Exception:
+            return
+        current = _get_current_cycle()
+        if not current:
+            banner.update("[dim]No active cycle[/dim]")
+            return
+        five, seven, five_reset, _sr = _current_pct()
+        reset_str = _countdown(five_reset) if five_reset else "?"
+
+        def _bar(pct, w=6):
+            try:
+                p = float(pct)
+                n = max(1, int(p * w / 100)) if p > 0 else 0
+                c = "red" if p < 25 else ("yellow" if p < 50 else "green")
+                return f"[dim]{chr(9617) * (w - n)}[/dim][{c}]{chr(9608) * n}[/{c}]"
+            except Exception:
+                return f"[dim]{chr(9617) * w}[/dim]"
+
+        try:
+            burn_pct = float(five)
+        except (ValueError, TypeError):
+            burn_pct = 0.0
+        try:
+            seven_pct = float(seven)
+        except (ValueError, TypeError):
+            seven_pct = 0.0
+
+        # Time elapsed in 5h window
+        try:
+            reset_dt = datetime.fromisoformat(str(five_reset).replace("Z", "+00:00"))
+            mins_left = max(0, (reset_dt - datetime.now(timezone.utc)).total_seconds() / 60)
+            time_pct = min(100, max(0, mins_left / 300 * 100))
+            h_l = int(mins_left // 60)
+            m_l = int(mins_left % 60)
+            time_str = f"{h_l}h{m_l:02d}m"
+        except Exception:
+            time_pct = 100
+            time_str = "?"
+
+        sessions = _get_cycle_sessions(current["cycle_id"])
+        from claude_watch_data import _get_cycle_items
+        bd = _get_burndown_data()
+        ws = ""
+        if bd and bd.get("window_start"):
+            ws_val = bd["window_start"]
+            ws = ws_val.isoformat() if isinstance(ws_val, datetime) else str(ws_val)
+        items = _get_cycle_items(ws) if ws else []
+        done_ct = sum(1 for i in items if i.get("status") == "done")
+        open_ct = sum(1 for i in items if i.get("status") == "open")
+        items_str = f"[green]{done_ct}[/green]/{done_ct + open_ct} tasks" if items else ""
+        five_left = max(0, 100 - burn_pct)
+        seven_left = max(0, 100 - seven_pct)
+        five_lc = "red" if five_left < 20 else ("yellow" if five_left < 40 else "green")
+        seven_lc = "red" if seven_left < 15 else ("yellow" if seven_left < 30 else "green")
+        time_lc = "red" if time_pct < 20 else ("yellow" if time_pct < 40 else "green")
+        banner.update(
+            f"T{_bar(time_pct)}[{time_lc}]{time_str}[/{time_lc}] "
+            f"5h{_bar(five_left)}[{five_lc}]{five_left:.0f}%[/{five_lc}] "
+            f"7d{_bar(seven_left)}[{seven_lc}]{seven_left:.0f}%[/{seven_lc}]  "
+            f"{items_str}  "
+            f"{current['cost_str']}  "
+            f"[cyan]{current['gravity_label'] or chr(8212)}[/cyan]"
+        )
+
     def refresh_data(self):
+        # Global cycle banner — always update regardless of active tab
+        self._update_cycle_banner()
+
         switcher = self.query_one("#content-switcher", ContentSwitcher)
 
         if switcher.current == "view-dashboard":
-            five, seven, fr, sr = _current_pct()
-            self.query_one("#header", TokenHeader).update_content(five, seven, fr, sr)
             acct = self.query_one("#account-capacity", AccountCapacityPanel)
             if acct.display:
                 acct.update_content()
@@ -4204,6 +5242,18 @@ class ClaudeWatchApp(App):
     def action_show_test(self):
         self.switch_view("view-test")
 
+    def action_show_rules(self):
+        self.switch_view("view-rules")
+
+    def action_show_audit(self):
+        self.switch_view("view-audit")
+
+    def action_show_wire(self):
+        self.switch_view("view-wire")
+
+    def action_show_mission(self):
+        self.switch_view("view-mission")
+
     def on_button_pressed(self, event: Button.Pressed) -> None:
         btn_map = {
             "nav-dashboard": "view-dashboard",
@@ -4214,6 +5264,10 @@ class ClaudeWatchApp(App):
             "nav-mcp": "view-mcp",
             "nav-cycles": "view-cycles",
             "nav-test": "view-test",
+            "nav-rules": "view-rules",
+            "nav-audit": "view-audit",
+            "nav-wire": "view-wire",
+            "nav-mission": "view-mission",
         }
         btn_id = event.button.id or ""
         if not btn_id.startswith("nav-"):
@@ -4226,6 +5280,8 @@ class ClaudeWatchApp(App):
         elif btn_id == "nav-health":
             self.switch_view("view-dashboard")
             self.action_toggle_health()
+        elif btn_id == "nav-open-nav":
+            self.push_screen(NavigationScreen())
 
     def action_toggle_accounts(self):
         acct = self.query_one("#account-capacity", AccountCapacityPanel)

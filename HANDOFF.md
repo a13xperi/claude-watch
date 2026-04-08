@@ -3,95 +3,44 @@
 ## What This Is
 Real-time terminal dashboard for monitoring Claude Code token usage. GitHub: a13xperi/claude-watch
 
-## Current State (v0.12 — Cycle Monitor)
+## Current State (v0.7 — Token Access + Rules + Pomodoro Gridlines)
 
-**v0.12 features (built on top of v0.11):**
-- **Cycle Monitor (`s`)**: Replaced SessionTasksScreen. Freeform capture space for the current 5h token window. Quick-add items tagged by category (Bug/Task/Idea/Direction) and project (Atlas/CW/Paper/OClaw/Frank/KAA). Tab cycles category, Shift+Tab cycles project. DataTable grouped by category with separator rows. Actions: Enter=toggle done, r=roll forward, d=delete, e=edit. Items persist to Supabase `cycle_items` table. Done items feed into the gamification scoring (shipping + breadth). Previous cycles summary panel shows past window scores and item counts.
-- **Project Selector**: 7 project buttons in the add-item row. Click or Shift+Tab to select. Project column visible in the items table.
-- Data layer: `_get_cycle_items()`, `_post_cycle_item()`, `_update_cycle_item()`, `_delete_cycle_item()`, `_get_recent_cycle_summaries()`, `_get_cycle_items_for_scoring()`, `_roll_cycle_items()`
+**v0.7 features (shipped 2026-04-08):**
+- **Token Access Control**: Panel in Usage tab showing all 23 Paperclip heartbeat agents grouped by company. Click → full toggle screen, Enter to flip on/off via Paperclip API. Suppressed run detection infers missed runs from known intervals.
+- **Rules tab** (g key): Lists all 11 rules (7 hooks, 1 budget, 3 permissions). Shows trigger/block counts per cycle from permissions.jsonl + battlestation.log. Click rule → event detail.
+- **Cycle source breakdown**: Token Distribution table in cycle detail view showing per-source token split within a 5h window.
+- **Cycle start + end times**: Both columns in Cycles list view.
+- **3-bar banner**: Top bar shows Time/5h/7d remaining with colored bars (red=low, green=plenty). Bars fill right-to-left showing remaining resources.
+- **8-row burndown chart**: Taller chart filling full vertical space. Right-side info panel with Used/Left, 5h/7d bars, zones, account, verdict, budget, score.
+- **Pomodoro gridlines**: Dotted vertical lines at 30-min intervals in burndown (10 blocks per 5h window).
+- **Navigation screen**: "Nav" button opens full-screen tab menu for narrow windows.
 
-**v0.9 features (built on top of v0.8):**
-- **Multi-Account Capacity View (`c`)**: Full-screen view showing all three accounts (A/B/C) side by side. Each panel shows 5h/7d usage bars with visual progress, reset countdowns, lane, repos, and data freshness. Live data for active account, Supabase `account_capacity` snapshots for inactive. Data layer: `get_account_capacity_display()`, `_get_supabase_account_capacity()`
+**All 23 Paperclip heartbeats disabled** — re-enable via Token Access toggle or manually via API.
 
-**v0.8 features (built on top of v0.7):**
-- **CSV Export (`e`)**: Press `e` to export full session history to `~/Downloads/claude-watch-YYYYMMDD-HHMMSS.csv`. Columns: date, session_id, ccid, source, company, project, model, duration_min, five_pct, output_tokens, cost_usd, directive. Data layer: `export_session_history_csv(filepath) -> int`
-- **System Notifications on Spike**: macOS notifications via osascript fire when 5h > 80%, 7d > 90%, or burn rate > 2.0%/min. 5-minute cooldown per notification type. Data layer: `check_and_notify()`, `send_system_notification()`, called from TUI refresh timer
-- **Cost Column Polish**: Verified cost column in Session History (per-row), drill-down summary bar, and tool call sub-rows — all already present from v0.7.1
+## What's Next — Pomodoro System
 
-**v0.7 features (built on top of v0.6):**
-- **Hot reload**: File watcher auto-restarts TUI when .py files change (exit code 42 restart loop)
-- **ActiveSessionsTable interactive**: Converted from Static to interactive DataTable with Enter/`f` to focus Warp terminal. Sub-rows show live state (ago, tok, cpu)
-- **Merged Call History into Session History**: Call History panel removed. Tool call data (call count + tool breakdown) now shows as expandable sub-rows in Session History
-- **Co (Company) column**: Added across System Health, Session History, and the merged history view. Derived from project name
-- **Mdl column in System Health**: Shows the model each session is running
-- **Memory-sorted System Health**: Highest memory consumer sorts to top
-- **AgentsPanel**: New panel showing agent spawn stats over 7 days (type, count, last seen)
-- **MCPStatsScreen**: Press `m` for MCP tool usage breakdown by server (7-day window)
-- **DailySparklinePanel**: 7-day output token sparkline in Usage Metrics
-- **Project column alignment**: System Health columns aligned with Active Sessions widths
+The gridlines are visual only. Next session builds the full Pomodoro execution framework:
 
-**Previous (v0.5 / v0.6):**
-- v0.6: Click-to-focus (AppleScript/AXRaise), usage sparkline (`u`), gravity center quality, dynamic burndown chart, System Health enriched (start, source, model, company)
-- v0.5: Gravity center directives, project column, accomplishments drill-down, token view toggle (`t`), CCID persistence, CLI lookup, session list, TUI search (`/`)
+1. Per-Pomodoro stats — `_get_pomodoro_stats(cycle_id)` slicing existing data into 30-min buckets
+2. "P7/10" indicator in the top banner
+3. Per-block token budget vs actual in burndown right panel
+4. Pomodoro planning UI — assign tasks to blocks
+5. Cycle detail grouped by Pomodoro instead of flat session list
+6. Auto-claim next planned task when block completes
 
-**Layout order (top to bottom):**
-1. Token Monitor header (5h/7d bars, pacing, account)
-2. Search bar (hidden, press `/` to show)
-3. Urgent Alerts (token expiry, runaway burn — actionable with kill PID)
-4. Active Sessions — interactive DataTable with inline sub-rows (state, ago, tokens, cpu) + Project + Co columns
-5. Session History — merged with Call History; indexed transcripts + tool call sub-rows (call count, tool breakdown), PID-mapped, green dot, project, company, gravity center
-6. Passive Drain
-7. Tool Frequency + Skills + Agent Spawns (side by side)
+Default template: P1-2 plan (20%), P3-8 build (60%), P9 assign next (10%), P10 close (10%).
 
-**Two versions:**
-- `claude-watch` → Textual TUI (symlink: `~/bin/claude-watch`)
-- `claude-watch-rich` → Rich Live fallback (may be behind on some panels)
-- Shared data layer: `claude_watch_data.py`
+See memory: `project_pomodoro_system.md`
 
-**Hook:** `~/.claude/hooks/token-tracker.sh` — captures tool_snippet, model, output_tokens
-
-**Keybindings:**
-- `q` quit, `r` refresh, `e` export CSV, `u` usage metrics, `m` MCP stats, `s` Cycle Monitor, `h` toggle health, `Tab`/`Shift+Tab` focus panels
-- `/` search/filter sessions, `Escape` clear search
-- `Enter`/`f` on Active Sessions → focus that session's Warp terminal
-- `Enter` on Session History → drill-down (accomplishments view)
-- `t` in drill-down → toggle token breakdown
-- `m` → MCP tool usage breakdown by server
-- Mouse wheel / arrow keys to scroll full dashboard
-
-**CLI:**
-- `python3 claude_watch_tui.py --session 72887` → JSON lookup by CCID
-- `python3 claude_watch_tui.py --session 72887 --context` → resume context packet
-- `python3 claude_watch_tui.py --list` → recent sessions table/JSON
-
-## What's Next (v1.0)
-
-### Ideas
-- Nested row expansion in Session History (expand to see full tool call detail)
-- Notification preferences (configurable thresholds, mute toggle)
-- CSV export filtering (date range, project, source)
-- Per-turn cost breakdown in drill-down view
-
-## Key Context
-- Python 3.9.6 (no `X | None` type hints)
-- Textual 8.2.3
-- 1% of 5h window ~ 5,500 output tokens
-- paperclip_agents.json maps 25 agents across KAA/Delphi/SAGE/Personal/Adinkra
-- Session index rebuilds in background; delete ~/.claude/logs/session-index.jsonl to force full rebuild
-
-## How To Verify
-```bash
-cd ~/projects/claude-watch
-
-# TUI dashboard
-python3 claude_watch_tui.py
-# press 'u' for usage metrics
-# press '/' to search sessions
-# Tab to Session History, Enter on a row for accomplishments drill-down
-# press 't' in drill-down for token view
-
-# CLI lookup
-python3 claude_watch_tui.py --session 72887
-python3 claude_watch_tui.py --session 72887 --context
-python3 claude_watch_tui.py --list
+## Start Command
 ```
+Build the Pomodoro system — read project_pomodoro_system.md memory
+```
+
+## Key Files
+| File | Purpose |
+|---|---|
+| claude_watch_data.py | Data layer — Paperclip API, rules system, heartbeat management |
+| claude_watch_tui.py | All Textual UI (~5500 lines) |
+| claude_watch_tui.tcss | Styles |
+| paperclip_agents.json | UUID → company/agent name mapping |

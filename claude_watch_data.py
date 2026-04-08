@@ -3393,6 +3393,121 @@ def _score_window(window_start_ts, window_reset_ts):
     }
 
 
+
+
+
+
+def _get_build_ledger(days=1, limit=100):
+    """Fetch build ledger items grouped by company/project."""
+    import urllib.request
+    from datetime import datetime, timedelta, timezone
+    try:
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        url = (
+            f"{_SUPABASE_URL}/build_ledger"
+            f"?created_at=gte.{cutoff}"
+            f"&order=created_at.desc&limit={limit}"
+        )
+        req = urllib.request.Request(url, headers={
+            "apikey": _SUPABASE_KEY,
+            "Authorization": f"Bearer {_SUPABASE_KEY}",
+        })
+        with urllib.request.urlopen(req, timeout=3) as resp:
+            items = json.loads(resp.read())
+
+        # Group by company → project
+        by_company = {}
+        sessions = set()
+        projects = set()
+        untested = 0
+        decisions = 0
+
+        for item in items:
+            co = item.get("company", "personal")
+            proj = item.get("project", "general")
+            by_company.setdefault(co, {}).setdefault(proj, []).append(item)
+            sessions.add(item.get("session_id", ""))
+            projects.add(proj)
+            if item.get("test_status") == "untested":
+                untested += 1
+            if item.get("item_type") == "decision":
+                decisions += 1
+
+        return {
+            "items": items,
+            "by_company": by_company,
+            "stats": {
+                "total": len(items),
+                "untested": untested,
+                "decisions": decisions,
+                "sessions": len(sessions),
+                "projects": len(projects),
+            }
+        }
+    except Exception:
+        return {"items": [], "by_company": {}, "stats": {"total": 0, "untested": 0, "decisions": 0, "sessions": 0, "projects": 0}}
+
+def _get_wire_messages(limit=50):
+    """Fetch recent Wire messages from Supabase session_messages table."""
+    import urllib.request
+    try:
+        url = (
+            f"{_SUPABASE_URL}/session_messages"
+            f"?select=id,from_session,to_session,msg_type,payload,read,acked,created_at"
+            f"&order=created_at.desc&limit={limit}"
+        )
+        req = urllib.request.Request(url, headers={
+            "apikey": _SUPABASE_KEY,
+            "Authorization": f"Bearer {_SUPABASE_KEY}",
+        })
+        with urllib.request.urlopen(req, timeout=3) as resp:
+            messages = json.loads(resp.read())
+
+        results = []
+        for m in messages:
+            payload = m.get("payload", {})
+            # Extract display message from payload
+            if m["msg_type"] == "file_release":
+                display = f'{payload.get("file_path", "?")} — {payload.get("reason", "")}'
+            elif m["msg_type"] == "question":
+                display = payload.get("question", "")
+            elif m["msg_type"] == "ack":
+                display = payload.get("message", payload.get("response", ""))
+            elif m["msg_type"] in ("info", "status"):
+                display = payload.get("message", "")
+            elif m["msg_type"] == "patch":
+                display = f'{payload.get("file_path", "?")} — {payload.get("description", "")}'
+            else:
+                display = json.dumps(payload)[:80]
+
+            results.append({
+                "id": m["id"],
+                "from": m["from_session"],
+                "to": m["to_session"],
+                "type": m["msg_type"],
+                "message": display[:120],
+                "read": m.get("read", False),
+                "acked": m.get("acked", False),
+                "created_at": m.get("created_at", ""),
+            })
+
+        # Stats
+        today_count = len(results)
+        unread_count = sum(1 for r in results if not r["read"])
+        sessions = set()
+        for r in results:
+            sessions.add(r["from"])
+            sessions.add(r["to"])
+
+        return {
+            "messages": results,
+            "total": today_count,
+            "unread": unread_count,
+            "sessions": len(sessions),
+        }
+    except Exception:
+        return {"messages": [], "total": 0, "unread": 0, "sessions": 0}
+
 BATTLESTATION_FILE = Path.home() / ".claude/battlestation.json"
 _SUPABASE_URL = "https://zoirudjyqfqvpxsrxepr.supabase.co/rest/v1"
 _SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InpvaXJ1ZGp5cWZxdnB4c3J4ZXByIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjgwMzE4MjgsImV4cCI6MjA4MzYwNzgyOH0.6W6OzRfJ-nmKN_23z1OBCS4Cr-ODRq9DJmF_yMwOCfo"
@@ -3597,6 +3712,9 @@ CYCLE_PLANS_FILE = Path.home() / ".claude/logs/cycle-plans.jsonl"
 _cycles_cache = None  # type: Optional[List[dict]]
 _cycles_cache_ts = 0.0
 
+_audit_cache = None  # type: Optional[dict]
+_audit_cache_ts = 0.0
+
 
 def _get_cycle_boundaries(limit=20):
     # type: (int) -> List[Tuple[datetime, datetime]]
@@ -3654,7 +3772,32 @@ def _get_cycle_boundaries(limit=20):
     except Exception:
         pass
 
-    # 4. Deduplicate: if two overlap within 30 min, keep authoritative
+    # 4. Infer boundaries from session timestamps for uncovered periods
+    all_sessions = _get_session_history()
+    for s in all_sessions:
+        try:
+            first = s.get("first_ts")
+            if not first:
+                continue
+            if not isinstance(first, datetime):
+                first = datetime.fromisoformat(str(first).replace("Z", "+00:00"))
+            if first.tzinfo is None:
+                first = first.replace(tzinfo=timezone.utc)
+            # Check if covered by any existing boundary
+            covered = any(start <= first < end for start, end, _auth in boundaries)
+            if not covered:
+                # Snap to 5h grid: 00, 05, 10, 15, 20 UTC
+                grid_hour = (first.hour // 5) * 5
+                grid_start = first.replace(hour=grid_hour, minute=0, second=0, microsecond=0)
+                grid_end = grid_start + timedelta(hours=5)
+                # Only add if this grid slot isn't already in boundaries
+                already = any(abs((s_existing - grid_start).total_seconds()) < 1800 for s_existing, _, _a in boundaries)
+                if not already:
+                    boundaries.append((grid_start, grid_end, False))
+        except Exception:
+            pass
+
+    # 5. Deduplicate: if two overlap within 30 min, keep authoritative
     deduped = []  # type: List[Tuple[datetime, datetime]]
     # Sort by start time
     boundaries.sort(key=lambda x: x[0])
@@ -3671,7 +3814,7 @@ def _get_cycle_boundaries(limit=20):
         if not merged:
             deduped.append((start, end))
 
-    # 5. Sort newest first, limit
+    # 6. Sort newest first, limit
     deduped.sort(key=lambda x: x[0], reverse=True)
     return deduped[:limit]
 
@@ -3990,8 +4133,8 @@ def _get_cycle_items(window_start, all_windows=False):
         return []
 
 
-def _post_cycle_item(window_start, category, title, project=""):
-    # type: (str, str, str, str) -> Optional[dict]
+def _post_cycle_item(window_start, category, title, project="", source_ref="", status="open"):
+    # type: (str, str, str, str, str, str) -> Optional[dict]
     """POST a new cycle_item. Returns the inserted row or None."""
     import urllib.request
     config = _get_battlestation_config()
@@ -4000,9 +4143,11 @@ def _post_cycle_item(window_start, category, title, project=""):
         "window_start": window_start,
         "category": category,
         "title": title,
-        "status": "open",
+        "status": status,
         "project": project,
     }
+    if source_ref:
+        payload["source_ref"] = source_ref
     try:
         data = json.dumps(payload).encode()
         req = urllib.request.Request(
@@ -4093,6 +4238,421 @@ def _get_recent_cycle_summaries(limit=3):
         if len(summaries) >= limit:
             break
     return summaries
+
+
+# ── Cycle Audit ────────────────────────────────────────────────────────────
+
+
+def _build_full_audit(limit=50):
+    # type: (int) -> dict
+    """Build a comprehensive audit across all cycles with per-project breakdowns."""
+    global _audit_cache, _audit_cache_ts
+    now = time.time()
+    if _audit_cache is not None and (now - _audit_cache_ts) < 60:
+        return _audit_cache
+
+    cycles = _get_all_cycles(limit=limit)
+    all_items = _get_cycle_items("", all_windows=True)
+
+    # Pre-parse item window_start timestamps for matching
+    items_by_cycle = {}  # type: Dict[str, List[dict]]
+    for item in all_items:
+        ws = item.get("window_start", "")
+        if ws not in items_by_cycle:
+            items_by_cycle[ws] = []
+        items_by_cycle[ws].append(item)
+
+    # Also build a list of parsed (datetime, window_start_str) for fuzzy matching
+    _parsed_item_windows = {}  # type: Dict[str, datetime]
+    for ws in items_by_cycle:
+        try:
+            _parsed_item_windows[ws] = datetime.fromisoformat(ws.replace("Z", "+00:00"))
+        except Exception:
+            pass
+
+    total_commits_global = set()  # type: set
+    total_files_edited_global = 0
+    total_files_created_global = 0
+    total_errors_global = 0
+    total_turns_global = 0
+    by_project_global = {}  # type: Dict[str, dict]
+    scored_scores = []  # type: List[float]
+
+    for cycle in cycles:
+        cid = cycle["cycle_id"]
+
+        # Match cycle_items: exact match first, then fuzzy within 1800s
+        matched_items = []  # type: List[dict]
+        if cid in items_by_cycle:
+            matched_items = items_by_cycle[cid]
+        else:
+            try:
+                cid_dt = datetime.fromisoformat(cid.replace("Z", "+00:00"))
+                for ws, ws_dt in _parsed_item_windows.items():
+                    if abs((cid_dt - ws_dt).total_seconds()) < 1800:
+                        matched_items = items_by_cycle.get(ws, [])
+                        break
+            except Exception:
+                pass
+
+        items_done = sum(1 for i in matched_items if i.get("status") == "done")
+        items_open = sum(1 for i in matched_items if i.get("status") == "open")
+        items_rolled = sum(1 for i in matched_items if i.get("status") not in ("done", "open"))
+
+        # Get full session entries for this cycle
+        cycle_sessions = _get_cycle_sessions(cid)
+
+        # Group sessions by project
+        by_project = {}  # type: Dict[str, dict]
+        for s in cycle_sessions:
+            proj = s.get("project", "unknown") or "unknown"
+            if proj == "\u2014":
+                proj = "unknown"
+            if proj not in by_project:
+                by_project[proj] = {
+                    "sessions": 0,
+                    "tokens": 0,
+                    "cost": 0.0,
+                    "commits": [],
+                    "files_edited": 0,
+                    "files_created": 0,
+                }
+            bp = by_project[proj]
+            bp["sessions"] += 1
+            tok = s.get("output_tokens", 0) or 0
+            bp["tokens"] += tok
+            bp["cost"] += _estimate_cost(tok, s.get("model", ""))
+
+            # Extract accomplishments for this session
+            try:
+                acc = _extract_accomplishments(s["session_id"])
+                if acc:
+                    commits = acc.get("git_commits", [])
+                    bp["commits"].extend(commits)
+                    bp["files_edited"] += len(acc.get("files_edited", []))
+                    bp["files_created"] += len(acc.get("files_created", []))
+            except Exception:
+                pass
+
+        # Accumulate global totals from by_project
+        for proj, bp in by_project.items():
+            total_commits_global.update(bp["commits"])
+            total_files_edited_global += bp["files_edited"]
+            total_files_created_global += bp["files_created"]
+
+            # Merge into global by_project
+            if proj not in by_project_global:
+                by_project_global[proj] = {
+                    "sessions": 0,
+                    "tokens": 0,
+                    "cost": 0.0,
+                    "commits": [],
+                    "files_edited": 0,
+                    "files_created": 0,
+                }
+            g = by_project_global[proj]
+            g["sessions"] += bp["sessions"]
+            g["tokens"] += bp["tokens"]
+            g["cost"] += bp["cost"]
+            g["commits"].extend(bp["commits"])
+            g["files_edited"] += bp["files_edited"]
+            g["files_created"] += bp["files_created"]
+
+        # Accumulate errors/turns from cycle-level accomplishments
+        cycle_acc = cycle.get("accomplishments", {})
+        total_errors_global += cycle_acc.get("errors", 0) if cycle_acc else 0
+        total_turns_global += cycle_acc.get("turn_count", 0) if cycle_acc else 0
+
+        # Track scored cycles
+        score = cycle.get("overall_score", 0)
+        if score and score > 0:
+            scored_scores.append(float(score))
+
+        # Attach audit fields to cycle dict
+        cycle["cycle_items"] = matched_items
+        cycle["items_done"] = items_done
+        cycle["items_open"] = items_open
+        cycle["items_rolled"] = items_rolled
+        cycle["by_project"] = by_project
+
+    # Deduplicate global commits per project
+    for proj, g in by_project_global.items():
+        g["commits"] = list(dict.fromkeys(g["commits"]))
+
+    total_sessions = sum(c.get("session_count", 0) for c in cycles)
+    total_tokens = sum(c.get("total_output_tokens", 0) for c in cycles)
+    total_cost = sum(c.get("total_cost", 0) for c in cycles)
+
+    totals = {
+        "cycle_count": len(cycles),
+        "total_sessions": total_sessions,
+        "total_output_tokens": total_tokens,
+        "total_cost": total_cost,
+        "cost_str": _format_cost(total_cost),
+        "total_commits": len(total_commits_global),
+        "total_files_edited": total_files_edited_global,
+        "total_files_created": total_files_created_global,
+        "total_errors": total_errors_global,
+        "total_turns": total_turns_global,
+        "avg_score": round(sum(scored_scores) / len(scored_scores), 1) if scored_scores else 0,
+        "scored_cycles": len(scored_scores),
+    }
+
+    result = {
+        "cycles": cycles,
+        "totals": totals,
+        "by_project_global": by_project_global,
+    }
+
+    _audit_cache = result
+    _audit_cache_ts = now
+    return result
+
+
+
+def _populate_cycle_from_sessions(cycle_id=None):
+    # type: (Optional[str]) -> int
+    """Populate cycle_items from session accomplishments. Returns count of items created."""
+
+    # MCP write operations that count as deliverables
+    MCP_WRITES = {
+        "notion-create-pages", "notion-update-page", "notion-create-database",
+        "notion-create-comment", "notion-create-view",
+        "execute_sql",  # Supabase
+        "create_task", "update_tasks",  # Asana
+        "apply_migration", "deploy_edge_function",  # Supabase
+    }
+
+    # Project name normalization
+    PROJECT_MAP = {
+        "-Users-a13xp": "home",
+        "-private-tmp": "unknown",
+    }
+    # Hex-like names -> unknown
+
+    def normalize_project(name):
+        if name in PROJECT_MAP:
+            return PROJECT_MAP[name]
+        if len(name) == 6 and all(c in "0123456789abcdef" for c in name):
+            return "unknown"
+        return name
+
+    def has_mcp_writes(mcp_ops):
+        """Check if any MCP operations are write operations."""
+        for op in mcp_ops:
+            op_lower = op.lower()
+            for write_op in MCP_WRITES:
+                if write_op.lower() in op_lower:
+                    return True
+        return False
+
+    if cycle_id:
+        # Single cycle
+        cycles_to_process = [c for c in _get_all_cycles(limit=50) if c["cycle_id"] == cycle_id]
+    else:
+        # All cycles
+        cycles_to_process = _get_all_cycles(limit=50)
+
+    if not cycles_to_process:
+        return 0
+
+    # Get ALL existing cycle_items with source_ref to dedup
+    existing_items = _get_cycle_items("", all_windows=True)
+    existing_refs = set()
+    for item in existing_items:
+        ref = item.get("source_ref")
+        if ref:
+            existing_refs.add(ref)
+
+    total_created = 0
+
+    for cycle in cycles_to_process:
+        window_start = cycle["cycle_id"]
+        sessions = _get_cycle_sessions(window_start)
+
+        for session in sessions:
+            sid = session.get("session_id", "")
+
+            acc = session.get("accomplishments") or _extract_accomplishments(sid)
+            if not acc:
+                continue
+
+            project = normalize_project(session.get("project", "unknown"))
+            directive = session.get("directive", "") or ""
+            commits = acc.get("git_commits", [])
+            files_edited = acc.get("files_edited", [])
+            files_created = acc.get("files_created", [])
+            mcp_ops = acc.get("mcp_ops", [])
+
+            if commits:
+                # One item per commit
+                for i, commit_msg in enumerate(commits):
+                    ref = f"{sid}:commit:{i}"
+                    if ref in existing_refs:
+                        continue
+                    title = commit_msg[:200]
+                    _post_cycle_item(window_start, "task", title, project=project, source_ref=ref, status="done")
+                    existing_refs.add(ref)
+                    total_created += 1
+
+            elif files_edited or files_created:
+                # One item per session -- uncommitted work
+                ref = f"{sid}:files"
+                if ref in existing_refs:
+                    continue
+                n_ed = len(files_edited)
+                n_cr = len(files_created)
+                label = directive[:80] if directive and directive != "\u2014" else f"{n_ed} files edited, {n_cr} created"
+                title = f"Uncommitted: {label}"[:200]
+                _post_cycle_item(window_start, "task", title, project=project, source_ref=ref, status="open")
+                existing_refs.add(ref)
+                total_created += 1
+
+            elif has_mcp_writes(mcp_ops):
+                # One item per session -- MCP write deliverable
+                ref = f"{sid}:mcp"
+                if ref in existing_refs:
+                    continue
+                # Pick the most descriptive MCP op
+                write_ops = [op for op in mcp_ops if any(w.lower() in op.lower() for w in MCP_WRITES)]
+                op_label = write_ops[0].split(":")[-1] if write_ops else "MCP"
+                label = directive[:80] if directive and directive != "\u2014" else op_label
+                title = f"{op_label}: {label}"[:200]
+                _post_cycle_item(window_start, "task", title, project=project, source_ref=ref, status="done")
+                existing_refs.add(ref)
+                total_created += 1
+
+            # else: skip -- chat/research/orchestration only
+
+    # Invalidate caches
+    global _audit_cache, _audit_cache_ts, _cycles_cache, _cycles_cache_ts
+    _audit_cache = None
+    _audit_cache_ts = 0
+    _cycles_cache = None
+    _cycles_cache_ts = 0
+
+    return total_created
+
+
+def export_audit_markdown(filepath):
+    # type: (str) -> None
+    """Export a full cycle audit report as structured Markdown."""
+    audit = _build_full_audit()
+    totals = audit["totals"]
+    cycles = audit["cycles"]
+    by_project = audit["by_project_global"]
+
+    # Date range
+    if cycles:
+        try:
+            first_dt = datetime.fromisoformat(cycles[-1]["cycle_id"].replace("Z", "+00:00"))
+            last_dt = datetime.fromisoformat(cycles[0]["cycle_id"].replace("Z", "+00:00"))
+            date_range = f"{first_dt.strftime('%Y-%m-%d')} to {last_dt.strftime('%Y-%m-%d')}"
+        except Exception:
+            date_range = "N/A"
+    else:
+        date_range = "N/A"
+
+    lines = []  # type: List[str]
+    lines.append("# Claude Code Cycle Audit Report")
+    lines.append(f"Generated: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
+    lines.append("")
+    lines.append("## Executive Summary")
+    lines.append(f"- **Cycles**: {totals['cycle_count']} ({date_range})")
+    lines.append(f"- **Sessions**: {totals['total_sessions']} total")
+    lines.append(f"- **Output Tokens**: {totals['total_output_tokens']:,} (~{totals['cost_str']})")
+    lines.append(f"- **Commits**: {totals['total_commits']} across {len(by_project)} projects")
+    lines.append(f"- **Average Score**: {totals['avg_score']}/5.0 ({totals['scored_cycles']} scored)")
+    lines.append("")
+
+    # Cross-project summary table
+    lines.append("## Cross-Project Summary")
+    lines.append("| Project | Sessions | Commits | Files Edited | Files Created | Cost |")
+    lines.append("|---------|----------|---------|-------------|--------------|------|")
+    for proj in sorted(by_project.keys()):
+        p = by_project[proj]
+        lines.append(
+            f"| {proj} | {p['sessions']} | {len(p['commits'])} "
+            f"| {p['files_edited']} | {p['files_created']} "
+            f"| {_format_cost(p['cost'])} |"
+        )
+    lines.append("")
+
+    # Load cycle plans for objectives
+    plans = _load_cycle_plans()
+
+    # Per-cycle details
+    for cycle in cycles:
+        cid = cycle["cycle_id"]
+        try:
+            start_dt = datetime.fromisoformat(cid.replace("Z", "+00:00")).astimezone()
+            end_dt = datetime.fromisoformat(cycle["end_ts"].replace("Z", "+00:00")).astimezone()
+            header = f"## Cycle: {start_dt.strftime('%Y-%m-%d %H:%M')} - {end_dt.strftime('%H:%M')}  {cycle.get('stars', '')}"
+        except Exception:
+            header = f"## Cycle: {cid}  {cycle.get('stars', '')}"
+
+        lines.append("---")
+        lines.append("")
+        lines.append(header)
+
+        # Objective from plan
+        plan = plans.get(cid) or _get_cycle_plan(cid)
+        if plan:
+            obj = plan.get("objective", plan.get("goal", ""))
+            if obj:
+                lines.append(f"**Objective**: {obj}")
+
+        # Score breakdown
+        ws = cycle.get("window_score")
+        if ws:
+            scores = []
+            for dim in ("burn", "parallel", "ship", "breadth", "velocity"):
+                val = ws.get(dim, 0)
+                if val:
+                    scores.append(f"{dim.capitalize()} {val}")
+            if scores:
+                lines.append(f"**Score**: {' | '.join(scores)}")
+
+        lines.append(
+            f"**Sessions**: {cycle.get('session_count', 0)} "
+            f"| **Cost**: {cycle.get('cost_str', '$0')} "
+            f"| **Peak**: {cycle.get('peak_five_pct', 0)}%"
+        )
+        lines.append("")
+
+        # Planned items
+        items = cycle.get("cycle_items", [])
+        if items:
+            lines.append("### Planned Items")
+            for item in items:
+                status = item.get("status", "open")
+                check = "x" if status == "done" else " "
+                proj = item.get("project", "")
+                proj_str = f" ({proj})" if proj else ""
+                lines.append(f"- [{check}] {item.get('title', 'untitled')}{proj_str}")
+            lines.append("")
+
+        # Work by project
+        bp = cycle.get("by_project", {})
+        if bp:
+            lines.append("### Work by Project")
+            lines.append("")
+            for proj in sorted(bp.keys()):
+                p = bp[proj]
+                cost_str = _format_cost(p["cost"])
+                lines.append(f"#### {proj} ({p['sessions']} sessions, {cost_str})")
+                if p["commits"]:
+                    dedupe = list(dict.fromkeys(p["commits"]))[:10]
+                    cleaned = [_normalize_commit(c) or c for c in dedupe]
+                    lines.append(f"- Commits: {', '.join(cleaned[:5])}")
+                lines.append(f"- Files edited: {p['files_edited']} | Files created: {p['files_created']}")
+                lines.append("")
+
+    # Write file
+    from pathlib import Path
+    Path(filepath).parent.mkdir(parents=True, exist_ok=True)
+    with open(filepath, "w") as f:
+        f.write("\n".join(lines) + "\n")
 
 
 def _get_cycle_items_for_scoring(window_start):
@@ -4204,8 +4764,8 @@ def _get_test_queue(project=None, status="pending"):
         return []
 
 
-def _add_test_item(title, project="", source="manual", source_ref="", route="", priority="normal"):
-    # type: (str, str, str, str, str, str) -> dict
+def _add_test_item(title, project="", source="manual", source_ref="", route="", priority="normal", notes=""):
+    # type: (str, str, str, str, str, str, str) -> dict
     """Insert a new test_queue item. Returns inserted row or empty dict."""
     import urllib.request
     config = _get_battlestation_config()
@@ -4218,6 +4778,7 @@ def _add_test_item(title, project="", source="manual", source_ref="", route="", 
         "route": route,
         "priority": priority,
         "status": "pending",
+        "notes": notes,
     }
     try:
         data = json.dumps(payload).encode()
@@ -4282,6 +4843,137 @@ def _delete_test_item(item_id):
     except Exception:
         return False
 
+
+
+def _scrape_cycle_sessions(window_start=None):
+    # type: (str) -> int
+    """Scrape sessions from the current cycle and create test_queue items.
+    Returns count of newly inserted items."""
+    import json as _json
+    from pathlib import Path
+
+    # Get window_start if not provided
+    if window_start is None:
+        bd = _get_burndown_data()
+        if not bd or not bd.get("window_start"):
+            return 0
+        ws_val = bd["window_start"]
+        window_start = ws_val.isoformat() if hasattr(ws_val, 'isoformat') else str(ws_val)
+
+    ws_str = str(window_start)
+
+    # Read session index
+    index_path = Path.home() / ".claude" / "logs" / "session-index.jsonl"
+    if not index_path.exists():
+        return 0
+
+    sessions = []
+    with open(index_path) as fh:
+        for line in fh:
+            try:
+                entry = _json.loads(line)
+                if entry.get("first_ts", "") >= ws_str:
+                    sessions.append(entry)
+            except Exception:
+                continue
+
+    if not sessions:
+        return 0
+
+    # Get existing session-sourced test items for dedup
+    existing = _get_test_queue(status=None)
+    existing_refs = {
+        item["source_ref"] for item in existing
+        if item.get("source") == "session" and item.get("source_ref")
+    }
+
+    # Route inference from file paths
+    def _infer_route(files):
+        for f in files:
+            fl = f.lower()
+            if "tui" in fl or "tcss" in fl:
+                return "TUI"
+            if "data" in fl:
+                return "data"
+            if "hook" in fl:
+                return "hooks"
+            if "skill" in fl:
+                return "skills"
+            if "script" in fl:
+                return "scripts"
+        return ""
+
+    inserted = 0
+    for s in sessions:
+        sid = s.get("session_id", "")
+        if sid in existing_refs:
+            continue
+
+        acc = s.get("accomplishments", {})
+        files_e = acc.get("files_edited", [])
+        files_c = acc.get("files_created", [])
+        commits = acc.get("git_commits", [])
+        skills = acc.get("skills", [])
+
+        # Skip sessions with no meaningful work
+        if not files_e and not files_c and not commits:
+            continue
+
+        # Build title
+        directive = s.get("directive", "")
+        slug = s.get("slug", "")
+        project = s.get("project", "")
+
+        if commits:
+            title = f"Verify: {commits[0]}"
+        elif directive and len(directive) > 10 and not directive.startswith(("session (", slug)):
+            title = f"Verify: {directive}"
+        elif files_e:
+            short = files_e[0].split("/")[-1]
+            title = f"Verify: {slug or sid[:8]} — changes to {short}"
+        elif files_c:
+            short = files_c[0].split("/")[-1]
+            title = f"Verify: {slug or sid[:8]} — new file {short}"
+        else:
+            continue
+
+        title = title[:200]
+        route = _infer_route(files_e + files_c)
+
+        all_files = files_e + files_c
+        files_str = ", ".join(f.split("/")[-1] for f in all_files[:6])
+        primary = all_files[0].split("/")[-1] if all_files else "unknown"
+
+        notes_parts = [
+            f"Session: {slug}",
+            f"Directive: {directive}",
+            f"Files: {files_str}",
+            "",
+            "Steps:",
+            f"1. Check that changes in {primary} work correctly",
+            "2. Run the relevant feature and verify no crashes",
+            "3. Verify the feature matches the directive intent",
+            "",
+            f"Expected: Feature works as described — {directive[:80]}",
+        ]
+        if commits:
+            notes_parts.insert(3, f"Commits: {'; '.join(commits[:3])}")
+
+        notes = "\n".join(notes_parts)
+
+        result = _add_test_item(
+            title=title,
+            project=project,
+            source="session",
+            source_ref=sid,
+            route=route,
+            priority="normal",
+            notes=notes,
+        )
+        if result:
+            inserted += 1
+
+    return inserted
 
 def _import_atlas_qa_tests():
     # type: () -> int
@@ -4372,3 +5064,361 @@ def _import_atlas_qa_tests():
             inserted += 1
 
     return inserted
+
+
+# ── Paperclip heartbeat management ──────────────────────────────────────────
+
+PAPERCLIP_BASE = "http://localhost:3100"
+
+_heartbeat_cache = (0.0, [])  # type: Tuple[float, list]
+_HEARTBEAT_CACHE_TTL = 10  # seconds
+
+
+def _get_paperclip_heartbeats():
+    """Fetch all heartbeat-enabled agents from Paperclip.
+    Returns list of dicts with id, companyName, agentName, heartbeatEnabled,
+    schedulerActive, intervalSec, lastHeartbeatAt, status.
+    """
+    global _heartbeat_cache
+    now = time.time()
+    cached_at, cached_data = _heartbeat_cache
+    if now - cached_at < _HEARTBEAT_CACHE_TTL:
+        return cached_data
+
+    import urllib.request
+    import json as _json
+
+    url = f"{PAPERCLIP_BASE}/api/instance/scheduler-heartbeats"
+    req = urllib.request.Request(url)
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            rows = _json.loads(resp.read())
+        _heartbeat_cache = (now, rows)
+        return rows
+    except Exception as e:
+        _log.warning("Failed to fetch heartbeats: %s", e)
+        if cached_data:
+            return cached_data
+        return []
+
+
+def _toggle_heartbeat(agent_id, enabled):
+    """Enable or disable a Paperclip agent's heartbeat.
+    Preserves intervalSec from the existing config or _KNOWN_INTERVALS.
+    Returns True on success, False on failure.
+    """
+    global _heartbeat_cache
+    import urllib.request
+    import json as _json
+
+    # Get current agent to preserve intervalSec
+    interval = 0
+    try:
+        get_req = urllib.request.Request(f"{PAPERCLIP_BASE}/api/agents/{agent_id}")
+        with urllib.request.urlopen(get_req, timeout=5) as resp:
+            agent_data = _json.loads(resp.read())
+            hb = agent_data.get("runtimeConfig", {}).get("heartbeat", {})
+            interval = hb.get("intervalSec", 0)
+            if not interval:
+                interval = _KNOWN_INTERVALS.get(agent_data.get("name", ""), 0)
+    except Exception:
+        pass
+
+    url = f"{PAPERCLIP_BASE}/api/agents/{agent_id}"
+    hb_config = {"enabled": enabled}
+    if interval > 0:
+        hb_config["intervalSec"] = interval
+    payload = _json.dumps({"runtimeConfig": {"heartbeat": hb_config}}).encode()
+    req = urllib.request.Request(url, data=payload, method="PATCH")
+    req.add_header("Content-Type", "application/json")
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            resp.read()
+        # Invalidate cache
+        _heartbeat_cache = (0.0, [])
+        return True
+    except Exception as e:
+        _log.warning("Failed to toggle heartbeat for %s: %s", agent_id, e)
+        return False
+
+
+_blocked_attempts_log = Path.home() / ".claude/logs/blocked-access.jsonl"
+
+
+def _log_blocked_attempt(system, agent_name="", detail=""):
+    """Log when a disabled system tries to access tokens."""
+    import json as _json
+    entry = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "system": system,
+        "agent": agent_name,
+        "detail": detail,
+    }
+    try:
+        with open(_blocked_attempts_log, "a") as f:
+            f.write(_json.dumps(entry) + "\n")
+    except Exception:
+        pass
+
+
+_KNOWN_INTERVALS = {
+    "DevOps Monitor": 3600, "Project Manager": 14400,
+    "Process Auditor": 43200, "Ops Director": 86400,
+    "Editor": 21600, "Trend Scanner": 43200, "Writer": 86400,
+    "Client Comms": 86400, "Life Pilot": 43200,
+    "Rhythm Keeper": 86400, "Wellness Agent": 43200,
+}
+
+
+def _get_blocked_attempts(minutes=60):
+    """Infer suppressed heartbeat runs for disabled agents.
+    Compares each disabled agent's known interval against lastHeartbeatAt
+    to calculate how many scheduled runs were suppressed.
+    """
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(minutes=minutes)
+    attempts = []
+
+    try:
+        agents = _get_paperclip_heartbeats()
+    except Exception:
+        return []
+
+    for a in agents:
+        if a.get("heartbeatEnabled", True):
+            continue
+        interval = a.get("intervalSec", 0)
+        if interval <= 0:
+            interval = _KNOWN_INTERVALS.get(a.get("agentName", ""), 0)
+        if interval <= 0:
+            continue
+        last_str = a.get("lastHeartbeatAt", "")
+        if not last_str:
+            continue
+        try:
+            last_dt = datetime.fromisoformat(last_str.replace("Z", "+00:00"))
+            if last_dt.tzinfo is None:
+                last_dt = last_dt.replace(tzinfo=timezone.utc)
+        except Exception:
+            continue
+
+        elapsed = (now - last_dt).total_seconds()
+        missed = int(elapsed / interval) - 1
+        if missed <= 0:
+            continue
+
+        if interval >= 86400:
+            freq = f"every {interval // 86400}d"
+        elif interval >= 3600:
+            freq = f"every {interval // 3600}h"
+        else:
+            freq = f"every {interval // 60}m"
+
+        for i in range(1, missed + 1):
+            expected_ts = last_dt + timedelta(seconds=interval * i)
+            if expected_ts < cutoff:
+                continue
+            if expected_ts > now:
+                break
+            attempts.append({
+                "ts": expected_ts.isoformat(),
+                "system": a.get("companyName", "?"),
+                "agent": a.get("agentName", "?"),
+                "detail": f"suppressed ({freq}, disabled)",
+            })
+
+    attempts.sort(key=lambda x: x["ts"])
+    return attempts
+
+
+def _get_heartbeat_runs(company_id, limit=10):
+    """Fetch recent heartbeat runs for a company."""
+    import urllib.request
+    import json as _json
+
+    url = f"{PAPERCLIP_BASE}/api/companies/{company_id}/heartbeat-runs?limit={limit}"
+    req = urllib.request.Request(url)
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            return _json.loads(resp.read())
+    except Exception as e:
+        _log.warning("Failed to fetch heartbeat runs: %s", e)
+        return []
+
+
+# ── Rules system ────────────────────────────────────────────────────────────
+
+PERMISSIONS_LOG = Path.home() / ".claude-permission-feed/permissions.jsonl"
+BATTLESTATION_LOG = Path("/tmp/battlestation/battlestation.log")
+
+_RULES_CATALOG = [
+    {"name": "afk-gate", "type": "hook", "phase": "PreToolUse",
+     "desc": "Blocks all tools when AFK lock active"},
+    {"name": "auto-register", "type": "hook", "phase": "PreToolUse",
+     "desc": "Registers session in Supabase + caches peers"},
+    {"name": "token-tracker", "type": "hook", "phase": "PreToolUse",
+     "desc": "Enforces progressive session budget (80%/15%/5% by class)"},
+    {"name": "session-limiter", "type": "hook", "phase": "PreToolUse",
+     "desc": "Blocks if >10 concurrent sessions (bypassed in burn mode)"},
+    {"name": "file-lock-check", "type": "hook", "phase": "PreToolUse",
+     "desc": "Blocks editing files owned by another session"},
+    {"name": "permission-logger", "type": "hook", "phase": "PreToolUse",
+     "desc": "Logs every tool call with category and risk level"},
+    {"name": "test-tracker", "type": "hook", "phase": "PostToolUse",
+     "desc": "Auto-creates QA test items on git commit/push/PR"},
+    {"name": "token-budget", "type": "budget", "phase": "-",
+     "desc": "hard_stop by class, burn_rate 2%/min, max 10 sessions"},
+    {"name": "deny:rm-rf", "type": "permission", "phase": "-",
+     "desc": "Blocks rm -rf /"},
+    {"name": "deny:sudo", "type": "permission", "phase": "-",
+     "desc": "Blocks all sudo commands"},
+    {"name": "deny:chmod-777", "type": "permission", "phase": "-",
+     "desc": "Blocks chmod 777"},
+]
+
+_rules_cache = (0.0, [], [])  # (ts, rules, blocks)
+_RULES_CACHE_TTL = 30
+
+
+def _get_rules_summary():
+    """Return (rules_list, block_events) for the current cycle."""
+    global _rules_cache
+    now = time.time()
+    cached_at, cached_rules, cached_blocks = _rules_cache
+    if now - cached_at < _RULES_CACHE_TTL:
+        return cached_rules, cached_blocks
+
+    cycle_start = None
+    try:
+        current = _get_current_cycle()
+        if current:
+            cycle_start = datetime.fromisoformat(current["start_ts"])
+            if cycle_start.tzinfo is None:
+                cycle_start = cycle_start.replace(tzinfo=timezone.utc)
+    except Exception:
+        pass
+    if not cycle_start:
+        cycle_start = datetime.now(timezone.utc) - timedelta(hours=5)
+
+    block_events = []
+    try:
+        with open(BATTLESTATION_LOG) as f:
+            for line in f:
+                if "[WARN]" not in line and "BLOCK" not in line.upper():
+                    continue
+                try:
+                    ts_str = line[:20].strip()
+                    ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+                    if ts.tzinfo is None:
+                        ts = ts.replace(tzinfo=timezone.utc)
+                    if ts < cycle_start:
+                        continue
+                    rest = line[21:].strip()
+                    level_end = rest.find("]")
+                    if level_end < 0:
+                        continue
+                    after_level = rest[level_end + 2:]
+                    colon_pos = after_level.find(":")
+                    if colon_pos < 0:
+                        continue
+                    rule_name = after_level[:colon_pos].strip()
+                    detail = after_level[colon_pos + 1:].strip()
+                    block_events.append({"ts": ts_str, "rule": rule_name, "detail": detail})
+                except Exception:
+                    continue
+    except FileNotFoundError:
+        pass
+
+    block_counts = {}  # type: dict
+    for evt in block_events:
+        r = evt["rule"]
+        block_counts[r] = block_counts.get(r, 0) + 1
+
+    trigger_counts = {}  # type: dict
+    last_triggered = {}  # type: dict
+    try:
+        file_size = PERMISSIONS_LOG.stat().st_size
+        read_start = max(0, file_size - 500_000)
+        with open(PERMISSIONS_LOG) as f:
+            if read_start > 0:
+                f.seek(read_start)
+                f.readline()
+            buf = ""
+            for line in f:
+                buf += line
+                if line.strip() == "}":
+                    try:
+                        entry = json.loads(buf)
+                        buf = ""
+                        ts_str = entry.get("timestamp", "")
+                        try:
+                            ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+                            if ts.tzinfo is None:
+                                ts = ts.replace(tzinfo=timezone.utc)
+                            if ts < cycle_start:
+                                continue
+                        except Exception:
+                            continue
+                        evt_type = entry.get("event", "")
+                        trigger_counts[evt_type] = trigger_counts.get(evt_type, 0) + 1
+                        if evt_type not in last_triggered or ts_str > last_triggered[evt_type]:
+                            last_triggered[evt_type] = ts_str
+                    except json.JSONDecodeError:
+                        buf = ""
+    except FileNotFoundError:
+        pass
+
+    total_pre = trigger_counts.get("PreToolUse", 0)
+    total_post = trigger_counts.get("PostToolUse", 0)
+
+    rules = []
+    for cat in _RULES_CATALOG:
+        rule = dict(cat)
+        name = rule["name"]
+        if rule["type"] == "hook":
+            hook_path = Path.home() / f".claude/hooks/{name}.sh"
+            rule["enabled"] = hook_path.exists()
+        else:
+            rule["enabled"] = True
+        if rule["phase"] == "PreToolUse":
+            rule["triggers"] = total_pre
+            rule["last_triggered"] = last_triggered.get("PreToolUse", "")
+        elif rule["phase"] == "PostToolUse":
+            rule["triggers"] = total_post
+            rule["last_triggered"] = last_triggered.get("PostToolUse", "")
+        else:
+            rule["triggers"] = 0
+            rule["last_triggered"] = ""
+        rule["blocks"] = block_counts.get(name, 0)
+        rules.append(rule)
+
+    _rules_cache = (now, rules, block_events)
+    return rules, block_events
+
+
+def _get_rule_events(rule_name, limit=30):
+    """Get recent events for a specific rule from battlestation log."""
+    events = []
+    try:
+        with open(BATTLESTATION_LOG) as f:
+            for line in f:
+                if rule_name not in line:
+                    continue
+                try:
+                    ts_str = line[:20].strip()
+                    rest = line[21:].strip()
+                    level_end = rest.find("]")
+                    if level_end < 0:
+                        continue
+                    level = rest[1:level_end]
+                    after = rest[level_end + 2:]
+                    colon = after.find(":")
+                    if colon < 0:
+                        continue
+                    detail = after[colon + 1:].strip()
+                    events.append({"ts": ts_str, "level": level, "detail": detail})
+                except Exception:
+                    continue
+    except FileNotFoundError:
+        pass
+    return events[-limit:]
