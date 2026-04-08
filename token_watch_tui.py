@@ -1621,6 +1621,7 @@ class NavBar(Horizontal):
         # Compact top bar — key tabs + Nav button for the rest
         buttons = [
             ("Dashboard", "nav-dashboard"),
+            ("Dispatch", "nav-dispatch"),
             ("Cycle", "nav-sessions"),
             ("Mission", "nav-mission"),
             ("Test", "nav-test"),
