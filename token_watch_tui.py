@@ -380,6 +380,13 @@ class EngineTable(DataTable):
         now_utc = datetime.now(timezone.utc)
         now_local = datetime.now()
 
+        # Per-session attribution (scaled to current window)
+        attr_data = _get_token_attribution()
+        attr_map = {}  # sid -> attributed pct
+        if attr_data:
+            for _as in attr_data.get("sessions", []):
+                attr_map[_as["session_id"]] = _as["pct_used"]
+
         n_local = len(engine_sessions)
         n_peers = len(remote_peers)
         n_total = n_local + n_peers
@@ -462,12 +469,16 @@ class EngineTable(DataTable):
                 if elapsed_s else "?"
             )
 
+            # Use per-session attribution instead of raw window delta
+            attr_pct = attr_map.get(sid)
+            if attr_pct is not None and attr_pct > 0:
+                delta = f"+{attr_pct:.1f}%"
             color = "green"
             if delta == "new":
                 color = "dim"
             else:
                 try:
-                    val = float(delta.strip("+%"))
+                    val = float(delta.strip("+%↻"))
                     color = "red" if val > 10 else ("yellow" if val > 5 else "green")
                 except Exception:
                     pass
@@ -3558,6 +3569,13 @@ class SessionHistoryTable(DataTable):
         pid_map = _build_pid_map()
         active = _active_pids()
 
+        # Per-session attribution (scaled to current window)
+        attr_data = _get_token_attribution()
+        attr_by_ccid = {}  # cc-PID -> attributed pct
+        if attr_data:
+            for _as in attr_data.get("sessions", []):
+                attr_by_ccid[_as["session_id"]] = _as["pct_used"]
+
         call_map = _get_call_data_map()
         call_by_uuid = {}
         for uuid, pid in pid_map.items():
@@ -3640,12 +3658,19 @@ class SessionHistoryTable(DataTable):
             mdl = _abbrev_model(s.get("model", ""))
             mdl_style = "magenta" if mdl == "opus" else ("cyan" if mdl == "sonnet" else "dim")
 
-            pct = s["pct_str"]
+            # Use per-session attribution instead of raw window delta
+            ccid = pid_map.get(s["session_id"])
+            ccid_str = f"cc-{ccid}" if ccid else ""
+            attr_pct = attr_by_ccid.get(ccid_str) or attr_by_ccid.get(s["session_id"])
+            if attr_pct is not None and attr_pct > 0:
+                pct = f"+{attr_pct:.1f}%"
+            else:
+                pct = s["pct_str"]
             if pct == "—":
                 pct_style = "dim"
             else:
                 try:
-                    v = float(pct.strip("+%"))
+                    v = float(pct.strip("+%↻"))
                     pct_style = "red" if v > 10 else ("yellow" if v > 5 else "green")
                 except Exception:
                     pct_style = "dim"
