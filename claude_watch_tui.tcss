@@ -72,6 +72,7 @@ Screen {
     border: solid cyan;
     border-title-color: white;
     border-title-style: bold;
+    border-title-align: center;
     margin: 0 0 1 0;
 }
 
@@ -98,6 +99,7 @@ Screen {
     border: solid dodgerblue;
     border-title-color: white;
     border-title-style: bold;
+    border-title-align: center;
 }
 
 #session-history:focus {

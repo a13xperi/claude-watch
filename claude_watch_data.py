@@ -4740,26 +4740,39 @@ def _roll_cycle_items(old_window_start, new_window_start):
 
 def _get_test_queue(project=None, status="pending"):
     # type: (str, str) -> list
-    """Fetch test_queue items from Supabase."""
+    """Fetch test items from build_ledger (single source of truth).
+    Maps build_ledger fields to test_queue format for backward compat."""
     import urllib.request
     from urllib.parse import quote
-    config = _get_battlestation_config()
-    url = (
-        f"{_SUPABASE_URL}/test_queue"
-        f"?user_id=eq.{config['user_id']}"
-    )
-    if status is not None:
-        url += f"&status=eq.{quote(status)}"
+
+    # Map test_queue status to build_ledger test_status
+    status_map = {"pending": "untested", "pass": "tested", "fail": "failed", "skip": "skipped"}
+    bl_status = status_map.get(status) if status else None
+
+    url = f"{_SUPABASE_URL}/build_ledger?"
+    if bl_status is not None:
+        url += f"test_status=eq.{quote(bl_status)}&"
     if project:
-        url += f"&project=eq.{quote(project)}"
-    url += "&order=created_at.desc&limit=200"
+        url += f"project=eq.{quote(project)}&"
+    url += "order=created_at.desc&limit=200"
     try:
         req = urllib.request.Request(url, headers={
             "apikey": _SUPABASE_KEY,
             "Authorization": f"Bearer {_SUPABASE_KEY}",
         })
         with urllib.request.urlopen(req, timeout=5) as resp:
-            return json.loads(resp.read())
+            items = json.loads(resp.read())
+
+        # Map to test_queue format for TUI compat
+        reverse_status = {"untested": "pending", "tested": "pass", "failed": "fail", "skipped": "skip"}
+        for item in items:
+            item["status"] = reverse_status.get(item.get("test_status", "untested"), "pending")
+            item["title"] = item.get("title", "")
+            item["route"] = item.get("test_hint", "")[:30] or ""
+            item["priority"] = "high" if item.get("item_type") in ("feature", "fix") else "normal"
+            item["source"] = item.get("source", "commit")
+            item["source_ref"] = item.get("session_id", "").replace("cc-", "")
+        return items
     except Exception:
         return []
 
@@ -4802,15 +4815,17 @@ def _add_test_item(title, project="", source="manual", source_ref="", route="", 
 
 def _update_test_item(item_id, status, notes=""):
     # type: (str, str, str) -> bool
-    """Update test_queue item status. Sets tested_at on pass/fail/skip."""
+    """Update build_ledger test_status. Maps pass/fail/skip to tested/failed/skipped."""
     import urllib.request
-    updates = {"status": status, "notes": notes}
-    if status in ("pass", "fail", "skip"):
-        updates["tested_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    status_map = {"pass": "tested", "fail": "failed", "skip": "skipped", "pending": "untested"}
+    bl_status = status_map.get(status, status)
+    updates = {"test_status": bl_status}
+    if notes:
+        updates["notes"] = notes
     try:
         data = json.dumps(updates).encode()
         req = urllib.request.Request(
-            f"{_SUPABASE_URL}/test_queue?id=eq.{item_id}",
+            f"{_SUPABASE_URL}/build_ledger?id=eq.{item_id}",
             data=data,
             headers={
                 "apikey": _SUPABASE_KEY,
@@ -4827,11 +4842,11 @@ def _update_test_item(item_id, status, notes=""):
 
 def _delete_test_item(item_id):
     # type: (str) -> bool
-    """Delete a test_queue item by id."""
+    """Delete a build_ledger item by id."""
     import urllib.request
     try:
         req = urllib.request.Request(
-            f"{_SUPABASE_URL}/test_queue?id=eq.{item_id}",
+            f"{_SUPABASE_URL}/build_ledger?id=eq.{item_id}",
             headers={
                 "apikey": _SUPABASE_KEY,
                 "Authorization": f"Bearer {_SUPABASE_KEY}",

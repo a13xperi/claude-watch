@@ -106,6 +106,10 @@ On first run, claude-watch builds a session index at `~/.claude/logs/session-ind
 
 A file watcher monitors `*.py` files in the project directory. When a source file changes, the TUI auto-restarts (exit code 42 restart loop).
 
+### Auto-Refresh
+
+All non-dashboard views auto-refresh when visible — no manual `r` needed. Each tab refreshes on a throttled interval (10–30s) to keep data fresh without hammering data sources.
+
 ## Panels
 
 ### Token Monitor (header)
@@ -113,6 +117,12 @@ A file watcher monitors `*.py` files in the project directory. When a source fil
 - Current usage percentage and pacing prediction
 - 5h countdown to reset, 7d reset day
 - Active account indicator (A/B/C)
+
+### Cycle Banner (global)
+Compact status bar visible on every tab. Shows:
+- 5h reset countdown and burn % progress bar
+- Active projects and task progress (done/open)
+- Cost estimate for the current cycle
 
 ### Burndown Chart
 ASCII chart tracking 5h window usage over time:
@@ -181,6 +191,9 @@ All Claude-related processes plus infrastructure (node, python, etc.):
 | `Escape` | Clear search |
 | `Enter` / `f` | Focus Warp terminal (Active Sessions) or drill down (Session History) |
 | `t` | Toggle token breakdown (in drill-down view) |
+| `s` | Cycle Monitor (task capture for current 5h window) |
+| `c` | Account Capacity view (A/B/C side by side) |
+| `e` | Export session history to CSV |
 
 ## CLI
 
@@ -197,10 +210,14 @@ python3 claude_watch_tui.py --list
 
 ## Roadmap
 
-- [ ] Nested row expansion in Call History and Session History
-- [ ] Export session history to CSV
+- [x] Export session history to CSV (v0.8)
+- [x] Alert notifications (v0.8)
+- [x] Multi-account capacity view (v0.9)
+- [x] Cycle Monitor (v0.12)
+- [x] Auto-refresh all tabs (v0.13)
+- [ ] Nested row expansion in Session History
 - [ ] Per-session cost estimation
-- [ ] Alert notifications (system notification on spike)
+- [ ] Prompt-level analytics
 
 ## License
 

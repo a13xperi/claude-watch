@@ -4425,11 +4425,11 @@ class TestQueueView(LazyView):
         dt.zebra_stripes = True
         dt.add_column("#",       width=4)
         dt.add_column("Project", width=10)
-        dt.add_column("Title",   width=42)
-        dt.add_column("Src",     width=13)
-        dt.add_column("Route",   width=14)
+        dt.add_column("Title",   width=32)
+        dt.add_column("How to Verify", width=28)
+        dt.add_column("Src",     width=10)
         dt.add_column("Pri",     width=5)
-        dt.add_column("Age",     width=6)
+        dt.add_column("Age",     width=5)
         dt.add_column("St",      width=4)
 
         if not self._items:
@@ -4481,12 +4481,13 @@ class TestQueueView(LazyView):
                 else:
                     src_display = src[:8] if src else "—"
 
+                hint = item.get("test_hint", "") or item.get("route", "") or ""
                 dt.add_row(
                     str(idx),
                     Text(proj, style=proj_style),
-                    Text(item.get("title", "—")[:46]),
+                    Text(item.get("title", "—")[:32]),
+                    Text(hint[:28], style="italic"),
                     Text(src_display, style="dim"),
-                    Text(item.get("route", "—")[:14], style="dim"),
                     Text(pri[:4], style=pri_style),
                     Text(age, style="dim"),
                     st_icon,
