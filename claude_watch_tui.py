@@ -4353,6 +4353,83 @@ class RulesView(LazyView):
             )
 
 
+class TestDetailScreen(Screen):
+    """Detail view for a build_ledger / test queue item."""
+
+    BINDINGS = [
+        Binding("escape", "pop_screen", "Back"),
+        Binding("q", "pop_screen", "Back"),
+        Binding("p", "mark_pass", "Pass"),
+        Binding("f", "mark_fail", "Fail"),
+        Binding("s", "mark_skip", "Skip"),
+    ]
+
+    def __init__(self, item, **kwargs):
+        super().__init__(**kwargs)
+        self._item = item
+
+    def compose(self) -> ComposeResult:
+        yield Static(id="td-content")
+
+    def on_mount(self):
+        item = self._item
+        files = item.get("files") or []
+        files_list = "\n".join(f"    {f}" for f in files) if files else "    (none)"
+        hint = item.get("test_hint", "") or item.get("route", "") or "No instructions"
+        notes = item.get("notes", "") or ""
+        status = item.get("test_status", item.get("status", "untested"))
+
+        status_style = {"untested": "yellow", "tested": "green", "failed": "red", "skipped": "dim",
+                        "pending": "yellow", "pass": "green", "fail": "red", "skip": "dim"}
+        st_color = status_style.get(status, "white")
+
+        body = f"""[bold]{item.get('title', '—')}[/bold]
+
+[dim]{'─' * 60}[/dim]
+
+[bold cyan]How to Verify[/bold cyan]
+    [italic]{hint}[/italic]
+
+[bold cyan]Details[/bold cyan]
+    Project:  [cyan]{item.get('project', '—')}[/cyan]  ({item.get('company', '—')})
+    Type:     {item.get('item_type', '—')}
+    Session:  {item.get('session_id', '—')}
+    Commit:   {item.get('commit_sha', '—')}
+    Source:   {item.get('source', '—')}
+    Created:  {item.get('created_at', '—')}
+    Status:   [{st_color}]{status}[/{st_color}]
+
+[bold cyan]Files Changed[/bold cyan]
+{files_list}
+"""
+        if notes:
+            body += f"""
+[bold cyan]Notes[/bold cyan]
+    {notes}
+"""
+        body += """
+[dim]p=pass  f=fail  s=skip  q/Esc=back[/dim]"""
+
+        self.query_one("#td-content", Static).update(body)
+
+    def _mark(self, status):
+        from claude_watch_data import _update_test_item
+        _update_test_item(self._item["id"], status)
+        self.app.pop_screen()
+
+    def action_mark_pass(self):
+        self._mark("pass")
+
+    def action_mark_fail(self):
+        self._mark("fail")
+
+    def action_mark_skip(self):
+        self._mark("skip")
+
+    def action_pop_screen(self):
+        self.app.pop_screen()
+
+
 class TestQueueView(LazyView):
     """Test Queue — things that need manual verification after shipping."""
 
@@ -4363,6 +4440,7 @@ class TestQueueView(LazyView):
             self._reload_data()
 
     BINDINGS = [
+        Binding("enter", "show_detail", "Detail", show=False),
         Binding("p", "mark_pass", "Pass"),
         Binding("f", "mark_fail", "Fail"),
         Binding("s", "mark_skip", "Skip"),
@@ -4573,6 +4651,17 @@ class TestQueueView(LazyView):
     def action_toggle_all(self):
         self._show_all = not self._show_all
         self._reload_data()
+
+    def action_show_detail(self):
+        """Open detail view for selected test item."""
+        item_id = self._get_selected_id()
+        if not item_id or item_id.startswith("—"):
+            return
+        # Find the item in our list
+        for item in self._items:
+            if str(item.get("id", "")) == item_id:
+                self.app.push_screen(TestDetailScreen(item))
+                return
 
 
 class MissionControlView(LazyView):
