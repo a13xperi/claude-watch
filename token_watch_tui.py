@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-claude-watch TUI — Textual-based interactive dashboard for Claude Code token monitoring.
+Token Watch TUI — Textual-based interactive dashboard for Claude Code token monitoring.
 Scrollable panels, keyboard navigation, no dead space.
 """
 
@@ -23,7 +23,7 @@ from textual.widgets import Button, ContentSwitcher, DataTable, Static
 from rich.panel import Panel
 from rich.table import Table as RichTable
 
-from claude_watch_data import (
+from token_watch_data import (
     make_urgent_panel,
     _abbrev_model,
     _safe_float,
@@ -111,7 +111,7 @@ def _start_hot_reload_watcher(app):
                 result[p] = p.stat().st_mtime
             except Exception:
                 pass
-        tcss = watch_dir / "claude_watch_tui.tcss"
+        tcss = watch_dir / "token_watch_tui.tcss"
         try:
             result[tcss] = tcss.stat().st_mtime
         except Exception:
@@ -127,9 +127,9 @@ def _start_hot_reload_watcher(app):
             app.call_from_thread(app._signal_files_changed)
 
 
-_BACKUP_DIR = Path(f"/tmp/claude-watch-backup-{os.getpid()}")
+_BACKUP_DIR = Path(f"/tmp/Token Watch-backup-{os.getpid()}")
 _SOURCE_DIR = Path(__file__).resolve().parent
-_BACKUP_FILES = ["claude_watch_tui.py", "claude_watch_data.py", "claude_watch.py", "claude_watch_tui.tcss", "claude_watch_advisor.py"]
+_BACKUP_FILES = ["token_watch_tui.py", "token_watch_data.py", "token_watch.py", "token_watch_tui.tcss", "token_watch_advisor.py"]
 
 
 def _backup_working_files():
@@ -178,7 +178,7 @@ def _project_to_company(project: str, company: str = "") -> tuple[str, str]:
         return "KAA", "green"
     if p in ("frank",):
         return "Frank", "magenta"
-    if p in ("openclaw", "paperclip", "claude-watch"):
+    if p in ("openclaw", "paperclip", "Token Watch"):
         return "Personal", "dim"
     return "—", "dim"
 
@@ -206,7 +206,7 @@ class AccountCapacityPanel(Static):
     """Compact side-by-side view of all Claude accounts."""
 
     def update_content(self):
-        from claude_watch_data import _get_all_account_capacities
+        from token_watch_data import _get_all_account_capacities
         accounts = _get_all_account_capacities()
         if not accounts:
             self.update("")
@@ -268,7 +268,7 @@ class ActiveSessionsTable(DataTable):
 
     def refresh_rows(self):
         """Rebuild the table from live session data + Supabase peers."""
-        from claude_watch_data import _detect_source
+        from token_watch_data import _detect_source
 
         sessions = _active_sessions()
         entries = _load_ledger(last_n=500)
@@ -379,7 +379,7 @@ class ActiveSessionsTable(DataTable):
                 project = parts[1] if len(parts) > 1 else parts[0]
             else:
                 d_lower = directive.lower() if directive else ""
-                for p in ("claude-watch", "atlas", "paperclip", "openclaw", "frank"):
+                for p in ("Token Watch", "atlas", "paperclip", "openclaw", "frank"):
                     if p in d_lower:
                         project = p
                         break
@@ -620,7 +620,7 @@ class SkillsPanel(Static):
 
 class AgentsPanel(Static):
     def update_content(self):
-        from claude_watch_data import _get_agent_stats
+        from token_watch_data import _get_agent_stats
         stats = _get_agent_stats(days=7)
         t = RichTable(
             show_header=True, header_style="bold yellow",
@@ -681,7 +681,7 @@ class SessionNarrativePanel(Static):
         # Color map for known projects
         color_map = {
             "atlas": "blue",
-            "claude-watch": "cyan",
+            "Token Watch": "cyan",
             "paperclip": "green",
             "openclaw": "magenta",
             "frank": "magenta",
@@ -859,7 +859,7 @@ class BurndownChart(Static):
         budget_per_10 = (remaining / mins_to_reset * 10) if mins_to_reset > 0 else 0
 
         # Per-Pomodoro block stats
-        from claude_watch_data import _get_current_pomodoro, _get_pomodoro_stats, _get_current_cycle
+        from token_watch_data import _get_current_pomodoro, _get_pomodoro_stats, _get_current_cycle
         pomo_num = _get_current_pomodoro()
         pomo_stats = None
         pomo_strip = ""
@@ -1032,7 +1032,7 @@ class BurndownChart(Static):
         )
 
         # ── Right side: converged Token Monitor info ──
-        from claude_watch_data import (
+        from token_watch_data import (
             _current_pct, _countdown, _reset_day,
             _get_active_account, _token_pacing, _burn_mode,
         )
@@ -1081,7 +1081,7 @@ class BurndownChart(Static):
             burn_title = f"  [bold magenta]BURN {bm}m {bs:02d}s[/bold magenta]"
 
         # Live window score
-        from claude_watch_data import (
+        from token_watch_data import (
             _score_window as _sw, _get_window_scores, _get_streak, _stars_display,
         )
         live_score = _sw(window_start, window_reset)
@@ -1203,7 +1203,7 @@ class SystemHealthPanel(Static):
                 project = source.split("/")[0].lower()
             else:
                 d_lower = directive.lower() if directive else ""
-                for p in ("claude-watch", "atlas", "paperclip", "openclaw", "frank"):
+                for p in ("Token Watch", "atlas", "paperclip", "openclaw", "frank"):
                     if p in d_lower:
                         project = p
                         break
@@ -1711,7 +1711,7 @@ class DailySparklinePanel(Static):
     _SPARKS = " ▁▂▃▄▅▆▇█"
 
     def update_content(self):
-        from claude_watch_data import _get_daily_usage
+        from token_watch_data import _get_daily_usage
         data = _get_daily_usage(days=7)
         if not data:
             self.update(Panel("[dim]No data yet[/dim]", title="7-Day Output Tokens", border_style="cyan"))
@@ -1753,7 +1753,7 @@ class TokenAccessPanel(Static):
     _STATUS_MIXED = "[bold yellow]◐[/bold yellow]"
 
     def update_content(self):
-        from claude_watch_data import _get_paperclip_heartbeats, _get_blocked_attempts
+        from token_watch_data import _get_paperclip_heartbeats, _get_blocked_attempts
 
         try:
             agents = _get_paperclip_heartbeats()
@@ -1842,7 +1842,7 @@ class TokenAccessScreen(Screen):
         self._load()
 
     def _load(self):
-        from claude_watch_data import _get_paperclip_heartbeats, _get_blocked_attempts
+        from token_watch_data import _get_paperclip_heartbeats, _get_blocked_attempts
 
         agents = _get_paperclip_heartbeats()
         blocked = _get_blocked_attempts(minutes=60)
@@ -1941,7 +1941,7 @@ class TokenAccessScreen(Screen):
         )
 
     def on_data_table_row_selected(self, event):
-        from claude_watch_data import _get_paperclip_heartbeats, _toggle_heartbeat
+        from token_watch_data import _get_paperclip_heartbeats, _toggle_heartbeat
 
         table = self.query_one("#taccess-table", DataTable)
         row_idx = event.cursor_row
@@ -1961,8 +1961,8 @@ class TokenAccessScreen(Screen):
             self._load()
 
     def action_refresh(self):
-        import claude_watch_data
-        claude_watch_data._heartbeat_cache = (0.0, [])
+        import token_watch_data
+        token_watch_data._heartbeat_cache = (0.0, [])
         self._load()
 
     def action_pop_screen(self):
@@ -2051,7 +2051,7 @@ class UsageMetricsView(LazyView):
         )
 
         # Window Scores
-        from claude_watch_data import _get_window_scores, _get_streak, _stars_display
+        from token_watch_data import _get_window_scores, _get_streak, _stars_display
         scores = _get_window_scores(limit=10)
         streak = _get_streak(scores)
 
@@ -2126,7 +2126,7 @@ class MCPStatsView(LazyView):
             yield DataTable(id="mcp-actions-table")
 
     def load_content(self):
-        from claude_watch_data import _get_mcp_stats
+        from token_watch_data import _get_mcp_stats
         stats = _get_mcp_stats(days=7)
 
         self.query_one("#mcp-header", Static).update(
@@ -2215,10 +2215,10 @@ class SessionTasksView(LazyView):
         "delphi": ["atlas", "Atlas"],
         "kaa": ["kaa", "KAA"],
         "frank": ["frank", "Frank"],
-        "sage": ["claude-watch", "CW", "openclaw", "OClaw", "paperclip", "Paper", "battlestation"],
+        "sage": ["token-watch", "TW", "openclaw", "OClaw", "paperclip", "Paper", "battlestation"],
     }
     COMPANY_LABELS = {"delphi": "Delphi", "kaa": "KAA", "frank": "Frank", "sage": "SAGE"}
-    PROJECT_LABELS = {"": "None", "atlas": "Atlas", "claude-watch": "CW", "paperclip": "Paper",
+    PROJECT_LABELS = {"": "None", "atlas": "Atlas", "token-watch": "TW", "paperclip": "Paper",
                       "openclaw": "OClaw", "frank": "Frank", "kaa": "KAA"}
 
     BINDINGS = [
@@ -2303,7 +2303,7 @@ class SessionTasksView(LazyView):
         self._reload()
 
     def action_import_cycle_sessions(self):
-        from claude_watch_data import _populate_cycle_from_sessions, _get_current_cycle
+        from token_watch_data import _populate_cycle_from_sessions, _get_current_cycle
         cycle = _get_current_cycle()
         if cycle:
             count = _populate_cycle_from_sessions(cycle_id=cycle["cycle_id"])
@@ -2327,7 +2327,7 @@ class SessionTasksView(LazyView):
             return ""
 
     def _reload(self):
-        from claude_watch_data import (
+        from token_watch_data import (
             _get_cycle_items, _get_recent_cycle_summaries, _get_current_cycle,
             _get_cycle_plan, _get_pomodoro_stats, _get_current_pomodoro,
             _format_cost,
@@ -2495,7 +2495,7 @@ class SessionTasksView(LazyView):
         pomo_text = ""
         pomo_num = _get_current_pomodoro()
         if cycle and pomo_num:
-            from claude_watch_data import _get_cycle_sessions
+            from token_watch_data import _get_cycle_sessions
             blocks = _get_pomodoro_stats(cycle["cycle_id"])
             all_sessions = _get_cycle_sessions(cycle["cycle_id"])
 
@@ -2704,7 +2704,7 @@ class SessionTasksView(LazyView):
 
     def on_input_submitted(self, event):
         from textual.widgets import Input
-        from claude_watch_data import _post_cycle_item, _update_cycle_item
+        from token_watch_data import _post_cycle_item, _update_cycle_item
         inp = self.query_one("#cm-add-input", Input)
         if event.input != inp:
             return
@@ -2718,7 +2718,7 @@ class SessionTasksView(LazyView):
         title = event.value.strip()
         if not title:
             return
-        proj_map = {"delphi": "Atlas", "kaa": "KAA", "frank": "Frank", "sage": "CW"}
+        proj_map = {"delphi": "Atlas", "kaa": "KAA", "frank": "Frank", "sage": "TW"}
         store_proj = proj_map.get(self._project, self._project or "")
         if self._editing_id:
             _update_cycle_item(self._editing_id, {"title": title, "category": self._category, "project": store_proj})
@@ -2803,7 +2803,7 @@ class SessionTasksView(LazyView):
         self.action_edit_item()
 
     def action_toggle_done(self):
-        from claude_watch_data import _update_cycle_item
+        from token_watch_data import _update_cycle_item
         dt = self.query_one("#cm-table", DataTable)
         if dt.cursor_row is None:
             return
@@ -2825,7 +2825,7 @@ class SessionTasksView(LazyView):
         self._reload()
 
     def action_roll_item(self):
-        from claude_watch_data import _update_cycle_item
+        from token_watch_data import _update_cycle_item
         dt = self.query_one("#cm-table", DataTable)
         if dt.cursor_row is None:
             return
@@ -2843,7 +2843,7 @@ class SessionTasksView(LazyView):
         self._reload()
 
     def action_assign_block(self):
-        from claude_watch_data import _assign_item_to_pomodoro
+        from token_watch_data import _assign_item_to_pomodoro
         dt = self.query_one("#cm-table", DataTable)
         if dt.cursor_row is None:
             return
@@ -2867,7 +2867,7 @@ class SessionTasksView(LazyView):
         self.app.push_screen(BlockAssignScreen(item_title, _do_assign))
 
     def action_delete_item(self):
-        from claude_watch_data import _delete_cycle_item
+        from token_watch_data import _delete_cycle_item
         dt = self.query_one("#cm-table", DataTable)
         if dt.cursor_row is None:
             return
@@ -2901,7 +2901,7 @@ class ProjectBoardView(LazyView):
         yield DataTable(id="pboard-table")
 
     def load_content(self):
-        from claude_watch_data import _get_project_tasks
+        from token_watch_data import _get_project_tasks
         tasks = _get_project_tasks()
 
         total = len(tasks)
@@ -3567,7 +3567,7 @@ class LeaderboardView(LazyView):
         yield DataTable(id="lb-table")
 
     def load_content(self):
-        from claude_watch_data import _get_leaderboard, _get_battlestation_config
+        from token_watch_data import _get_leaderboard, _get_battlestation_config
         config = _get_battlestation_config()
         my_id = config.get("user_id", "")
         lb = _get_leaderboard(days=7)
@@ -3645,7 +3645,7 @@ class CyclesView(LazyView):
         now = time.time()
         if not hasattr(self, '_last_refresh') or (now - self._last_refresh) > 15:
             self._last_refresh = now
-            from claude_watch_data import (
+            from token_watch_data import (
                 _get_current_cycle, _get_cycle_sessions,
                 _countdown, _current_pct,
             )
@@ -3670,7 +3670,7 @@ class CyclesView(LazyView):
             sessions = _get_cycle_sessions(current["cycle_id"])
             projects = sorted({s.get("project", "?") for s in sessions if s.get("project")})
             proj_str = ", ".join(projects[:5]) if projects else "\u2014"
-            from claude_watch_data import _get_cycle_plan
+            from token_watch_data import _get_cycle_plan
             plan = _get_cycle_plan(current["cycle_id"])
             plan_str = "[green]plan set[/green]" if plan else "[dim]no plan[/dim]"
             panel.update(
@@ -3683,7 +3683,7 @@ class CyclesView(LazyView):
             )
 
     def load_content(self):
-        from claude_watch_data import (
+        from token_watch_data import (
             _get_current_cycle, _get_all_cycles, _get_cycle_sessions,
             _get_cycle_plan, _countdown, _format_cost, _current_pct,
         )
@@ -3819,7 +3819,7 @@ class CycleDetailScreen(Screen):
         yield Static(id="cdetail-plan")
 
     def on_mount(self):
-        from claude_watch_data import (
+        from token_watch_data import (
             _get_cycle_sessions, _get_cycle_plan, _stars_display,
             _format_cost, _estimate_cost, _countdown,
             _get_pomodoro_stats,
@@ -4129,7 +4129,7 @@ class CyclePlanScreen(Screen):
         self._load_and_render()
 
     def _load_and_render(self):
-        from claude_watch_data import (
+        from token_watch_data import (
             _get_current_cycle, _get_cycle_plan, _save_cycle_plan,
             _get_plannable_tasks, _current_pct, _format_cost,
         )
@@ -4251,7 +4251,7 @@ class CyclePlanScreen(Screen):
                         "", "", "", "", "")
 
     def action_add_task(self):
-        from claude_watch_data import _save_cycle_plan
+        from token_watch_data import _save_cycle_plan
         at = self.query_one("#cplan-available", DataTable)
         if not at.row_count or not hasattr(self, '_available_tasks') or not self._available_tasks:
             return
@@ -4278,7 +4278,7 @@ class CyclePlanScreen(Screen):
         self._load_and_render()
 
     def action_done_task(self):
-        from claude_watch_data import _save_cycle_plan
+        from token_watch_data import _save_cycle_plan
         pt = self.query_one("#cplan-tasks", DataTable)
         tasks = self._plan.get("tasks", [])
         if not pt.row_count or not tasks:
@@ -4294,7 +4294,7 @@ class CyclePlanScreen(Screen):
             return
 
     def action_skip_task(self):
-        from claude_watch_data import _save_cycle_plan
+        from token_watch_data import _save_cycle_plan
         pt = self.query_one("#cplan-tasks", DataTable)
         tasks = self._plan.get("tasks", [])
         if not pt.row_count or not tasks:
@@ -4504,7 +4504,7 @@ class RulesView(LazyView):
         yield DataTable(id="rules-detail")
 
     def load_content(self):
-        from claude_watch_data import _get_rules_summary
+        from token_watch_data import _get_rules_summary
 
         rules, block_events = _get_rules_summary()
 
@@ -4598,7 +4598,7 @@ class RulesView(LazyView):
 
     def on_data_table_row_selected(self, event):
         """When a rule row is selected, filter the detail table to show only that rule's events."""
-        from claude_watch_data import _get_rule_events
+        from token_watch_data import _get_rule_events
 
         row_key = str(event.row_key.value) if hasattr(event.row_key, 'value') else str(event.row_key)
         if not row_key.startswith("rule-"):
@@ -4712,7 +4712,7 @@ class TestDetailScreen(Screen):
         self.query_one("#td-content", Static).update(body)
 
     def _mark(self, status):
-        from claude_watch_data import _update_test_item
+        from token_watch_data import _update_test_item
         _update_test_item(self._item["id"], status)
         self.app.pop_screen()
 
@@ -4851,7 +4851,7 @@ class TestQueueView(LazyView):
                 src_ref = item.get("source_ref", "")
                 if src == "session" and src_ref:
                     # Look up session slug for readable display
-                    from claude_watch_data import _get_session_history
+                    from token_watch_data import _get_session_history
                     slug = ""
                     for _s in _get_session_history():
                         if _s.get("session_id", "").startswith(src_ref[:8]):
@@ -4994,7 +4994,7 @@ class MissionControlView(LazyView):
         yield DataTable(id="mission-table")
 
     def load_content(self):
-        from claude_watch_data import _get_build_ledger
+        from token_watch_data import _get_build_ledger
         cycle_id = getattr(self.app, '_active_cycle_id', None)
         data = _get_build_ledger(days=7, limit=100, cycle_id=cycle_id)
         stats = data["stats"]
@@ -5116,7 +5116,7 @@ class WireView(LazyView):
         yield DataTable(id="wire-table")
 
     def load_content(self):
-        from claude_watch_data import _get_wire_messages
+        from token_watch_data import _get_wire_messages
         cycle_id = getattr(self.app, '_active_cycle_id', None)
         data = _get_wire_messages(limit=50, cycle_id=cycle_id)
 
@@ -5190,7 +5190,7 @@ class AuditView(LazyView):
         self._refresh_audit()
 
     def _refresh_audit(self):
-        from claude_watch_data import _build_full_audit
+        from token_watch_data import _build_full_audit
         audit = _build_full_audit()
         totals = audit["totals"]
 
@@ -5219,7 +5219,7 @@ class AuditView(LazyView):
 
         # Sort projects by session count descending
         for proj, stats in sorted(audit["by_project_global"].items(), key=lambda x: x[1]["sessions"], reverse=True):
-            from claude_watch_data import _format_cost
+            from token_watch_data import _format_cost
             pt.add_row(
                 f"[cyan]{proj}[/cyan]",
                 str(stats["sessions"]),
@@ -5275,7 +5275,7 @@ class AuditView(LazyView):
     def action_export_audit(self):
         import os
         from datetime import datetime
-        from claude_watch_data import export_audit_markdown
+        from token_watch_data import export_audit_markdown
         ts = datetime.now().strftime("%Y%m%d-%H%M%S")
         filepath = os.path.expanduser(f"~/Downloads/cycle-audit-{ts}.md")
         export_audit_markdown(filepath)
@@ -5286,7 +5286,7 @@ class AuditView(LazyView):
         self.notify("Audit refreshed")
 
     def action_import_sessions(self):
-        from claude_watch_data import _populate_cycle_from_sessions
+        from token_watch_data import _populate_cycle_from_sessions
         count = _populate_cycle_from_sessions()  # all cycles
         self._refresh_audit()
         self.notify(f"Imported {count} items from sessions across all cycles")
@@ -5314,7 +5314,7 @@ class AdvisorView(LazyView):
             self._refresh_advisor()
 
     def _refresh_advisor(self):
-        from claude_watch_advisor import run_advisor, SEVERITY_ORDER
+        from token_watch_advisor import run_advisor, SEVERITY_ORDER
         self._last_refresh = time.time()
         report = run_advisor()
 
@@ -5363,10 +5363,10 @@ class AdvisorView(LazyView):
             )
 
     def action_run_advisor(self):
-        from claude_watch_advisor import _advisor_cache_ts
-        import claude_watch_advisor
-        claude_watch_advisor._advisor_cache = None
-        claude_watch_advisor._advisor_cache_ts = 0.0
+        from token_watch_advisor import _advisor_cache_ts
+        import token_watch_advisor
+        token_watch_advisor._advisor_cache = None
+        token_watch_advisor._advisor_cache_ts = 0.0
         self._last_refresh = 0
         self._refresh_advisor()
         self.notify("Advisor refreshed")
@@ -5681,8 +5681,8 @@ class AnalyticsView(LazyView):
 
 
 class ClaudeWatchApp(App):
-    CSS_PATH = "claude_watch_tui.tcss"
-    TITLE = "claude-watch"
+    CSS_PATH = "token_watch_tui.tcss"
+    TITLE = "Token Watch"
 
     BINDINGS = [
         Binding("q", "quit", "Quit"),
@@ -5797,7 +5797,7 @@ class ClaudeWatchApp(App):
         self.set_interval(1.0, self.refresh_data)
         self.refresh_data()
         # Cycle navigation state
-        from claude_watch_data import _get_current_cycle_id, _get_all_cycles
+        from token_watch_data import _get_current_cycle_id, _get_all_cycles
         self._active_cycle_id = _get_current_cycle_id()
         self._cycle_list = []  # populated on first nav
         self._cycle_idx = 0
@@ -5833,7 +5833,7 @@ class ClaudeWatchApp(App):
         project_dir = str(Path(__file__).resolve().parent)
 
         result = subprocess.run(
-            [sys.executable, "-c", "import claude_watch_data; import claude_watch_tui"],
+            [sys.executable, "-c", "import token_watch_data; import token_watch_tui"],
             cwd=project_dir,
             capture_output=True,
             text=True,
@@ -5868,7 +5868,7 @@ class ClaudeWatchApp(App):
         try:
             log_dir = Path.home() / ".claude" / "logs"
             log_dir.mkdir(parents=True, exist_ok=True)
-            log_file = log_dir / "claude-watch-build-errors.log"
+            log_file = log_dir / "Token Watch-build-errors.log"
             from datetime import datetime
             timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             with open(log_file, "a") as f:
@@ -5887,7 +5887,7 @@ class ClaudeWatchApp(App):
 
     def _update_cycle_banner(self):
         """Update the global cycle status banner shown on all tabs."""
-        from claude_watch_data import (
+        from token_watch_data import (
             _get_current_cycle, _get_cycle_sessions,
             _countdown, _current_pct, _get_current_pomodoro,
         )
@@ -5943,7 +5943,7 @@ class ClaudeWatchApp(App):
         if pomo and pomo != getattr(self, "_last_pomo", None):
             self._last_pomo = pomo
             try:
-                from claude_watch_data import _get_next_pomodoro_task
+                from token_watch_data import _get_next_pomodoro_task
                 next_task = _get_next_pomodoro_task()
                 if next_task:
                     task_title = next_task.get("title", "")[:50]
@@ -5952,7 +5952,7 @@ class ClaudeWatchApp(App):
                 pass
 
         sessions = _get_cycle_sessions(current["cycle_id"])
-        from claude_watch_data import _get_cycle_items
+        from token_watch_data import _get_cycle_items
         bd = _get_burndown_data()
         ws = ""
         if bd and bd.get("window_start"):
@@ -6007,7 +6007,7 @@ class ClaudeWatchApp(App):
                 pass
 
         # Auto-score completed windows + cycle rollover (keep unconditional)
-        from claude_watch_data import _check_and_score_completed_window
+        from token_watch_data import _check_and_score_completed_window
         new_score = _check_and_score_completed_window()
         if new_score:
             rolled = new_score.get("rolled", 0)
@@ -6044,7 +6044,7 @@ class ClaudeWatchApp(App):
 
     def action_export_csv(self):
         filename = os.path.expanduser(
-            "~/Downloads/claude-watch-{}.csv".format(
+            "~/Downloads/Token Watch-{}.csv".format(
                 datetime.now().strftime("%Y%m%d-%H%M%S")
             )
         )
@@ -6111,7 +6111,7 @@ class ClaudeWatchApp(App):
         """Load cycle list if not loaded."""
         if not self._cycle_list:
             try:
-                from claude_watch_data import _get_all_cycles
+                from token_watch_data import _get_all_cycles
                 cycles = _get_all_cycles(limit=20)
                 self._cycle_list = [(c["start"], c["end"], c.get("is_current", False)) for c in cycles]
                 # Find current cycle index
@@ -6144,7 +6144,7 @@ class ClaudeWatchApp(App):
         """Toggle between current cycle and all cycles."""
         if self._active_cycle_id is None:
             # Switch back to current
-            from claude_watch_data import _get_current_cycle_id
+            from token_watch_data import _get_current_cycle_id
             self._active_cycle_id = _get_current_cycle_id()
             self._cycle_idx = 0
         else:
@@ -6292,7 +6292,7 @@ def _cli_list_sessions(args):
     _load_index()
     _build_or_update_index()
 
-    from claude_watch_data import _get_session_history
+    from token_watch_data import _get_session_history
     sessions = _get_session_history()[:20]
 
     if not sys.stdout.isatty():
@@ -6313,7 +6313,7 @@ def _cli_list_sessions(args):
         fmt = "{:<10} {:<10} {:<12} {:<8} {:<7} {}"
         print(fmt.format("Session", "Source", "Project", "Dur", "Out", "Directive"))
         print("-" * 80)
-        from claude_watch_data import _build_pid_map
+        from token_watch_data import _build_pid_map
         pid_map = _build_pid_map()
         for s in sessions:
             sid = pid_map.get(s["session_id"], s["session_id"][:10])
@@ -6527,7 +6527,7 @@ def _cli_snapshot():
 def _cli_advisor(args):
     """Run advisor and print insights to terminal."""
     import json as _json
-    from claude_watch_advisor import run_advisor
+    from token_watch_advisor import run_advisor
 
     report = run_advisor(force_refresh=True)
 
@@ -6596,7 +6596,7 @@ def _cli_advisor(args):
 def main():
     import argparse
     import sys
-    parser = argparse.ArgumentParser(description="claude-watch — Claude Code token monitor")
+    parser = argparse.ArgumentParser(description="Token Watch — Claude Code token monitor")
     parser.add_argument("-s", "--session", help="Look up session by CCID or UUID prefix")
     parser.add_argument("-l", "--list", action="store_true", help="List recent sessions")
     parser.add_argument("--context", action="store_true", help="Include resume context (with --session)")

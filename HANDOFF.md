@@ -1,9 +1,14 @@
-# claude-watch Handoff — Pick Up Here
+# token-watch Handoff — Pick Up Here
 
 ## What This Is
-Real-time terminal dashboard for monitoring Claude Code token usage. GitHub: a13xperi/claude-watch
+Real-time terminal dashboard for monitoring Claude Code token usage. GitHub: a13xperi/token-watch
 
-## Current State (v0.15 — Pomodoro System + Audit + Skills)
+## Current State (v0.15+ — Pomodoro System + Audit + Skills + Auto-Roll)
+
+**Burn session additions (2026-04-08 02:00 UTC):**
+- **Auto-roll cycle items at boundaries** (`efc67d8`): `_auto_roll_stale_items()` catches open items from ANY past window (not just previous). Dedup by `(title, project)`, `[rolled]` prefix, idempotent. Rolled 29 stale items across 7 windows on first run. Called from `_check_and_score_completed_window()`.
+- **Build_ledger reseeded**: All 13 entries with `commit_sha` updated to actual git author dates (were using hook-execution time). Fixes Mission Control timeline accuracy.
+- **File-lock hook fixed** (battlestation `hooks/file-lock-check.sh`): Was matching on basename only → false positives when two repos had same-named files. Now uses full relative paths from git root.
 
 **v0.15 features (shipped 2026-04-08):**
 - **Full Pomodoro system**: 10 x 30-min blocks per 5h cycle with real per-block stats
@@ -42,7 +47,7 @@ Real-time terminal dashboard for monitoring Claude Code token usage. GitHub: a13
 2. Session monitor LaunchAgent (Medium)
 3. Better test hints — project-specific verify instructions (Medium)
 4. Smarter lane auto-assignment in Cycle Monitor (Medium)
-5. Re-seed build_ledger with correct git timestamps (Medium)
+5. ~~Re-seed build_ledger with correct git timestamps~~ **Done** (burn session 2026-04-08)
 
 ### Atlas (separate repos):
 - Portal PRs #168, #166 need a11y fix before merge
@@ -53,9 +58,9 @@ Real-time terminal dashboard for monitoring Claude Code token usage. GitHub: a13
 ## Key Files
 | File | Purpose |
 |---|---|
-| claude_watch_data.py | Data layer — Pomodoro stats, cycle items, Paperclip API, audit |
-| claude_watch_tui.py | All Textual UI (~5800 lines) |
-| claude_watch_tui.tcss | Styles |
+| token_watch_data.py | Data layer — Pomodoro stats, cycle items, Paperclip API, audit |
+| token_watch_tui.py | All Textual UI (~5800 lines) |
+| token_watch_tui.tcss | Styles |
 | paperclip_agents.json | UUID → company/agent name mapping |
 
 ## Start Command

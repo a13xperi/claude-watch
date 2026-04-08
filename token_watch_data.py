@@ -1,5 +1,5 @@
 """
-claude-watch data layer — shared by Rich and Textual versions.
+Token Watch data layer — shared by Rich and Textual versions.
 All data fetching, caching, and computation lives here.
 """
 
@@ -21,8 +21,8 @@ from rich.panel import Panel
 from rich.table import Table
 
 (Path.home() / ".claude/logs").mkdir(parents=True, exist_ok=True)
-_log = logging.getLogger("claude_watch")
-_log_handler = logging.FileHandler(Path.home() / ".claude/logs/claude-watch.log")
+_log = logging.getLogger("token_watch")
+_log_handler = logging.FileHandler(Path.home() / ".claude/logs/token-watch.log")
 _log_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
 _log.addHandler(_log_handler)
 _log.setLevel(logging.WARNING)
@@ -866,7 +866,7 @@ def _derive_project(source, project_dir, accomplishments=None):
     for name in ("atlas-backend", "atlas-portal", "atlas"):
         if name in dir_name:
             return "atlas"
-    for name in ("openclaw", "frank-pilot", "paperclip", "claude-watch"):
+    for name in ("openclaw", "frank-pilot", "paperclip", "Token Watch"):
         if name in dir_name:
             return name
 
@@ -875,7 +875,7 @@ def _derive_project(source, project_dir, accomplishments=None):
         all_files = accomplishments.get("files_edited", []) + accomplishments.get("files_created", [])
         for fp in all_files:
             fp_lower = fp.lower()
-            for proj in ("claude-watch", "atlas-portal", "atlas-backend", "openclaw",
+            for proj in ("Token Watch", "atlas-portal", "atlas-backend", "openclaw",
                          "frank-pilot", "paperclip", "adinkra"):
                 if proj in fp_lower:
                     if "atlas" in proj:
@@ -1458,7 +1458,7 @@ def export_session_history_csv(filepath):
                 company = "KAA"
             elif p_lower in ("frank",):
                 company = "Frank"
-            elif p_lower in ("openclaw", "paperclip", "claude-watch"):
+            elif p_lower in ("openclaw", "paperclip", "Token Watch"):
                 company = "Personal"
             else:
                 company = ""
@@ -1517,19 +1517,19 @@ def check_and_notify(five_pct, seven_pct, burn_rate=None):
     if five_pct > 80:
         key = "five_pct_high"
         if now - _last_notified.get(key, 0) >= NOTIFICATION_COOLDOWN:
-            send_system_notification("claude-watch", "5h window at {:.0f}%".format(five_pct))
+            send_system_notification("Token Watch", "5h window at {:.0f}%".format(five_pct))
             _last_notified[key] = now
 
     if seven_pct > 90:
         key = "seven_pct_high"
         if now - _last_notified.get(key, 0) >= NOTIFICATION_COOLDOWN:
-            send_system_notification("claude-watch", "7d window at {:.0f}%".format(seven_pct))
+            send_system_notification("Token Watch", "7d window at {:.0f}%".format(seven_pct))
             _last_notified[key] = now
 
     if burn_rate is not None and burn_rate > 2.0:
         key = "burn_rate_high"
         if now - _last_notified.get(key, 0) >= NOTIFICATION_COOLDOWN:
-            send_system_notification("claude-watch", "High burn rate: {:.1f}%/min".format(burn_rate))
+            send_system_notification("Token Watch", "High burn rate: {:.1f}%/min".format(burn_rate))
             _last_notified[key] = now
 
 
@@ -3081,7 +3081,7 @@ def make_sessions_panel():
         else:
             # Try to infer from directive text
             d_lower = directive.lower() if directive else ""
-            for p in ("claude-watch", "atlas", "paperclip", "openclaw", "frank"):
+            for p in ("Token Watch", "atlas", "paperclip", "openclaw", "frank"):
                 if p in d_lower:
                     project = p
                     break
@@ -3343,7 +3343,7 @@ def _score_window(window_start_ts, window_reset_ts):
     for e in window_entries:
         if e.get("type") == "tool_use":
             d = (e.get("directive") or "").lower()
-            for p in ("atlas", "claude-watch", "paperclip", "openclaw", "frank", "kaa"):
+            for p in ("atlas", "Token Watch", "paperclip", "openclaw", "frank", "kaa"):
                 if p in d:
                     window_projects.add(p)
 

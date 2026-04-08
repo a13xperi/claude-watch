@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-claude-watch — Rich Live version (lightweight fallback).
-For the interactive Textual version, run claude_watch_tui.py.
+Token Watch — Rich Live version (lightweight fallback).
+For the interactive Textual version, run token_watch_tui.py.
 """
 
 import time
@@ -13,7 +13,7 @@ from rich.live import Live
 from rich.panel import Panel
 from rich.table import Table
 
-from claude_watch_data import (
+from token_watch_data import (
     _abbrev_model,
     _compute_tool_feed_rows,
     _current_pct,
@@ -140,7 +140,7 @@ def build_layout(five, seven, five_reset_ts, seven_reset_ts):
 
 def main():
     _ensure_index()
-    console.print("[bold bright_blue]claude-watch[/bold bright_blue] starting... (Ctrl+C to exit)\n")
+    console.print("[bold bright_blue]Token Watch[/bold bright_blue] starting... (Ctrl+C to exit)\n")
     with Live(console=console, refresh_per_second=2, screen=True) as live:
         while True:
             five, seven, five_reset_ts, seven_reset_ts = _current_pct()
@@ -152,4 +152,4 @@ if __name__ == "__main__":
     try:
         main()
     except KeyboardInterrupt:
-        console.print("\n[dim]claude-watch exited.[/dim]")
+        console.print("\n[dim]Token Watch exited.[/dim]")

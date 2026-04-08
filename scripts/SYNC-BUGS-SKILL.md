@@ -65,16 +65,16 @@ export NOTION_TESTS_DB="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
 ## Usage
 ```bash
 # Sync everything
-~/projects/claude-watch/scripts/sync-bugs-to-notion.sh
+~/projects/token-watch/scripts/sync-bugs-to-notion.sh
 
 # Sync only bugs
-~/projects/claude-watch/scripts/sync-bugs-to-notion.sh bugs
+~/projects/token-watch/scripts/sync-bugs-to-notion.sh bugs
 
 # Sync only test cases
-~/projects/claude-watch/scripts/sync-bugs-to-notion.sh test_cases
+~/projects/token-watch/scripts/sync-bugs-to-notion.sh test_cases
 
 # Dry run (shows what would sync without writing)
-~/projects/claude-watch/scripts/sync-bugs-to-notion.sh --dry-run
+~/projects/token-watch/scripts/sync-bugs-to-notion.sh --dry-run
 ```
 
 ## How dedup works
@@ -84,5 +84,5 @@ Each Notion page has a `supabase_id` rich_text property. On sync, the script que
 To run on a schedule, add to cron or use `/schedule` skill:
 ```bash
 # Every 15 minutes
-*/15 * * * * NOTION_TOKEN=xxx NOTION_BUGS_DB=xxx NOTION_TESTS_DB=xxx ~/projects/claude-watch/scripts/sync-bugs-to-notion.sh >> /tmp/notion-sync.log 2>&1
+*/15 * * * * NOTION_TOKEN=xxx NOTION_BUGS_DB=xxx NOTION_TESTS_DB=xxx ~/projects/token-watch/scripts/sync-bugs-to-notion.sh >> /tmp/notion-sync.log 2>&1
 ```

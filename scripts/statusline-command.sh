@@ -1,23 +1,38 @@
 #!/usr/bin/env bash
-# Claude Code status line — responsive stacked layout with per-session directive
+# Battlestation statusline renderer
+# Called by Claude Code with JSON on stdin (rate limits, model, effort)
+# Output: multi-line status for the terminal statusline area
+#
+# Refactored from ~/.claude/statusline-command.sh to use battlestation libs.
+# Rendering logic stays inline — it's display-specific and doesn't belong in libs.
+
+set -o pipefail
+
+# ── Bootstrap libs ──
+BATTLESTATION_HOME="${BATTLESTATION_HOME:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+source "$BATTLESTATION_HOME/lib/config.sh"
+source "$BATTLESTATION_HOME/lib/atomic.sh"
+source "$BATTLESTATION_HOME/lib/supabase.sh"
+source "$BATTLESTATION_HOME/lib/session.sh"
+source "$BATTLESTATION_HOME/lib/log.sh"
+source "$BATTLESTATION_HOME/lanes/accounts.sh"
+
+# ── Read JSON input ──
 input=$(cat)
-echo "$input" > /tmp/statusline-debug.json
+atomic_write /tmp/statusline-debug.json "$input"
 
-# Auto-detect active account from accounts.json
-account="???"
-if [ -f "$HOME/.claude/accounts.json" ]; then
-  _active_label=$(jq -r '.active // "?"' "$HOME/.claude/accounts.json" 2>/dev/null)
-  _active_name=$(jq -r --arg l "$_active_label" '.accounts[] | select(.label == $l) | .name // $l' "$HOME/.claude/accounts.json" 2>/dev/null)
-  [ -n "$_active_name" ] && account="$_active_name"
-fi
+# ── Active account ──
+account=$(bs_active_account)
+_active_label=$(jq -r '.active // "?"' "$HOME/.claude/accounts.json" 2>/dev/null)
 
-# Terminal width detection — tput needs /dev/tty in subshells
+# ── Terminal width ──
 cols=$(stty size </dev/tty 2>/dev/null | awk '{print $2}')
 if [ -z "$cols" ] || [ "$cols" -eq 0 ] 2>/dev/null; then
   cols=$(tput cols 2>/dev/null || echo 80)
 fi
 
-model=$(echo "$input" | jq -r '.model.id // .model // empty' | sed 's/\[.*//;s/\x1b\[[0-9;]*m//g')
+# ── Model detection ──
+model=$(echo "$input" | jq -r '(.model | if type == "object" then .id else . end) // empty' 2>/dev/null | sed 's/\[.*//;s/\x1b\[[0-9;]*m//g')
 if [ -z "$model" ]; then
   model=$(jq -r '.model // "unknown"' ~/.claude/settings.json 2>/dev/null)
 fi
@@ -28,22 +43,20 @@ case "$model" in
   *)        model_short="$model" ;;
 esac
 
+# ── Effort level ──
 effort=$(echo "$input" | jq -r '.effortLevel // empty')
 if [ -z "$effort" ]; then
   effort=$(jq -r '.effortLevel // "medium"' ~/.claude/settings.json 2>/dev/null)
 fi
 
-# Per-session directive — keyed by PPID (= Claude Code process PID)
-# Claude's bash also has this same PPID, so they match
+# ── Per-session directive ──
 directive="—"
 if [ -f "/tmp/claude-directive-$PPID" ]; then
   raw=$(cat "/tmp/claude-directive-$PPID" 2>/dev/null | tr -d '\n')
-  if [ -n "$raw" ]; then
-    directive="$raw"
-  fi
+  [ -n "$raw" ] && directive="$raw"
 fi
 
-# Detect company + project from CC process working directory
+# ── Company + project from CC process cwd ──
 _cwd=$(lsof -a -p $PPID -d cwd -Fn 2>/dev/null | grep '^n' | cut -c2-)
 _project="—"
 _company="—"
@@ -52,7 +65,8 @@ case "$_cwd" in
   */atlas-backend*|*/atlas-be*)  _project="Atlas";       _company="Delphi" ;;
   */paperclip*)                  _project="Paperclip";   _company="Personal" ;;
   */openclaw*)                   _project="OpenClaw";    _company="Personal" ;;
-  */claude-watch*)               _project="claude-watch"; _company="Personal" ;;
+  */token-watch*|*/token-watch*) _project="Token Watch";  _company="Personal" ;;
+  */battlestation*)              _project="Battlestation"; _company="Personal" ;;
   */kaa*)                        _project="KAA";         _company="KAA" ;;
   */frank*)                      _project="Frank";       _company="Frank" ;;
   "$HOME"|"$HOME/")              _project="general";     _company="Personal" ;;
@@ -75,6 +89,7 @@ if [ -f "$BUDGET_FILE" ]; then
   fi
 fi
 
+# ── Rate limits ──
 five_pct=$(echo "$input" | jq -r '.rate_limits.five_hour.used_percentage // empty')
 week_pct=$(echo "$input" | jq -r '.rate_limits.seven_day.used_percentage // empty')
 five_reset=$(echo "$input" | jq -r '.rate_limits.five_hour.resets_at // empty')
@@ -96,14 +111,17 @@ if [ -n "$_b_start" ] && [ -n "$five_pct" ]; then
   budget_line="${_b_icon} ${_b_delta_int}/${_hard_stop}% budget"
 fi
 
+# ── Helpers ──
+
 format_countdown() {
   local reset_ts="$1"
   if [ -z "$reset_ts" ]; then echo "--"; return; fi
-  local now=$(date +%s)
-  local diff=$((reset_ts - now))
+  local now diff hours mins
+  now=$(date +%s)
+  diff=$((reset_ts - now))
   if [ "$diff" -le 0 ]; then echo "now"; return; fi
-  local hours=$((diff / 3600))
-  local mins=$(( (diff % 3600) / 60 ))
+  hours=$((diff / 3600))
+  mins=$(( (diff % 3600) / 60 ))
   if [ "$hours" -gt 0 ]; then
     printf '%dh%02dm' "$hours" "$mins"
   else
@@ -120,6 +138,8 @@ make_bar() {
   [ "$rem" -gt 0 ] && empty=$(printf '▱%.0s' $(seq 1 $rem))
   echo "${filled}${empty}"
 }
+
+# ── Format session + weekly bars ──
 
 if [ -n "$five_pct" ]; then
   session_pct=$(printf '%.0f' "$five_pct")
@@ -141,15 +161,6 @@ else
   w_bar="▱▱▱▱▱▱▱▱▱▱"
 fi
 
-# === Responsive layout ===
-# Claude Code's statusline renderer clips to fewer visible lines at narrow widths.
-# Strategy: at narrow widths, pack more info onto fewer lines (front-load what matters).
-#
-# Tier 1 (45+): 4 lines — header | directive | S pct ⟳reset bar | W pct ⟳reset bar
-# Tier 2 (35-44): 3 lines — header + S/W rates on one line | directive | bars on one line
-# Tier 3 (<35):  2 lines — header S⟳reset W⟳reset | ▶ directive
-
-# Truncate directive to fit available width
 trunc_directive() {
   local max=$1
   if [ "$max" -gt 0 ] && [ "${#directive}" -gt "$max" ]; then
@@ -161,7 +172,7 @@ trunc_directive() {
 s_left="S ${session_pct}% ⟳${session_reset}"
 w_left="W ${weekly_pct}% ⟳${weekly_reset}"
 
-# Pad shorter line with spaces so bars align
+# Pad shorter line so bars align
 s_len=${#s_left}
 w_len=${#w_left}
 if [ "$s_len" -gt "$w_len" ]; then
@@ -182,7 +193,7 @@ else
   w_line="$w_left"
 fi
 
-# === 70% weekly usage alert ===
+# ── 70% weekly usage alert ──
 alert_line=""
 if [ -n "$week_pct" ]; then
   week_int=$(printf '%.0f' "$week_pct")
@@ -196,13 +207,18 @@ if [ -n "$week_pct" ]; then
   fi
 fi
 
-# === Output core lines immediately (no network delay) ===
-trunc_directive $((cols - 4))
+# ── Output core lines immediately (no network delay) ──
 
-# Directive gets its own line (only when set)
-directive_line=""
-if [ "$directive" != "—" ]; then
+# Wide terminals (≥45 cols): directive gets its own line
+# Narrow terminals (<45 cols): directive folds into header line
+if [ "$cols" -ge 45 ] && [ "$directive" != "—" ]; then
+  trunc_directive $((cols - 4))
   directive_line=$(printf "\n▸ %s" "$directive")
+elif [ "$directive" != "—" ]; then
+  trunc_directive $((cols - ${#account} - ${#model_short} - ${#effort} - 6))
+  directive_line=$(printf " | %s" "$directive")
+else
+  directive_line=""
 fi
 
 if [ -n "$budget_line" ]; then
@@ -226,8 +242,8 @@ if [ -n "$alert_line" ]; then
   printf "\n⚠ %s" "$alert_line"
 fi
 
-# ── Peer sessions — read cached data, refresh in background ──
-my_session="cc-${PPID}"
+# ── Peer sessions — read cached data ──
+my_session=$(bs_session_id)
 
 if [ -f /tmp/claude-peers.json ]; then
   peer_count=$(jq -r 'length' /tmp/claude-peers.json 2>/dev/null || echo "0")
@@ -244,24 +260,17 @@ if [ -f /tmp/claude-peers.json ]; then
   fi
 fi
 
-# ── Background: refresh peer cache + expire stale sessions for next render ──
-SUPA_URL="https://zoirudjyqfqvpxsrxepr.supabase.co"
-SUPA_KEY="eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InpvaXJ1ZGp5cWZxdnB4c3J4ZXByIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjgwMzE4MjgsImV4cCI6MjA4MzYwNzgyOH0.6W6OzRfJ-nmKN_23z1OBCS4Cr-ODRq9DJmF_yMwOCfo"
+# ── Background: write capacity to Supabase, refresh peer cache, expire stale sessions ──
 
-# Write capacity snapshot to Supabase for active account (background, throttled)
+# Write capacity snapshot (throttled to once per 60s)
 NOW_S=$(date +%s)
 CAP_FLAG="/tmp/claude-capacity-write"
 CAP_LAST=$(cat "$CAP_FLAG" 2>/dev/null || echo "0")
 if [ -n "$five_pct" ] && [ -n "$week_pct" ] && [ -n "$_active_label" ] && [ "$_active_label" != "?" ]; then
   if [ $((NOW_S - CAP_LAST)) -gt 60 ]; then
-    echo "$NOW_S" > "$CAP_FLAG"
-    curl -s --max-time 2 -X PATCH \
-      "${SUPA_URL}/rest/v1/account_capacity?account=eq.${_active_label}" \
-      -H "apikey: ${SUPA_KEY}" \
-      -H "Authorization: Bearer ${SUPA_KEY}" \
-      -H "Content-Type: application/json" \
-      -H "Prefer: return=minimal" \
-      -d "{
+    atomic_write "$CAP_FLAG" "$NOW_S"
+    supa_patch "account_capacity" "account=eq.${_active_label}" \
+      "{
         \"five_hour_used_pct\": ${five_pct},
         \"five_hour_resets_at\": ${five_reset:-0},
         \"seven_day_used_pct\": ${week_pct},
@@ -272,23 +281,26 @@ if [ -n "$five_pct" ] && [ -n "$week_pct" ] && [ -n "$_active_label" ] && [ "$_a
   fi
 fi
 
-# Refresh peer cache in background — atomic write to avoid corruption from concurrent renders
-(curl -s --max-time 3 "${SUPA_URL}/rest/v1/session_locks?status=eq.active&select=session_id,task_name,repo,heartbeat_at,files_touched&order=claimed_at.desc" \
-  -H "apikey: ${SUPA_KEY}" \
-  -H "Authorization: Bearer ${SUPA_KEY}" > /tmp/claude-peers-$$.tmp 2>/dev/null \
-  && mv -f /tmp/claude-peers-$$.tmp /tmp/claude-peers.json 2>/dev/null \
-  || rm -f /tmp/claude-peers-$$.tmp) &
+# Refresh peer cache in background (atomic write to avoid corruption)
+(atomic_write_cmd /tmp/claude-peers.json \
+  curl -s --max-time 3 \
+    "${SUPA_URL}/rest/v1/session_locks?status=eq.active&select=session_id,task_name,repo,heartbeat_at,files_touched&order=claimed_at.desc" \
+    -H "apikey: ${SUPA_KEY}" \
+    -H "Authorization: Bearer ${SUPA_KEY}") &
 
-# Auto-expire stale sessions in background (once per minute max)
+# Auto-expire stale sessions (once per minute)
 EXPIRY_FLAG="/tmp/claude-expiry-check"
-NOW_S=$(date +%s)
 LAST_EXPIRY=$(cat "$EXPIRY_FLAG" 2>/dev/null || echo "0")
 if [ $((NOW_S - LAST_EXPIRY)) -gt 60 ]; then
-  echo "$NOW_S" > "$EXPIRY_FLAG"
-  curl -s --max-time 2 -X PATCH "${SUPA_URL}/rest/v1/session_locks?status=eq.active&heartbeat_at=lt.$(date -u -v-30M +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -d '30 minutes ago' +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)" \
-    -H "apikey: ${SUPA_KEY}" \
-    -H "Authorization: Bearer ${SUPA_KEY}" \
-    -H "Content-Type: application/json" \
-    -H "Prefer: return=minimal" \
-    -d '{"status":"done","released_at":"'"$(date -u +%Y-%m-%dT%H:%M:%SZ)"'"}' &>/dev/null &
+  atomic_write "$EXPIRY_FLAG" "$NOW_S"
+  # macOS date -v vs GNU date -d
+  thirty_min_ago=$(date -u -v-30M +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -d '30 minutes ago' +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)
+  supa_patch "session_locks" \
+    "status=eq.active&heartbeat_at=lt.${thirty_min_ago}" \
+    '{"status":"done","released_at":"'"$(date -u +%Y-%m-%dT%H:%M:%SZ)"'"}' &>/dev/null &
 fi
+
+# Compute best alt account and cache for alert line (background)
+(source "$BATTLESTATION_HOME/lanes/accounts.sh" 2>/dev/null
+ best=$(bs_best_alt_account 2>/dev/null)
+ [ -n "$best" ] && atomic_write /tmp/claude-best-alt-account "$best") &

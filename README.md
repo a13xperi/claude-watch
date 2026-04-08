@@ -1,4 +1,4 @@
-# claude-watch
+# token-watch
 
 Real-time terminal dashboard for monitoring Claude Code token usage, session activity, and burn rate.
 
@@ -57,14 +57,14 @@ Copy `hooks/token-tracker.sh` to `~/.claude/hooks/` and register it in `~/.claud
 ### 3. Run
 
 ```bash
-python3 claude_watch_tui.py
+python3 token_watch_tui.py
 ```
 
 Or symlink it:
 
 ```bash
-ln -s $(pwd)/claude_watch_tui.py ~/bin/claude-watch
-chmod +x claude_watch_tui.py
+ln -s $(pwd)/token_watch_tui.py ~/bin/token-watch
+chmod +x token_watch_tui.py
 ```
 
 ## How it works
@@ -80,7 +80,7 @@ PreToolUse hook fires --> token-tracker.sh
     |                    ~/.claude/logs/token-ledger.jsonl     (global)
     |
     v
-claude-watch reads:
+token-watch reads:
     - token-ledger.jsonl              (tool calls, drain events)
     - /tmp/statusline-debug.json      (current rate limits)
     - /tmp/claude-directive-{PID}     (session directives)
@@ -93,14 +93,14 @@ claude-watch reads:
 
 | File | Role |
 |---|---|
-| `claude_watch_tui.py` | Main entry point -- Textual TUI app |
-| `claude_watch_data.py` | Data layer -- parsing, indexing, aggregation |
-| `claude_watch_tui.tcss` | Textual CSS styles |
-| `claude_watch.py` | Legacy Rich-only version (still works, superseded by TUI) |
+| `token_watch_tui.py` | Main entry point -- Textual TUI app |
+| `token_watch_data.py` | Data layer -- parsing, indexing, aggregation |
+| `token_watch_tui.tcss` | Textual CSS styles |
+| `token_watch.py` | Legacy Rich-only version (still works, superseded by TUI) |
 
 ### Session Index
 
-On first run, claude-watch builds a session index at `~/.claude/logs/session-index.jsonl` by scanning all transcript files. Subsequent runs only parse new/modified files. This makes the all-time session history panel fast even with hundreds of transcripts.
+On first run, token-watch builds a session index at `~/.claude/logs/session-index.jsonl` by scanning all transcript files. Subsequent runs only parse new/modified files. This makes the all-time session history panel fast even with hundreds of transcripts.
 
 ### Hot Reload
 
@@ -199,13 +199,13 @@ All Claude-related processes plus infrastructure (node, python, etc.):
 
 ```bash
 # Launch the TUI
-python3 claude_watch_tui.py
+python3 token_watch_tui.py
 
 # Resume context packet for a specific session
-python3 claude_watch_tui.py --session <PID> --context
+python3 token_watch_tui.py --session <PID> --context
 
 # List recent sessions (table/JSON)
-python3 claude_watch_tui.py --list
+python3 token_watch_tui.py --list
 ```
 
 ## Roadmap

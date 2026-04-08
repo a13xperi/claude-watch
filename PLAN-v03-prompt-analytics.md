@@ -1,4 +1,4 @@
-# claude-watch v0.3: Prompt-Level Analytics
+# token-watch v0.3: Prompt-Level Analytics
 
 ## Context
 
