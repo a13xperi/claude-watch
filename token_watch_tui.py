@@ -473,8 +473,11 @@ class EngineTable(DataTable):
                 state_txt = Text("thinking...", style="bold yellow")
             elif secs_since is not None and secs_since < 120:
                 state_txt = Text(f"~ {tool_name[:12]}", style="dim")
+            elif secs_since is not None:
+                idle_m = secs_since // 60
+                state_txt = Text(f"· {idle_m}m", style="dim")
             else:
-                state_txt = Text("idle", style="dim")
+                state_txt = Text("· ?", style="dim")
 
             # Memory gauge
             mem_text = Text.from_markup(_mem_mini_gauge(mem_mb)) if mem_mb > 0 else Text("—", style="dim")
