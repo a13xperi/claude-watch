@@ -115,7 +115,8 @@ def _countdown(reset_ts):
         m = rem // 60
         local_time = reset.astimezone().strftime("%-I:%M %p")
         return f"{h}h{m:02d}m (at {local_time})"
-    except Exception:
+    except Exception as e:
+        _log.debug("__countdown: %s", e)
         return "?"
 
 
@@ -125,7 +126,8 @@ def _reset_day(reset_ts):
     try:
         dt = datetime.fromisoformat(reset_ts.replace("Z", "+00:00")).astimezone()
         return dt.strftime(f"%a %b {dt.day} %-I:%M %p")
-    except Exception:
+    except Exception as e:
+        _log.debug("__reset_day: %s", e)
         return "?"
 
 
@@ -150,7 +152,8 @@ def _budget():
     try:
         if BUDGET_FILE.exists():
             return json.loads(BUDGET_FILE.read_text()).get("per_session_pct", 15)
-    except Exception:
+    except Exception as e:
+        _log.debug("__budget: %s", e)
         pass
     return 15
 
@@ -172,7 +175,8 @@ def _active_sessions():
                 directive = ""
                 try:
                     directive = Path(f"/tmp/claude-directive-{pid}").read_text().strip()
-                except Exception:
+                except Exception as e:
+                    _log.debug("__active_sessions: %s", e)
                     pass
                 delta = "?"
                 try:
@@ -190,11 +194,13 @@ def _active_sessions():
                         delta = "new"
                     else:
                         delta = f"+{raw_delta}%"
-                except Exception:
+                except Exception as e:
+                    _log.debug("__active_sessions: %s", e)
                     pass
                 source = _detect_source(pid)
                 sessions.append((pid, etime, directive or "—", delta, source))
-    except Exception:
+    except Exception as e:
+        _log.debug("__active_sessions: %s", e)
         pass
     # Sort newest first (shortest etime = most recently spawned)
     sessions.sort(key=lambda s: _etime_to_secs(s[1]) or 0)
@@ -245,7 +251,8 @@ def _get_peer_sessions():
             rows = _json.loads(resp.read())
         _peer_cache = (now, rows)
         return rows
-    except Exception:
+    except Exception as e:
+        _log.warning("__get_peer_sessions: %s", e)
         # On error, return stale cache if available, else empty
         if _peer_cache is not None:
             return _peer_cache[1]
@@ -282,7 +289,8 @@ def _get_conversation_title(pid):
             try:
                 for f in Path(pd).glob("*.jsonl"):
                     candidates.append((f.stat().st_mtime, f))
-            except Exception:
+            except Exception as e:
+                _log.warning("__get_conversation_title: %s", e)
                 continue
         candidates.sort(key=lambda x: x[0], reverse=True)
         for _, fpath in candidates[:10]:  # check 10 most recent
@@ -301,7 +309,8 @@ def _get_conversation_title(pid):
                         entry = idx.get(file_sid)
                         if entry and entry.get("ccid") == ccid:
                             return title
-            except Exception:
+            except Exception as e:
+                _log.warning("__get_conversation_title: %s", e)
                 continue
         # Last resort: check the very recent files without ccid verification
         for _, fpath in candidates[:5]:
@@ -317,7 +326,8 @@ def _get_conversation_title(pid):
                             # Can't confirm PID match, but it's a recent unindexed session
                             # Return it only if we have just one active unindexed session
                             return title
-            except Exception:
+            except Exception as e:
+                _log.warning("__get_conversation_title: %s", e)
                 continue
         return None
 
@@ -344,9 +354,11 @@ def _extract_first_user_message(fpath):
                             for block in content:
                                 if isinstance(block, dict) and block.get("type") == "text":
                                     return block["text"].split("\n")[0].strip()[:80]
-                except Exception:
+                except Exception as e:
+                    _log.debug("__extract_first_user_message: %s", e)
                     continue
-    except Exception:
+    except Exception as e:
+        _log.debug("__extract_first_user_message: %s", e)
         pass
     return None
 
@@ -374,7 +386,8 @@ def _raise_warp_window(search_text):
             timeout=3, capture_output=True, text=True,
         )
         return "found" in r.stdout
-    except Exception:
+    except Exception as e:
+        _log.debug("__raise_warp_window: %s", e)
         return False
 
 
@@ -396,7 +409,8 @@ def focus_session_terminal(pid):
     directive = ""
     try:
         directive = Path(f"/tmp/claude-directive-{pid}").read_text().strip()
-    except Exception:
+    except Exception as e:
+        _log.debug("_focus_session_terminal: %s", e)
         pass
     if directive and directive != "\u2014" and _raise_warp_window(directive):
         return True
@@ -407,7 +421,8 @@ def focus_session_terminal(pid):
             ["osascript", "-e", 'tell application "Warp" to activate'],
             timeout=3, capture_output=True,
         )
-    except Exception:
+    except Exception as e:
+        _log.debug("_focus_session_terminal: %s", e)
         pass
     return False
 
@@ -428,7 +443,8 @@ def _session_last_activity(session_id):
                 elif tool.startswith("mcp__"):
                     tool = "mcp:" + tool[5:]
                 return secs, tool
-            except Exception:
+            except Exception as e:
+                _log.debug("__session_last_activity: %s", e)
                 pass
     return None, None
 
@@ -459,7 +475,8 @@ def _detect_source(pid):
         if any(sh in parent_cmd for sh in ('zsh', 'bash', 'fish', 'sh ')):
             return 'cli'
         return 'cli'
-    except Exception:
+    except Exception as e:
+        _log.debug("__detect_source: %s", e)
         return '?'
 
 
@@ -511,7 +528,8 @@ def _interpolate_five_pct(target_ts):
             diff = abs((ts - target_ts).total_seconds())
             if diff < best_diff:
                 best_diff, best = diff, pct
-        except Exception:
+        except Exception as e:
+            _log.debug("__interpolate_five_pct: %s", e)
             pass
     return best
 
@@ -609,7 +627,8 @@ def _extract_accomplishments_from_file(f):
                     continue
                 try:
                     obj = json.loads(line)
-                except Exception:
+                except Exception as e:
+                    _log.debug("__extract_accomplishments_from_file: %s", e)
                     continue
 
                 t = obj.get("type", "")
@@ -713,7 +732,8 @@ def _extract_accomplishments_from_file(f):
                                 if isinstance(c, dict) and c.get("is_error"):
                                     acc["errors"] += 1
 
-    except Exception:
+    except Exception as e:
+        _log.debug("__extract_accomplishments_from_file: %s", e)
         pass
 
     return acc
@@ -902,7 +922,8 @@ def _resolve_ccid_for_session(session_id, first_ts, last_ts):
             continue
         try:
             ts = datetime.fromisoformat(e["ts"].replace("Z", "+00:00"))
-        except Exception:
+        except Exception as e:
+            _log.debug("__resolve_ccid_for_session: %s", e)
             continue
         if sid not in pid_ranges:
             pid_ranges[sid] = (ts, ts)
@@ -1053,7 +1074,8 @@ def _parse_transcript(f):
                         if first_ts is None:
                             first_ts = ts
                         last_ts = ts
-                    except Exception:
+                    except Exception as e:
+                        _log.debug("__parse_transcript: %s", e)
                         pass
 
                 if t == "assistant":
@@ -1152,7 +1174,8 @@ def _parse_transcript(f):
                     if lp:
                         last_prompt = lp
 
-    except Exception:
+    except Exception as e:
+        _log.debug("__parse_transcript: %s", e)
         return None
     if first_ts is None:
         return None
@@ -1242,7 +1265,8 @@ def _build_or_update_index():
                             ccid = _resolve_ccid_for_session(sid, ft, lt)
                             if ccid:
                                 result["ccid"] = ccid
-                        except Exception:
+                        except Exception as e:
+                            _log.debug("__build_or_update_index: %s", e)
                             pass
                     new_entries.append(result)
                     known[sid] = result
@@ -1259,7 +1283,8 @@ def _build_or_update_index():
                     for entry in known.values():
                         fh.write(json.dumps(entry) + "\n")
                 os.replace(tmp_path, str(SESSION_INDEX))
-            except Exception:
+            except Exception as e:
+                _log.debug("__build_or_update_index: %s", e)
                 try:
                     os.unlink(tmp_path)
                 except OSError:
@@ -1303,7 +1328,8 @@ def _get_session_history():
         try:
             first_ts = datetime.fromisoformat(entry["first_ts"])
             last_ts = datetime.fromisoformat(entry["last_ts"])
-        except Exception:
+        except Exception as e:
+            _log.debug("__get_session_history: %s", e)
             continue
 
         session_date = last_ts.astimezone().date()
@@ -1326,7 +1352,8 @@ def _get_session_history():
                         pct_str = "↻win"  # 5h window reset during session
                     else:
                         pct_str = f"+{d_pct}%" if d_pct >= 0 else f"{d_pct}%"
-                except Exception:
+                except Exception as e:
+                    _log.debug("__get_session_history: %s", e)
                     pass
 
         sessions.append({
@@ -1446,7 +1473,8 @@ def export_session_history_csv(filepath):
                     duration_min = round(secs / 60.0, 1)
                 else:
                     duration_min = ""
-            except Exception:
+            except Exception as e:
+                _log.debug("_export_session_history_csv: %s", e)
                 duration_min = ""
 
             # Derive company from project
@@ -1505,7 +1533,8 @@ def send_system_notification(title, body):
              'display notification "' + escaped_body + '" with title "' + escaped_title + '"'],
             timeout=3, capture_output=True,
         )
-    except Exception:
+    except Exception as e:
+        _log.debug("_send_system_notification: %s", e)
         pass
 
 
@@ -1554,7 +1583,8 @@ def _get_session_turns(session_id):
                     continue
                 try:
                     obj = json.loads(line)
-                except Exception:
+                except Exception as e:
+                    _log.debug("__get_session_turns: %s", e)
                     continue
 
                 t = obj.get("type", "")
@@ -1602,10 +1632,74 @@ def _get_session_turns(session_id):
                         "prompt": last_prompt or "—",
                     })
 
-    except Exception:
+    except Exception as e:
+        _log.debug("__get_session_turns: %s", e)
         pass
 
     return turns
+
+def _get_expensive_turns(limit=20, days=3):
+    # type: (int, int) -> List[Dict[str, Any]]
+    """Top N costliest individual turns across all recent sessions.
+    Returns list of dicts sorted by tokens_out descending.
+    """
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+    index = _load_index()
+
+    all_turns = []  # type: List[Dict[str, Any]]
+    for entry in index:
+        try:
+            ts = datetime.fromisoformat(entry["last_ts"].replace("Z", "+00:00"))
+            if ts < cutoff:
+                continue
+        except Exception:
+            continue
+
+        sid = entry.get("session_id", "")
+        turns = _get_session_turns(sid)
+        for t in turns:
+            t["session_id"] = sid
+            t["session_short"] = sid[:10]
+            all_turns.append(t)
+
+    # Sort by output tokens descending
+    all_turns.sort(key=lambda x: x.get("tokens_out", 0), reverse=True)
+    return all_turns[:limit]
+
+
+def _model_cost_stats(days=3):
+    # type: (int) -> Dict[str, Dict[str, Any]]
+    """Aggregate cost stats by model across recent sessions.
+    Returns dict keyed by model name with turns, avg_tokens, total_tokens, avg_pct.
+    """
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+    index = _load_index()
+
+    by_model = {}  # type: Dict[str, Dict[str, Any]]
+    for entry in index:
+        try:
+            ts = datetime.fromisoformat(entry["last_ts"].replace("Z", "+00:00"))
+            if ts < cutoff:
+                continue
+        except Exception:
+            continue
+
+        sid = entry.get("session_id", "")
+        turns = _get_session_turns(sid)
+        for t in turns:
+            mdl = t.get("model", "?")
+            if mdl not in by_model:
+                by_model[mdl] = {"turns": 0, "total_out": 0, "total_pct": 0.0}
+            by_model[mdl]["turns"] += 1
+            by_model[mdl]["total_out"] += t.get("tokens_out", 0)
+            by_model[mdl]["total_pct"] += t.get("pct_est", 0.0)
+
+    for mdl, stats in by_model.items():
+        n = stats["turns"]
+        stats["avg_tokens"] = stats["total_out"] // n if n else 0
+        stats["avg_pct"] = round(stats["total_pct"] / n, 3) if n else 0
+
+    return by_model
 
 
 # ── usage metrics ────────────────────────────────────────────────────────────
@@ -1628,7 +1722,8 @@ def _get_usage_metrics(days=7):
             last_ts = datetime.fromisoformat(entry["last_ts"])
             if last_ts.tzinfo is None:
                 last_ts = last_ts.replace(tzinfo=timezone.utc)
-        except Exception:
+        except Exception as e:
+            _log.debug("__get_usage_metrics: %s", e)
             continue
         if last_ts < cutoff:
             continue
@@ -1664,7 +1759,8 @@ def _safe_date(ts_str):
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
         return dt.astimezone().date()
-    except Exception:
+    except Exception as e:
+        _log.debug("__safe_date: %s", e)
         return None
 
 
@@ -1713,7 +1809,8 @@ def _get_mcp_stats(days=7):
             ts = datetime.fromisoformat(e["ts"].replace("Z", "+00:00"))
             if ts < cutoff:
                 continue
-        except Exception:
+        except Exception as e:
+            _log.debug("__get_mcp_stats: %s", e)
             continue
         parsed = _parse_mcp_tool(tool)
         if not parsed:
@@ -1732,7 +1829,8 @@ def _get_mcp_stats(days=7):
                 last_ts = last_ts.replace(tzinfo=timezone.utc)
             if last_ts < cutoff:
                 continue
-        except Exception:
+        except Exception as e:
+            _log.debug("__get_mcp_stats: %s", e)
             continue
         if entry.get("accomplishments", {}).get("mcp_ops"):
             sessions_with_mcp += 1
@@ -1780,7 +1878,8 @@ def _get_skill_stats():
                 skill_last[name] = datetime.fromisoformat(
                     ts.replace("Z", "+00:00")
                 ).astimezone().strftime("%H:%M:%S")
-            except Exception:
+            except Exception as e:
+                _log.debug("__get_skill_stats: %s", e)
                 skill_last[name] = "?"
     result = []
     for name, count in sorted(skill_counts.items(), key=lambda x: x[1], reverse=True):
@@ -1809,7 +1908,8 @@ def _get_agent_stats(days=7):
             if last_ts < cutoff:
                 continue
             time_str = last_ts.astimezone().strftime("%m/%d")
-        except Exception:
+        except Exception as e:
+            _log.debug("__get_agent_stats: %s", e)
             continue
         acc = entry.get("accomplishments", {})
         for item in acc.get("bash_notable", []):
@@ -1866,7 +1966,8 @@ def _build_pid_map():
             continue
         try:
             ts = datetime.fromisoformat(e["ts"].replace("Z", "+00:00"))
-        except Exception:
+        except Exception as e:
+            _log.debug("__build_pid_map: %s", e)
             continue
         if sid not in pid_ranges:
             pid_ranges[sid] = (ts, ts)
@@ -1888,7 +1989,8 @@ def _build_pid_map():
                 t_first = t_first.replace(tzinfo=timezone.utc)
             if t_last.tzinfo is None:
                 t_last = t_last.replace(tzinfo=timezone.utc)
-        except Exception:
+        except Exception as e:
+            _log.debug("__build_pid_map: %s", e)
             continue
 
         best_pid = None
@@ -1966,7 +2068,8 @@ def _get_call_history():
                 pct_str = "↻win"
             else:
                 pct_str = f"+{delta:.1f}%" if delta >= 0 else f"{delta:.1f}%"
-        except Exception:
+        except Exception as e:
+            _log.debug("__get_call_history: %s", e)
             pct_str = "?"
 
         # When (last activity)
@@ -1974,7 +2077,8 @@ def _get_call_history():
             last = datetime.fromisoformat(s["last_ts"].replace("Z", "+00:00"))
             when_str = last.astimezone().strftime("%H:%M:%S")
             when_date = last.astimezone().date()
-        except Exception:
+        except Exception as e:
+            _log.debug("__get_call_history: %s", e)
             when_str = "?"
             when_date = None
 
@@ -2080,7 +2184,8 @@ def _compute_tool_feed_rows(last_n=200):
         ts = e.get("ts", "")
         try:
             ts_str = datetime.fromisoformat(ts.replace("Z", "+00:00")).astimezone().strftime("%H:%M:%S")
-        except Exception:
+        except Exception as e:
+            _log.debug("__compute_tool_feed_rows: %s", e)
             ts_str = ts[-8:] if ts else "?"
 
         session = e.get("session", "?")
@@ -2099,7 +2204,8 @@ def _compute_tool_feed_rows(last_n=200):
                 diff = _safe_float(cur_pct) - _safe_float(prev)
                 if diff > 0:
                     tick = diff
-            except Exception:
+            except Exception as e:
+                _log.debug("__compute_tool_feed_rows: %s", e)
                 pass
         if cur_pct is not None:
             prev_pct[session] = cur_pct
@@ -2112,7 +2218,8 @@ def _compute_tool_feed_rows(last_n=200):
                 c = _safe_float(cumulative)
                 delta_str = f"+{c:.1f}%" if c > 0 else "—"
                 delta_style = "dim"
-            except Exception:
+            except Exception as e:
+                _log.debug("__compute_tool_feed_rows: %s", e)
                 delta_str = "—"
                 delta_style = "dim"
         else:
@@ -2146,7 +2253,8 @@ def _drain_status(drain_events):
         delta = _safe_float(last.get("delta_5h", 0))
         burn = _safe_float(last.get("burn_rate_per_min", 0))
         sessions = int(last.get("cli_sessions", 0))
-    except Exception:
+    except Exception as e:
+        _log.debug("__drain_status: %s", e)
         return "dim", "● Status unknown"
 
     if delta > 3:
@@ -2185,7 +2293,8 @@ def _get_burndown_data():
         mins_elapsed = max(0, (now_utc - window_start).total_seconds() / 60)
         mins_to_reset = max(0, (reset - now_utc).total_seconds() / 60)
         remaining_pct = 100.0 - _safe_float(five)
-    except Exception:
+    except Exception as e:
+        _log.debug("__get_burndown_data: %s", e)
         return {}
 
     # Load ledger and bucket actual data at 2-min intervals
@@ -2203,7 +2312,8 @@ def _get_burndown_data():
                 continue
             elapsed = (ts - window_start).total_seconds() / 60
             raw_points.append((elapsed, 100.0 - _safe_float(pct)))
-        except Exception:
+        except Exception as e:
+            _log.debug("__get_burndown_data: %s", e)
             continue
 
     # Bucket into 2-minute intervals
@@ -2302,7 +2412,8 @@ def _get_token_attribution():
         now_utc = datetime.now(timezone.utc)
         window_start = reset - timedelta(hours=5)
         current_five_pct = float(five)
-    except Exception:
+    except Exception as e:
+        _log.debug("__get_token_attribution: %s", e)
         return {}
 
     # Load ledger entries in window, filter to tool_use
@@ -2327,7 +2438,8 @@ def _get_token_attribution():
                 "model": e.get("model", ""),
                 "tool": e.get("tool", ""),
             })
-        except Exception:
+        except Exception as e:
+            _log.debug("__get_token_attribution: %s", e)
             continue
 
     if not window_entries:
@@ -2356,7 +2468,8 @@ def _get_token_attribution():
                             we["session"] = sid
                             matched = True
                             break
-                except Exception:
+                except Exception as e:
+                    _log.debug("__get_token_attribution: %s", e)
                     continue
         # Fallback: timestamp overlap only
         if not matched:
@@ -2371,7 +2484,8 @@ def _get_token_attribution():
                     if ft <= ts <= lt + timedelta(minutes=5):
                         we["session"] = sid
                         break
-                except Exception:
+                except Exception as e:
+                    _log.debug("__get_token_attribution: %s", e)
                     continue
 
     # Group remaining unmatched by directive
@@ -2484,7 +2598,8 @@ def _get_system_health():
     try:
         r = subprocess.run(["sysctl", "-n", "hw.memsize"], capture_output=True, text=True, timeout=2)
         _SYSTEM_MEM_MB = int(r.stdout.strip()) // (1024 * 1024)
-    except Exception:
+    except Exception as e:
+        _log.debug("__get_system_health: %s", e)
         pass
 
     # Get all processes
@@ -2493,7 +2608,8 @@ def _get_system_health():
             ["ps", "-eo", "pid,pcpu,rss,etime,comm"],
             capture_output=True, text=True, timeout=3,
         )
-    except Exception:
+    except Exception as e:
+        _log.debug("__get_system_health: %s", e)
         return {}
 
     # Get active session info for cross-referencing
@@ -2518,14 +2634,16 @@ def _get_system_health():
             mem_kb = int(parts[2])
             etime_str = parts[3]
             comm = parts[4].strip()
-        except Exception:
+        except Exception as e:
+            _log.debug("__get_system_health: %s", e)
             continue
 
         # Parse etime (formats: MM:SS, HH:MM:SS, D-HH:MM:SS)
         try:
             elapsed_secs = _etime_to_secs(etime_str)
             start_time = (now_dt - timedelta(seconds=elapsed_secs)).strftime("%H:%M:%S") if elapsed_secs else "?"
-        except Exception:
+        except Exception as e:
+            _log.debug("__get_system_health: %s", e)
             start_time = "?"
 
         mem_mb = mem_kb / 1024.0
@@ -2769,7 +2887,8 @@ def _token_pacing():
     five, _, five_reset_ts, _ = _current_pct()
     try:
         remaining = 100 - float(five)
-    except Exception:
+    except Exception as e:
+        _log.debug("__token_pacing: %s", e)
         return None
     
     if remaining <= 0:
@@ -2780,7 +2899,8 @@ def _token_pacing():
     try:
         reset = datetime.fromisoformat(five_reset_ts.replace("Z", "+00:00"))
         mins_to_reset = max(0, (reset - datetime.now(timezone.utc)).total_seconds() / 60)
-    except Exception:
+    except Exception as e:
+        _log.debug("__token_pacing: %s", e)
         mins_to_reset = 0
     
     return {
@@ -2801,7 +2921,8 @@ def _get_active_account():
             if acct.get("label") == active:
                 return active, acct.get("name", "?"), acct.get("lane", "?")
         return active, "?", "?"
-    except Exception:
+    except Exception as e:
+        _log.debug("__get_active_account: %s", e)
         return "?", "?", "?"
 
 
@@ -2828,7 +2949,8 @@ def _get_guardian_state():
         data = json.loads(state_path.read_text())
         age_secs = now - state_path.stat().st_mtime
         data["last_run_min"] = age_secs / 60.0
-    except Exception:
+    except Exception as e:
+        _log.debug("__get_guardian_state: %s", e)
         data = {"last_run_min": -1}
 
     _guardian_state_cache = (now, data)
@@ -2854,7 +2976,8 @@ def _get_guardian_events(limit=10):
     try:
         with open(log_path) as f:
             lines = f.readlines()[-50:]
-    except Exception:
+    except Exception as e:
+        _log.debug("__get_guardian_events: %s", e)
         return []
 
     events = []
@@ -2883,7 +3006,8 @@ def _get_all_account_capacities():
         d = json.loads((Path.home() / ".claude/accounts.json").read_text())
         active_label = d.get("active", "?")
         accounts = d.get("accounts", [])
-    except Exception:
+    except Exception as e:
+        _log.debug("__get_all_account_capacities: %s", e)
         return []
 
     result = []
@@ -2944,7 +3068,8 @@ def _get_supabase_account_capacity():
             rows_result = _json.loads(resp.read())
         _sb_acct_cap_cache = (now, rows_result)
         return rows_result
-    except Exception:
+    except Exception as e:
+        _log.warning("__get_supabase_account_capacity: %s", e)
         return []
 
 
@@ -2968,7 +3093,8 @@ def get_account_capacity_display():
         accounts_meta = {
             a.get("label", "?"): a for a in accts_json.get("accounts", [])
         }
-    except Exception:
+    except Exception as e:
+        _log.warning("_get_account_capacity_display: %s", e)
         active_label = "?"
         accounts_meta = {}
 
@@ -2996,7 +3122,8 @@ def get_account_capacity_display():
                 snap_age = (
                     datetime.now(timezone.utc) - snap_dt
                 ).total_seconds() / 60.0
-            except Exception:
+            except Exception as e:
+                _log.warning("_get_account_capacity_display: %s", e)
                 snap_age = None
 
         if is_active:
@@ -3039,7 +3166,8 @@ def _burn_mode():
         now = time.time()
         if data.get("active") and data.get("expires", 0) > now:
             return True, int(data["expires"] - now)
-    except Exception:
+    except Exception as e:
+        _log.debug("__burn_mode: %s", e)
         pass
     return False, 0
 
@@ -3052,7 +3180,8 @@ def make_header(five, seven, five_reset_ts, seven_reset_ts):
             filled = int(pct_f * width / 100)
             color = "green" if pct_f < 50 else ("yellow" if pct_f < 75 else "red")
             pct_display = f"{pct_f:.1f}" if pct_f != int(pct_f) else str(int(pct_f))
-        except Exception:
+        except Exception as e:
+            _log.debug("_bar: %s", e)
             filled, color, pct_display = 0, "dim", "?"
         return f"[{color}]{'█' * filled}{'░' * (width - filled)}[/{color}] {pct_display}%"
 
@@ -3129,7 +3258,8 @@ def make_urgent_panel():
                 f"  {urgency} — [bold]{pct_remaining:.0f}% tokens unused[/bold], "
                 f"resets in [{color}]{mins_left}m[/{color}]. Use them or lose them."
             )
-    except Exception:
+    except Exception as e:
+        _log.debug("_make_urgent_panel: %s", e)
         pass
 
     # Check for runaway burn rate from drain events — with actionable detail
@@ -3153,7 +3283,8 @@ def make_urgent_panel():
                     pid, _, directive, delta_str = item[0], item[1], item[2], item[3]
                     try:
                         d = float(delta_str.strip("+%"))
-                    except Exception:
+                    except Exception as e:
+                        _log.debug("_make_urgent_panel: %s", e)
                         d = 0
                     if d > top_delta:
                         top_delta = d
@@ -3186,7 +3317,8 @@ def make_urgent_panel():
                     else:
                         line2 += " — actively working."
                     alerts.append(line2)
-    except Exception:
+    except Exception as e:
+        _log.debug("_make_urgent_panel: %s", e)
         pass
 
     # Check weekly capacity — suggest switch if active account >70%
@@ -3233,7 +3365,8 @@ def make_urgent_panel():
                         bc=alt_color, bl=best_alt["label"], bpct=best_alt_pct,
                     )
                 )
-    except Exception:
+    except Exception as e:
+        _log.debug("_make_urgent_panel: %s", e)
         pass
 
     if not alerts:
@@ -3263,7 +3396,8 @@ def _etime_to_secs(etime):
         else:
             return None
         return days * 86400 + h * 3600 + m * 60 + s
-    except Exception:
+    except Exception as e:
+        _log.debug("__etime_to_secs: %s", e)
         return None
 
 
@@ -3310,7 +3444,8 @@ def make_sessions_panel():
                 tool = _shorten_tool(e.get("tool", "?"))
                 out = e.get("output_tokens", 0)
                 last_call[sid] = (ts, tool, out)
-            except Exception:
+            except Exception as e:
+                _log.debug("_make_sessions_panel: %s", e)
                 pass
 
     for item in sessions:
@@ -3329,7 +3464,8 @@ def make_sessions_panel():
             try:
                 val = float(delta.strip("+%"))
                 color = "red" if val > 10 else ("yellow" if val > 5 else "green")
-            except Exception:
+            except Exception as e:
+                _log.debug("_make_sessions_panel: %s", e)
                 pass
 
         mdl = _abbrev_model(model_map.get(sid, "?"))
@@ -3430,7 +3566,8 @@ def _get_pid_cpu(pid):
             capture_output=True, text=True, timeout=2,
         )
         return float(r.stdout.strip())
-    except Exception:
+    except Exception as e:
+        _log.debug("__get_pid_cpu: %s", e)
         return 0.0
 
 
@@ -3469,7 +3606,8 @@ def make_drain_panel():
             ts = e.get("ts", "")
             try:
                 ts_str = datetime.fromisoformat(ts.replace("Z", "+00:00")).astimezone().strftime("%H:%M:%S")
-            except Exception:
+            except Exception as e:
+                _log.debug("_make_drain_panel: %s", e)
                 ts_str = "?"
             delta = e.get("delta_5h", 0)
             burn = e.get("burn_rate_per_min", 0)
@@ -3518,7 +3656,8 @@ def _get_session_tasks(session_id=None, today_only=True):
     try:
         with urllib.request.urlopen(req, timeout=5) as resp:
             return _json.loads(resp.read())
-    except Exception:
+    except Exception as e:
+        _log.warning("__get_session_tasks: %s", e)
         return []
 
 
@@ -3550,7 +3689,8 @@ def _get_project_tasks(project=None):
     try:
         with urllib.request.urlopen(req, timeout=5) as resp:
             return _json.loads(resp.read())
-    except Exception:
+    except Exception as e:
+        _log.warning("__get_project_tasks: %s", e)
         return []  # end of _get_project_tasks
 
 
@@ -3582,7 +3722,8 @@ def _score_window(window_start_ts, window_reset_ts):
             ts = datetime.fromisoformat(e["ts"].replace("Z", "+00:00"))
             if window_start_ts <= ts <= window_reset_ts:
                 window_entries.append(e)
-        except Exception:
+        except Exception as e:
+            _log.warning("__score_window: %s", e)
             pass
     if not window_entries:
         return None
@@ -3614,7 +3755,8 @@ def _score_window(window_start_ts, window_reset_ts):
                 proj = entry.get("project", "")
                 if proj and proj != "\u2014":
                     window_projects.add(proj)
-        except Exception:
+        except Exception as e:
+            _log.warning("__score_window: %s", e)
             pass
     for e in window_entries:
         if e.get("type") == "tool_use":
@@ -3640,7 +3782,8 @@ def _score_window(window_start_ts, window_reset_ts):
                 drain_rates.append(r)
             try:
                 drain_ts.append(datetime.fromisoformat(e["ts"].replace("Z", "+00:00")))
-            except Exception:
+            except Exception as e:
+                _log.debug("__score_window: %s", e)
                 pass
     avg_rate = sum(drain_rates) / len(drain_rates) if drain_rates else 0
     idle_gaps = 0
@@ -3683,7 +3826,8 @@ def _get_current_cycle_id():
         if five_reset_ts:
             reset = datetime.fromisoformat(five_reset_ts.replace("Z", "+00:00"))
             return (reset - timedelta(hours=5)).isoformat()
-    except Exception:
+    except Exception as e:
+        _log.debug("__get_current_cycle_id: %s", e)
         pass
     # Fallback: read from statusline debug
     try:
@@ -3693,7 +3837,8 @@ def _get_current_cycle_id():
         ts = d["rate_limits"]["five_hour"]["resets_at"]
         reset = datetime.fromtimestamp(int(ts), tz=timezone.utc)
         return (reset - timedelta(hours=5)).isoformat()
-    except Exception:
+    except Exception as e:
+        _log.debug("__get_current_cycle_id: %s", e)
         return None
 
 def _get_build_ledger(days=1, limit=100, cycle_id=None):
@@ -3745,7 +3890,8 @@ def _get_build_ledger(days=1, limit=100, cycle_id=None):
                 "projects": len(projects),
             }
         }
-    except Exception:
+    except Exception as e:
+        _log.warning("__get_build_ledger: %s", e)
         return {"items": [], "by_company": {}, "stats": {"total": 0, "untested": 0, "decisions": 0, "sessions": 0, "projects": 0}}
 
 def _get_wire_messages(limit=50, cycle_id=None):
@@ -3807,7 +3953,8 @@ def _get_wire_messages(limit=50, cycle_id=None):
             "unread": unread_count,
             "sessions": len(sessions),
         }
-    except Exception:
+    except Exception as e:
+        _log.warning("__get_wire_messages: %s", e)
         return {"messages": [], "total": 0, "unread": 0, "sessions": 0}
 
 BATTLESTATION_FILE = Path.home() / ".claude/battlestation.json"
@@ -3820,7 +3967,8 @@ def _get_battlestation_config():
         if BATTLESTATION_FILE.exists():
             with open(BATTLESTATION_FILE) as f:
                 return json.loads(f.read())
-    except Exception:
+    except Exception as e:
+        _log.warning("__get_battlestation_config: %s", e)
         pass
     return {"user_id": "unknown", "display_name": "Unknown", "team": ""}
 
@@ -3862,7 +4010,8 @@ def _post_score_to_supabase(score):
             method="POST",
         )
         urllib.request.urlopen(req, timeout=5)
-    except Exception:
+    except Exception as e:
+        _log.warning("__post_score_to_supabase: %s", e)
         pass
 
 
@@ -3873,7 +4022,8 @@ def _save_window_score(score):
         WINDOW_SCORES_FILE.parent.mkdir(parents=True, exist_ok=True)
         with open(WINDOW_SCORES_FILE, "a") as f:
             f.write(json.dumps(score) + "\n")
-    except Exception:
+    except Exception as e:
+        _log.warning("__save_window_score: %s", e)
         pass
     # Also publish to shared leaderboard
     _post_score_to_supabase(score)
@@ -3890,9 +4040,11 @@ def _get_window_scores(limit=20):
                 if line:
                     try:
                         scores.append(json.loads(line))
-                    except Exception:
+                    except Exception as e:
+                        _log.debug("__get_window_scores: %s", e)
                         pass
-    except Exception:
+    except Exception as e:
+        _log.warning("__get_window_scores: %s", e)
         pass
     scores.reverse()
     return scores[:limit]
@@ -3931,7 +4083,8 @@ def _check_and_score_completed_window():
         # Auto-populate cycle items from session accomplishments
         try:
             _populate_cycle_from_sessions(cycle_id=prev_start.isoformat())
-        except Exception:
+        except Exception as e:
+            _log.debug("__check_and_score_completed_window: %s", e)
             pass
 
         # Auto-roll open cycle items from ALL past windows to current (catch-up)
@@ -3954,7 +4107,8 @@ def _check_and_score_completed_window():
 
         if rolled > 0:
             return {"rolled": rolled}
-    except Exception:
+    except Exception as e:
+        _log.debug("__check_and_score_completed_window: %s", e)
         pass
     return None
 
@@ -3976,7 +4130,8 @@ def _get_leaderboard(days=7):
         })
         with urllib.request.urlopen(req, timeout=5) as resp:
             rows = _json.loads(resp.read())
-    except Exception:
+    except Exception as e:
+        _log.warning("__get_leaderboard: %s", e)
         return []
 
     # Aggregate by user
@@ -4046,7 +4201,8 @@ def _get_cycle_boundaries(limit=20):
             start = datetime.fromisoformat(ws["window_start"].replace("Z", "+00:00"))
             end = datetime.fromisoformat(ws["window_reset"].replace("Z", "+00:00"))
             boundaries.append((start, end, True))
-        except Exception:
+        except Exception as e:
+            _log.warning("__get_cycle_boundaries: %s", e)
             pass
 
     # 2. Current cycle from live rate-limit data
@@ -4062,7 +4218,8 @@ def _get_cycle_boundaries(limit=20):
             if end_dt:
                 start_dt = end_dt - timedelta(hours=5)
                 boundaries.append((start_dt, end_dt, False))
-    except Exception:
+    except Exception as e:
+        _log.debug("__get_cycle_boundaries: %s", e)
         pass
 
     # 3. Gap-fill from ledger: detect five_pct resets
@@ -4084,10 +4241,12 @@ def _get_cycle_boundaries(limit=20):
                     cycle_start = ts
                     cycle_end = ts + timedelta(hours=5)
                     boundaries.append((cycle_start, cycle_end, False))
-                except Exception:
+                except Exception as e:
+                    _log.debug("__get_cycle_boundaries: %s", e)
                     pass
             prev_pct = cur_pct
-    except Exception:
+    except Exception as e:
+        _log.debug("__get_cycle_boundaries: %s", e)
         pass
 
     # 4. Infer boundaries from session timestamps for uncovered periods
@@ -4112,7 +4271,8 @@ def _get_cycle_boundaries(limit=20):
                 already = any(abs((s_existing - grid_start).total_seconds()) < 1800 for s_existing, _, _a in boundaries)
                 if not already:
                     boundaries.append((grid_start, grid_end, False))
-        except Exception:
+        except Exception as e:
+            _log.debug("__get_cycle_boundaries: %s", e)
             pass
 
     # 5. Deduplicate: if two overlap within 30 min, keep authoritative
@@ -4154,7 +4314,8 @@ def _build_cycle_record(start_ts, end_ts, is_current=False):
                 first = first.replace(tzinfo=timezone.utc)
             if start_ts <= first < end_ts:
                 cycle_sessions.append(s)
-        except Exception:
+        except Exception as e:
+            _log.debug("__build_cycle_record: %s", e)
             pass
 
     # Filter ledger entries within this cycle
@@ -4165,7 +4326,8 @@ def _build_cycle_record(start_ts, end_ts, is_current=False):
             ts = datetime.fromisoformat(entry["ts"].replace("Z", "+00:00"))
             if start_ts <= ts <= end_ts:
                 cycle_ledger.append(entry)
-        except Exception:
+        except Exception as e:
+            _log.debug("__build_cycle_record: %s", e)
             pass
 
     # Peak five_pct
@@ -4217,7 +4379,8 @@ def _build_cycle_record(start_ts, end_ts, is_current=False):
                         existing.add(item)
             merged_acc["errors"] += acc.get("errors", 0)
             merged_acc["turn_count"] += acc.get("turn_count", 0)
-        except Exception:
+        except Exception as e:
+            _log.debug("__build_cycle_record: %s", e)
             pass
 
     # Window score lookup
@@ -4228,7 +4391,8 @@ def _build_cycle_record(start_ts, end_ts, is_current=False):
             if abs((ws_start - start_ts).total_seconds()) < 1800:
                 window_score = ws
                 break
-        except Exception:
+        except Exception as e:
+            _log.debug("__build_cycle_record: %s", e)
             pass
 
     # Gravity label
@@ -4276,7 +4440,8 @@ def _get_all_cycles(limit=20):
                 current_end = datetime.fromisoformat(five_reset_ts.replace("Z", "+00:00"))
             elif isinstance(five_reset_ts, (int, float)):
                 current_end = datetime.fromtimestamp(five_reset_ts, tz=timezone.utc)
-    except Exception:
+    except Exception as e:
+        _log.debug("__get_all_cycles: %s", e)
         pass
 
     cycles = []
@@ -4287,7 +4452,8 @@ def _get_all_cycles(limit=20):
         try:
             record = _build_cycle_record(start, end, is_current=is_current)
             cycles.append(record)
-        except Exception:
+        except Exception as e:
+            _log.debug("__get_all_cycles: %s", e)
             pass
 
     _cycles_cache = cycles
@@ -4331,7 +4497,8 @@ def _get_cycle_sessions(cycle_id):
                 first = first.replace(tzinfo=timezone.utc)
             if target_start <= first < target_end:
                 result.append(s)
-        except Exception:
+        except Exception as e:
+            _log.debug("__get_cycle_sessions: %s", e)
             pass
     return result
 
@@ -4371,7 +4538,8 @@ def _get_pomodoro_stats(cycle_id):
             ts = datetime.fromisoformat(entry["ts"].replace("Z", "+00:00"))
             if target_start <= ts < target_end:
                 cycle_ledger.append((ts, entry))
-        except Exception:
+        except Exception as e:
+            _log.debug("__get_pomodoro_stats: %s", e)
             pass
 
     # Load sessions for this cycle
@@ -4399,7 +4567,8 @@ def _get_pomodoro_stats(cycle_id):
                     sid = s.get("session_id") or s.get("id", "")
                     if sid:
                         block_session_ids.add(sid)
-            except Exception:
+            except Exception as e:
+                _log.debug("__get_pomodoro_stats: %s", e)
                 pass
 
         # Also collect session IDs from ledger entries in this block
@@ -4482,9 +4651,11 @@ def _load_cycle_plans():
                         cid = entry.get("cycle_id")
                         if cid:
                             plans[cid] = entry
-                    except Exception:
+                    except Exception as e:
+                        _log.debug("__load_cycle_plans: %s", e)
                         pass
-    except Exception:
+    except Exception as e:
+        _log.debug("__load_cycle_plans: %s", e)
         pass
     return plans
 
@@ -4504,7 +4675,8 @@ def _save_cycle_plan(plan):
         CYCLE_PLANS_FILE.parent.mkdir(parents=True, exist_ok=True)
         with open(CYCLE_PLANS_FILE, "a") as f:
             f.write(json.dumps(plan) + "\n")
-    except Exception:
+    except Exception as e:
+        _log.debug("__save_cycle_plan: %s", e)
         pass
 
 
@@ -4575,7 +4747,8 @@ def _get_cycle_items(window_start, all_windows=False):
         })
         with urllib.request.urlopen(req, timeout=5) as resp:
             return json.loads(resp.read())
-    except Exception:
+    except Exception as e:
+        _log.warning("__get_cycle_items: %s", e)
         return []
 
 
@@ -4610,7 +4783,8 @@ def _post_cycle_item(window_start, category, title, project="", source_ref="", s
         with urllib.request.urlopen(req, timeout=5) as resp:
             rows = json.loads(resp.read())
             return rows[0] if rows else None
-    except Exception:
+    except Exception as e:
+        _log.warning("__post_cycle_item: %s", e)
         return None
 
 
@@ -4632,7 +4806,8 @@ def _update_cycle_item(item_id, updates):
         )
         urllib.request.urlopen(req, timeout=5)
         return True
-    except Exception:
+    except Exception as e:
+        _log.warning("__update_cycle_item: %s", e)
         return False
 
 
@@ -4651,7 +4826,8 @@ def _delete_cycle_item(item_id):
         )
         urllib.request.urlopen(req, timeout=5)
         return True
-    except Exception:
+    except Exception as e:
+        _log.warning("__delete_cycle_item: %s", e)
         return False
 
 
@@ -4670,7 +4846,8 @@ def _get_recent_cycle_summaries(limit=3):
         try:
             dt = datetime.fromisoformat(c["cycle_id"].replace("Z", "+00:00"))
             when_str = dt.astimezone().strftime(f"%b {dt.day} %-I%p").replace("AM", "am").replace("PM", "pm")
-        except Exception:
+        except Exception as e:
+            _log.warning("__get_recent_cycle_summaries: %s", e)
             when_str = c["cycle_id"][:16]
         summaries.append({
             "window_start": c["cycle_id"],
@@ -4713,7 +4890,8 @@ def _build_full_audit(limit=50):
     for ws in items_by_cycle:
         try:
             _parsed_item_windows[ws] = datetime.fromisoformat(ws.replace("Z", "+00:00"))
-        except Exception:
+        except Exception as e:
+            _log.warning("__build_full_audit: %s", e)
             pass
 
     total_commits_global = set()  # type: set
@@ -4738,7 +4916,8 @@ def _build_full_audit(limit=50):
                     if abs((cid_dt - ws_dt).total_seconds()) < 1800:
                         matched_items = items_by_cycle.get(ws, [])
                         break
-            except Exception:
+            except Exception as e:
+                _log.debug("__build_full_audit: %s", e)
                 pass
 
         items_done = sum(1 for i in matched_items if i.get("status") == "done")
@@ -4777,7 +4956,8 @@ def _build_full_audit(limit=50):
                     bp["commits"].extend(commits)
                     bp["files_edited"] += len(acc.get("files_edited", []))
                     bp["files_created"] += len(acc.get("files_created", []))
-            except Exception:
+            except Exception as e:
+                _log.debug("__build_full_audit: %s", e)
                 pass
 
         # Accumulate global totals from by_project
@@ -4994,7 +5174,8 @@ def export_audit_markdown(filepath):
             first_dt = datetime.fromisoformat(cycles[-1]["cycle_id"].replace("Z", "+00:00"))
             last_dt = datetime.fromisoformat(cycles[0]["cycle_id"].replace("Z", "+00:00"))
             date_range = f"{first_dt.strftime('%Y-%m-%d')} to {last_dt.strftime('%Y-%m-%d')}"
-        except Exception:
+        except Exception as e:
+            _log.debug("_export_audit_markdown: %s", e)
             date_range = "N/A"
     else:
         date_range = "N/A"
@@ -5034,7 +5215,8 @@ def export_audit_markdown(filepath):
             start_dt = datetime.fromisoformat(cid.replace("Z", "+00:00")).astimezone()
             end_dt = datetime.fromisoformat(cycle["end_ts"].replace("Z", "+00:00")).astimezone()
             header = f"## Cycle: {start_dt.strftime('%Y-%m-%d %H:%M')} - {end_dt.strftime('%H:%M')}  {cycle.get('stars', '')}"
-        except Exception:
+        except Exception as e:
+            _log.debug("_export_audit_markdown: %s", e)
             header = f"## Cycle: {cid}  {cycle.get('stars', '')}"
 
         lines.append("---")
@@ -5125,7 +5307,8 @@ def _assign_item_to_pomodoro(item_id, block_num):
         )
         with urllib.request.urlopen(req, timeout=5) as resp:
             rows = json.loads(resp.read())
-    except Exception:
+    except Exception as e:
+        _log.warning("__assign_item_to_pomodoro: %s", e)
         return False
     if not rows:
         return False
@@ -5183,7 +5366,8 @@ def _roll_cycle_items(old_window_start, new_window_start):
         })
         with urllib.request.urlopen(req, timeout=5) as resp:
             open_items = json.loads(resp.read())
-    except Exception:
+    except Exception as e:
+        _log.warning("__roll_cycle_items: %s", e)
         return 0
 
     if not open_items:
@@ -5208,14 +5392,16 @@ def _roll_cycle_items(old_window_start, new_window_start):
             # Dedup key: strip any existing "[rolled]" prefix for comparison
             raw_title = re.sub(r"^\[rolled\]\s*", "", ti.get("title", ""))
             existing_keys.add((raw_title.lower().strip(), (ti.get("project") or "").lower()))
-    except Exception:
+    except Exception as e:
+        _log.warning("__roll_cycle_items: %s", e)
         pass
 
     # Format source cycle label for annotation
     try:
         dt = datetime.fromisoformat(old_window_start.replace("Z", "+00:00"))
         cycle_label = dt.astimezone().strftime("%b %d %H:%M")
-    except Exception:
+    except Exception as e:
+        _log.warning("__roll_cycle_items: %s", e)
         cycle_label = old_window_start[:16]
 
     rolled = 0
@@ -5242,7 +5428,8 @@ def _roll_cycle_items(old_window_start, new_window_start):
                     method="PATCH",
                 )
                 urllib.request.urlopen(req, timeout=5)
-            except Exception:
+            except Exception as e:
+                _log.warning("__roll_cycle_items: %s", e)
                 pass
             continue
 
@@ -5272,7 +5459,8 @@ def _roll_cycle_items(old_window_start, new_window_start):
                 method="POST",
             )
             urllib.request.urlopen(req, timeout=5)
-        except Exception:
+        except Exception as e:
+            _log.warning("__roll_cycle_items: %s", e)
             continue
 
         # Mark original as rolled
@@ -5290,7 +5478,8 @@ def _roll_cycle_items(old_window_start, new_window_start):
             )
             urllib.request.urlopen(req, timeout=5)
             rolled += 1
-        except Exception:
+        except Exception as e:
+            _log.warning("__roll_cycle_items: %s", e)
             pass
 
         # Track for dedup within this run
@@ -5331,13 +5520,15 @@ def _auto_roll_stale_items(current_window_start=None):
         })
         with urllib.request.urlopen(req, timeout=8) as resp:
             all_open = json.loads(resp.read())
-    except Exception:
+    except Exception as e:
+        _log.warning("__auto_roll_stale_items: %s", e)
         return 0
 
     # Parse current window start for comparison
     try:
         current_dt = datetime.fromisoformat(current_window_start.replace("Z", "+00:00"))
-    except Exception:
+    except Exception as e:
+        _log.warning("__auto_roll_stale_items: %s", e)
         return 0
 
     # Group stale items by their source window
@@ -5351,7 +5542,8 @@ def _auto_roll_stale_items(current_window_start=None):
                 if ws not in stale_windows:
                     stale_windows[ws] = []
                 stale_windows[ws].append(item)
-        except Exception:
+        except Exception as e:
+            _log.debug("__auto_roll_stale_items: %s", e)
             continue
 
     if not stale_windows:
@@ -5406,7 +5598,8 @@ def _get_test_queue(project=None, status="pending", cycle_id=None):
             item["source"] = item.get("source", "commit")
             item["source_ref"] = item.get("session_id", "").replace("cc-", "")
         return items
-    except Exception:
+    except Exception as e:
+        _log.warning("__get_test_queue: %s", e)
         return []
 
 
@@ -5442,7 +5635,8 @@ def _add_test_item(title, project="", source="manual", source_ref="", route="", 
         with urllib.request.urlopen(req, timeout=5) as resp:
             rows = json.loads(resp.read())
             return rows[0] if rows else {}
-    except Exception:
+    except Exception as e:
+        _log.warning("__add_test_item: %s", e)
         return {}
 
 
@@ -5469,7 +5663,8 @@ def _update_test_item(item_id, status, notes=""):
         )
         urllib.request.urlopen(req, timeout=5)
         return True
-    except Exception:
+    except Exception as e:
+        _log.warning("__update_test_item: %s", e)
         return False
 
 
@@ -5488,7 +5683,8 @@ def _delete_test_item(item_id):
         )
         urllib.request.urlopen(req, timeout=5)
         return True
-    except Exception:
+    except Exception as e:
+        _log.warning("__delete_test_item: %s", e)
         return False
 
 
@@ -5522,7 +5718,8 @@ def _scrape_cycle_sessions(window_start=None):
                 entry = _json.loads(line)
                 if entry.get("first_ts", "") >= ws_str:
                     sessions.append(entry)
-            except Exception:
+            except Exception as e:
+                _log.warning("__scrape_cycle_sessions: %s", e)
                 continue
 
     if not sessions:
@@ -5634,7 +5831,8 @@ def _import_atlas_qa_tests():
     try:
         with open(ts_path) as fh:
             content = fh.read()
-    except Exception:
+    except Exception as e:
+        _log.debug("__import_atlas_qa_tests: %s", e)
         return 0
 
     section_route_map = {
@@ -5769,7 +5967,8 @@ def _toggle_heartbeat(agent_id, enabled):
             interval = hb.get("intervalSec", 0)
             if not interval:
                 interval = _KNOWN_INTERVALS.get(agent_data.get("name", ""), 0)
-    except Exception:
+    except Exception as e:
+        _log.warning("__toggle_heartbeat: %s", e)
         pass
 
     url = f"{PAPERCLIP_BASE}/api/agents/{agent_id}"
@@ -5810,7 +6009,8 @@ def _get_blocked_attempts(minutes=60):
 
     try:
         agents = _get_paperclip_heartbeats()
-    except Exception:
+    except Exception as e:
+        _log.warning("__get_blocked_attempts: %s", e)
         return []
 
     for a in agents:
@@ -5828,7 +6028,8 @@ def _get_blocked_attempts(minutes=60):
             last_dt = datetime.fromisoformat(last_str.replace("Z", "+00:00"))
             if last_dt.tzinfo is None:
                 last_dt = last_dt.replace(tzinfo=timezone.utc)
-        except Exception:
+        except Exception as e:
+            _log.debug("__get_blocked_attempts: %s", e)
             continue
 
         elapsed = (now - last_dt).total_seconds()
@@ -5909,7 +6110,8 @@ def _get_rules_summary():
             cycle_start = datetime.fromisoformat(current["start_ts"])
             if cycle_start.tzinfo is None:
                 cycle_start = cycle_start.replace(tzinfo=timezone.utc)
-    except Exception:
+    except Exception as e:
+        _log.warning("__get_rules_summary: %s", e)
         pass
     if not cycle_start:
         cycle_start = datetime.now(timezone.utc) - timedelta(hours=5)
@@ -5938,7 +6140,8 @@ def _get_rules_summary():
                     rule_name = after_level[:colon_pos].strip()
                     detail = after_level[colon_pos + 1:].strip()
                     block_events.append({"ts": ts_str, "rule": rule_name, "detail": detail})
-                except Exception:
+                except Exception as e:
+                    _log.debug("__get_rules_summary: %s", e)
                     continue
     except FileNotFoundError:
         pass
@@ -5971,7 +6174,8 @@ def _get_rules_summary():
                                 ts = ts.replace(tzinfo=timezone.utc)
                             if ts < cycle_start:
                                 continue
-                        except Exception:
+                        except Exception as e:
+                            _log.debug("__get_rules_summary: %s", e)
                             continue
                         evt_type = entry.get("event", "")
                         trigger_counts[evt_type] = trigger_counts.get(evt_type, 0) + 1
@@ -6031,7 +6235,8 @@ def _get_rule_events(rule_name, limit=30):
                         continue
                     detail = after[colon + 1:].strip()
                     events.append({"ts": ts_str, "level": level, "detail": detail})
-                except Exception:
+                except Exception as e:
+                    _log.debug("__get_rule_events: %s", e)
                     continue
     except FileNotFoundError:
         pass
@@ -6108,7 +6313,8 @@ def _compute_utilization(window):
             ts = datetime.fromisoformat(lts.replace("Z", "+00:00"))
             if ts >= cutoff:
                 sessions.append(entry)
-        except Exception:
+        except Exception as e:
+            _log.debug("__compute_utilization: %s", e)
             pass
 
     # Filter ledger in window
@@ -6118,7 +6324,8 @@ def _compute_utilization(window):
             ts = datetime.fromisoformat(e["ts"].replace("Z", "+00:00"))
             if ts >= cutoff:
                 ledger_in_window.append(e)
-        except Exception:
+        except Exception as e:
+            _log.debug("__compute_utilization: %s", e)
             pass
 
     # ── Account attribution ──────────────────────────────────────────────
@@ -6136,7 +6343,8 @@ def _compute_utilization(window):
         accts_data = json.loads((Path.home() / ".claude/accounts.json").read_text())
         accounts_meta = {a["label"]: a for a in accts_data.get("accounts", [])}
         active_label = accts_data.get("active", "A")
-    except Exception:
+    except Exception as e:
+        _log.debug("__compute_utilization: %s", e)
         accounts_meta = {}
         active_label = "A"
 
@@ -6205,7 +6413,8 @@ def _compute_utilization(window):
                 supa_cap = [r for r in _get_supabase_account_capacity() if r.get("account") == label]
                 if supa_cap:
                     seven_day_resets_at = supa_cap[0].get("seven_day_resets_at")
-            except Exception:
+            except Exception as e:
+                _log.warning("__compute_utilization: %s", e)
                 pass
         else:
             # Inactive account — find most recent history entry
@@ -6221,7 +6430,8 @@ def _compute_utilization(window):
                         latest["snapshot_at"].replace("Z", "+00:00")
                     )
                     snapshot_age = (now_dt - snap_ts).total_seconds() / 60
-                except Exception:
+                except Exception as e:
+                    _log.warning("__compute_utilization: %s", e)
                     snapshot_age = 999
             else:
                 # No history — fall back to Supabase account_capacity (stale)
@@ -6239,7 +6449,8 @@ def _compute_utilization(window):
                 delta = reset_dt - now_dt
                 if delta.total_seconds() > 0:
                     seven_day_resets_in = round(delta.total_seconds() / 3600, 1)  # hours
-            except Exception:
+            except Exception as e:
+                _log.warning("__compute_utilization: %s", e)
                 pass
 
         score = _score_dimension(util_pct, 85.0)
@@ -6375,7 +6586,8 @@ def _compute_account_activity_timeline(cutoff, now_dt, sessions, ledger_entries,
             end_bucket = min(bucket_count - 1, int((lts - cutoff).total_seconds() / 300))
             for b in range(start_bucket, end_bucket + 1):
                 active_buckets[acct].add(b)
-        except Exception:
+        except Exception as e:
+            _log.debug("__compute_account_activity_timeline: %s", e)
             pass
 
     # Mark buckets from ledger entries
@@ -6388,7 +6600,8 @@ def _compute_account_activity_timeline(cutoff, now_dt, sessions, ledger_entries,
             ts = datetime.fromisoformat(e["ts"].replace("Z", "+00:00"))
             b = max(0, min(bucket_count - 1, int((ts - cutoff).total_seconds() / 300)))
             active_buckets[acct].add(b)
-        except Exception:
+        except Exception as e:
+            _log.debug("__compute_account_activity_timeline: %s", e)
             pass
 
     # Per-account stats

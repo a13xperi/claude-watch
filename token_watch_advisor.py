@@ -696,6 +696,115 @@ def check_context_blockers(ctx: Dict) -> List[Insight]:
     return insights
 
 
+# --- Directive Alignment checks ---
+
+def _parse_directives(text: str) -> Dict[str, List[str]]:
+    """Parse DIRECTIVES.md into {section: [directive_lines]}."""
+    sections: Dict[str, List[str]] = {}
+    current_section = "global"
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("## "):
+            current_section = stripped[3:].strip().lower()
+            continue
+        if stripped.startswith("- ") and current_section:
+            sections.setdefault(current_section, []).append(stripped[2:])
+    return sections
+
+
+# Map directive section names to keywords that match repos/projects
+_DIRECTIVE_PROJECT_MAP = {
+    "delphi os": ["atlas", "delphi"],
+    "kaa": ["kaa", "openclaw", "landscape"],
+    "paperclip": ["paperclip"],
+    "token watch": ["token-watch", "token_watch", "tokenwatch"],
+}
+
+
+@advisor_check("directive_alignment", ["directives_md", "peer_sessions", "build_ledger"])
+def check_directive_alignment(ctx: Dict) -> List[Insight]:
+    text = ctx.get("directives_md", "")
+    if not text:
+        return []
+
+    sections = _parse_directives(text)
+    peers = ctx.get("peer_sessions", [])
+    ledger = ctx.get("build_ledger", {})
+
+    active_peers = [p for p in peers if p.get("status") == "active"]
+    active_repos = [p.get("repo", "").lower() for p in active_peers]
+    active_work = [p.get("work_unit", "").lower() for p in active_peers]
+    active_text = " ".join(active_repos + active_work)
+
+    # Collect recent build projects
+    build_projects = set()
+    for item in ledger.get("items", []):
+        proj = (item.get("project") or "").lower()
+        if proj:
+            build_projects.add(proj)
+
+    insights: List[Insight] = []
+
+    # Check each directive section for alignment
+    for section, directives in sections.items():
+        if section == "global":
+            continue
+
+        # Find keywords for this section
+        keywords = _DIRECTIVE_PROJECT_MAP.get(section, [section.split()[0].lower()])
+
+        has_active_work = any(kw in active_text for kw in keywords)
+        has_recent_builds = any(kw in bp for kw in keywords for bp in build_projects)
+
+        # Check for "non-negotiable" or "must" directives with no work
+        for directive in directives:
+            dl = directive.lower()
+            is_critical = any(w in dl for w in ["non-negotiable", "must", "critical", "required"])
+            if is_critical and not has_active_work and not has_recent_builds:
+                insights.append(Insight(
+                    category="ALIGNMENT", severity="warning",
+                    title=f"Directive gap: {section.title()}",
+                    message=f'"{directive[:80]}" — no active sessions or recent builds for {section.title()}.',
+                    action=f"Start work on {section.title()} or review directive.",
+                    source="directive_alignment",
+                    data={"section": section, "directive": directive[:120]},
+                ))
+
+    # Focus distribution: if directives have a clear priority but work is elsewhere
+    # Count active sessions per directive area
+    area_session_count: Dict[str, int] = {}
+    for section in sections:
+        if section == "global":
+            continue
+        keywords = _DIRECTIVE_PROJECT_MAP.get(section, [section.split()[0].lower()])
+        count = sum(1 for repo in active_repos if any(kw in repo for kw in keywords))
+        area_session_count[section] = count
+
+    total_active = len(active_peers)
+    if total_active >= 3:
+        # If one area has most sessions but directives emphasize another
+        dominant_area = max(area_session_count, key=area_session_count.get, default=None) if area_session_count else None
+        if dominant_area and area_session_count.get(dominant_area, 0) >= total_active * 0.7:
+            # Check if other areas have unmet critical directives
+            for section, directives in sections.items():
+                if section == "global" or section == dominant_area:
+                    continue
+                has_critical = any(
+                    any(w in d.lower() for w in ["non-negotiable", "must", "priority", "flagship"])
+                    for d in directives
+                )
+                if has_critical and area_session_count.get(section, 0) == 0:
+                    insights.append(Insight(
+                        category="ALIGNMENT", severity="info",
+                        title=f"Focus skew: {dominant_area.title()} dominant",
+                        message=f"{area_session_count[dominant_area]}/{total_active} sessions on {dominant_area.title()}, none on {section.title()} (has priority directives).",
+                        action=f"Consider allocating a session to {section.title()}.",
+                        source="directive_alignment",
+                        data={"dominant": dominant_area, "neglected": section, "total_active": total_active},
+                    ))
+
+    return insights
+
 
 # --- Test Queue checks ---
 
