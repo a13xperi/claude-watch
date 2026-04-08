@@ -278,6 +278,49 @@ def _zone_label(pct):
     return ("REDLINE", "bold red")
 
 
+
+class SystemStatusPanel(Static):
+    """System pressure, memory, and CPU status — sits above Engine Management."""
+
+    def update_content(self):
+        from token_watch_data import _get_engine_status
+        engine = _get_engine_status()
+        pressure = engine["pressure"]
+        totals = engine["totals"]
+
+        mem_pct = totals.get("mem_pct", 0)
+        total_cpu = totals.get("cpu", 0)
+        total_mem = totals.get("mem_mb", 0)
+        sys_mem = totals.get("system_mem_mb", 16384)
+        n_sessions = len(engine["sessions"]) + len(engine["peers"])
+
+        mem_zone, mem_zc = _zone_label(mem_pct)
+        cpu_capped = min(total_cpu, 100)
+        cpu_zone, cpu_zc = _zone_label(cpu_capped)
+        mem_gb = total_mem / 1024
+        sys_gb = sys_mem / 1024
+
+        parts = []
+        # Pressure alert
+        if pressure["active"]:
+            trim_sids = [tr["sid"] for tr in pressure["trim_order"][:3]]
+            trim_note = ", ".join(trim_sids) if trim_sids else "none"
+            parts.append(f"[bold red]\u26a0 {pressure['reason']}[/bold red]  [red]trim: {trim_note}[/red]")
+
+        # Gauges
+        parts.append(
+            f"MEM {_gauge_bar(mem_pct)} {mem_gb:.1f}/{sys_gb:.0f}GB [{mem_zc}]{mem_zone}[/{mem_zc}]"
+            f"    CPU {_gauge_bar(cpu_capped)} {total_cpu:.0f}% [{cpu_zc}]{cpu_zone}[/{cpu_zc}]"
+            f"    Sessions: {n_sessions}"
+        )
+
+        self.update(Panel(
+            "\n".join(parts),
+            title="[bold]System Status[/bold]",
+            border_style="cyan" if not pressure["active"] else "red",
+        ))
+
+
 class EngineTable(DataTable):
     """Engine management — unified session health + system pressure."""
 
@@ -302,6 +345,19 @@ class EngineTable(DataTable):
         self.add_column("Dur", width=12, key="dur")
         self.add_column("Used", width=11, key="used")
         self.add_column("Directive", key="directive")
+
+
+    def on_mouse_scroll_down(self, event) -> None:
+        if self.scroll_y >= self.max_scroll_y:
+            return  # Let parent ScrollableContainer handle it
+        self.scroll_down()
+        event.stop()
+
+    def on_mouse_scroll_up(self, event) -> None:
+        if self.scroll_y <= 0:
+            return  # Let parent ScrollableContainer handle it
+        self.scroll_up()
+        event.stop()
 
     def refresh_rows(self):
         """Rebuild the table from unified engine status with health scoring."""
@@ -378,18 +434,7 @@ class EngineTable(DataTable):
         acct_color_map = {"A": "cyan", "B": "magenta", "C": "yellow"}
         acct_color_local = acct_color_map.get(active_label, "dim")
 
-        # Pressure alert row
-        if pressure["active"]:
-            trim_sids = [tr["sid"] for tr in pressure["trim_order"][:3]]
-            pressure_short = pressure["reason"]
-            trim_note = "trim: " + ", ".join(trim_sids) if trim_sids else ""
-            self.add_row(
-                Text(""), Text(""), Text(""),
-                Text("⚠ PRESSURE", style="bold red"),
-                Text(""), Text(""), Text(""), Text(""), Text(""), Text(""),
-                Text(f"{pressure_short}  {trim_note}", style="red"),
-                key="pressure-alert",
-            )
+        # Pressure/totals moved to SystemStatusPanel
 
         for session in engine_sessions:
             pid = session["pid"]
@@ -602,28 +647,7 @@ class EngineTable(DataTable):
             )
 
         # Totals footer row with gauges
-        mem_pct = totals.get("mem_pct", 0)
-        total_cpu = totals.get("cpu", 0)
-        total_mem = totals.get("mem_mb", 0)
-        sys_mem = totals.get("system_mem_mb", 16384)
-
-        mem_zone, mem_zc = _zone_label(mem_pct)
-        cpu_capped = min(total_cpu, 100)
-        cpu_zone, cpu_zc = _zone_label(cpu_capped)
-        mem_gb = total_mem / 1024
-        sys_gb = sys_mem / 1024
-
-        n_total = len(engine_sessions) + len(remote_peers)
-        self.add_row(
-            Text(""), Text(""), Text(""), Text(""), Text(""), Text(""),
-            Text(""), Text(""), Text(""), Text(""),
-            Text.from_markup(
-                f"  MEM {_gauge_bar(mem_pct)} {mem_gb:.1f}/{sys_gb:.0f}GB [{mem_zc}]{mem_zone}[/{mem_zc}]"
-                f"    CPU {_gauge_bar(cpu_capped)} {total_cpu:.0f}% [{cpu_zc}]{cpu_zone}[/{cpu_zc}]"
-                f"    Sessions: {n_total}"
-            ),
-            key="totals-footer",
-        )
+        # Totals moved to SystemStatusPanel
 
         try:
             if cur_row < self.row_count:
@@ -851,19 +875,22 @@ class TokenAttributionPanel(Static):
         except Exception:
             bar_width = 50
 
-        # Build single-line bar
+        # Build single-line bar — normalize so bar always fits in one row
+        display_sessions = [s for s in sessions if s["pct_used"] >= 0.3]
+        sum_pct = sum(s["pct_used"] for s in display_sessions) + max(unaccounted, 0)
+        if sum_pct <= 0:
+            sum_pct = 1
+
         bar_chars = []
-        for s in sessions:
+        for s in display_sessions:
             pct = s["pct_used"]
-            if pct < 0.3:
-                continue
-            cols = max(1, int(pct / max(total, 0.1) * bar_width))
+            cols = max(1, int(pct / sum_pct * bar_width))
             color = s["color"]
             label = f"{pct:.0f}%"
             segment = label.center(cols) if cols >= len(label) + 2 else "\u2588" * cols
             bar_chars.append(f"[bold white on {color}]{segment}[/]")
         if unaccounted > 0.5:
-            cols = max(1, int(unaccounted / max(total, 0.1) * bar_width))
+            cols = max(1, int(unaccounted / sum_pct * bar_width))
             segment = f"{unaccounted:.0f}%".center(cols) if cols >= 6 else "\u2591" * cols
             bar_chars.append(f"[dim]{segment}[/dim]")
         bar_line = "".join(bar_chars)
@@ -6009,7 +6036,6 @@ class DispatchView(LazyView):
 
     BINDINGS = [
         Binding("r", "refresh_dispatch", "Refresh"),
-        Binding("enter", "view_detail", "View"),
         Binding("c", "copy_selected", "Copy"),
     ]
 
@@ -6118,11 +6144,12 @@ class DispatchView(LazyView):
             pass
         self.notify("Dispatch refreshed")
 
-    def action_view_detail(self):
-        table = self.query_one("#dispatch-table", DataTable)
+    def on_data_table_row_selected(self, event):
+        """Enter pressed on a row — open detail view."""
         if not hasattr(self, '_items') or not self._items:
             return
         try:
+            table = self.query_one("#dispatch-table", DataTable)
             row_idx = table.cursor_row
             if 0 <= row_idx < len(self._items):
                 self.app.push_screen(DispatchDetailScreen(self._items[row_idx]))
@@ -6196,6 +6223,7 @@ class ClaudeWatchApp(App):
                 yield TokenAttributionPanel(id="attribution")
                 yield Input(placeholder="Search sessions (ccid, project, directive)...", id="search-input")
                 yield UrgentAlerts(id="urgent")
+                yield SystemStatusPanel(id="system-status")
                 yield EngineTable(id="active-sessions")
                 yield SessionNarrativePanel(id="session-narrative")
                 yield SessionHistoryTable(id="session-history")
@@ -6458,6 +6486,7 @@ class ClaudeWatchApp(App):
             self.query_one("#burndown", BurndownChart).update_content()
             self.query_one("#attribution", TokenAttributionPanel).update_content()
             self.query_one("#urgent", UrgentAlerts).update_content()
+            self.query_one("#system-status", SystemStatusPanel).update_content()
             self.query_one("#active-sessions", EngineTable).refresh_rows()
             self.query_one("#session-narrative", SessionNarrativePanel).update_content()
             self.query_one("#session-history", SessionHistoryTable).refresh_rows()
