@@ -1401,17 +1401,16 @@ class NavBar(Horizontal):
         ("Rules", "nav-rules"),
         ("MCP", "nav-mcp"),
         ("Test", "nav-test"),
-        ("Advisor", "nav-advisor"),
+        ("TW Advisor", "nav-advisor"),
     ]
 
     def compose(self) -> ComposeResult:
         # Compact top bar — key tabs + Nav button for the rest
         buttons = [
             ("Dashboard", "nav-dashboard"),
-            ("Cycles", "nav-cycles"),
-            ("Usage", "nav-usage"),
-            ("Analytics", "nav-analytics"),
-            ("Rules", "nav-rules"),
+            ("Cycle", "nav-sessions"),
+            ("Mission", "nav-mission"),
+            ("Test", "nav-test"),
             ("Nav", "nav-open-nav"),
         ]
         for label, btn_id in buttons:
@@ -5293,7 +5292,7 @@ class AuditView(LazyView):
 
 
 class AdvisorView(LazyView):
-    """Advisor — actionable intelligence synthesis."""
+    """Token Watch Advisor Agent — actionable intelligence synthesis."""
 
     BINDINGS = [
         Binding("R", "run_advisor", "Run Now"),
@@ -5334,7 +5333,7 @@ class AdvisorView(LazyView):
                 _, style = severity_display[sev]
                 parts.append(f"[{style}]{n} {label}[/{style}]")
         header_text = (
-            f"[bold]Advisor[/bold]  "
+            f"[bold]TW Advisor[/bold]  "
             f"[dim]{report.checks_run} checks · {report.duration_ms}ms · "
             f"{len(report.insights)} insights[/dim]"
         )
@@ -5369,7 +5368,7 @@ class AdvisorView(LazyView):
         token_watch_advisor._advisor_cache_ts = 0.0
         self._last_refresh = 0
         self._refresh_advisor()
-        self.notify("Advisor refreshed")
+        self.notify("TW Advisor refreshed")
 
 
 class AnalyticsView(LazyView):
@@ -5490,14 +5489,24 @@ class AnalyticsView(LazyView):
             snap_age = acct.get("snapshot_age_min", 0)
             stale_note = ""
             if not acct.get("is_active") and snap_age > 60:
-                stale_note = f"  [dim](snapshot {snap_age/60:.0f}h ago)[/dim]"
+                stale_note = f"  [dim](snap {snap_age/60:.0f}h ago)[/dim]"
+
+            # 7d reset countdown
+            reset_hours = acct.get("seven_day_resets_in_hours")
+            if reset_hours is not None:
+                if reset_hours < 24:
+                    reset_str = f"  resets in [bold cyan]{reset_hours:.0f}h[/bold cyan]"
+                else:
+                    reset_str = f"  resets in [cyan]{reset_hours/24:.1f}d[/cyan]"
+            else:
+                reset_str = ""
 
             card = (
                 f"Lane: {acct.get('lane', '?')}{active_tag}\n"
                 f"Active: [{color}]{acct.get('active_hours', 0)}h[/{color}] / "
                 f"{acct.get('active_hours', 0) + acct.get('idle_hours', 0):.0f}h\n"
                 f"{a_bar}  {a_util}%\n"
-                f"5h: {five_str}    7d: {seven_str}{stale_note}\n"
+                f"5h: {five_str}    7d: {seven_str}{reset_str}{stale_note}\n"
                 f"Sessions: {acct.get('sessions', 0)}    Tokens: {tok_s}\n"
                 f"Score: {a_stars} ({a_score:.1f})"
             )
@@ -5701,7 +5710,7 @@ class ClaudeWatchApp(App):
         Binding("A", "toggle_accounts", "Accounts"),
         Binding("w", "show_wire", "Wire"),
         Binding("M", "show_mission", "Mission"),
-        Binding("v", "show_advisor", "Advisor"),
+        Binding("v", "show_advisor", "TW Advisor"),
         Binding("[", "prev_cycle", "Prev Cycle"),
         Binding("]", "next_cycle", "Next Cycle"),
         Binding("0", "all_cycles", "All Cycles"),
@@ -6586,7 +6595,7 @@ def _cli_advisor(args):
 
     panel = Panel(
         t,
-        title=f"[bold]Advisor[/bold]  {summary_line}",
+        title=f"[bold]TW Advisor[/bold]  {summary_line}",
         subtitle=f"[dim]{report.checks_run} checks · {report.duration_ms}ms[/dim]",
         border_style="magenta",
     )

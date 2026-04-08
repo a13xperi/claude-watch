@@ -5949,6 +5949,8 @@ def _compute_utilization(window):
         cap_row = cap_by_label.get(label, {})
         is_active = cap_row.get("is_active", False)
 
+        seven_day_resets_at = None  # epoch timestamp
+
         if is_active:
             # Active account — use live data
             five_pct = cap_row.get("five_pct")
@@ -5956,6 +5958,13 @@ def _compute_utilization(window):
             five_pct = _safe_float(five_pct, 0) if five_pct not in (None, "—") else None
             seven_day = _safe_float(seven_day, 0) if seven_day not in (None, "—") else None
             snapshot_age = cap_row.get("snapshot_age_min", 0)
+            # Reset timestamps from live account_capacity table
+            try:
+                supa_cap = [r for r in _get_supabase_account_capacity() if r.get("account") == label]
+                if supa_cap:
+                    seven_day_resets_at = supa_cap[0].get("seven_day_resets_at")
+            except Exception:
+                pass
         else:
             # Inactive account — find most recent history entry
             hist = [h for h in cap_history if h.get("account") == label]
@@ -5963,6 +5972,7 @@ def _compute_utilization(window):
                 latest = hist[0]  # sorted desc by snapshot_at
                 five_pct = _safe_float(latest.get("five_hour_used_pct"), 0)
                 seven_day = _safe_float(latest.get("seven_day_used_pct"), 0)
+                seven_day_resets_at = latest.get("seven_day_resets_at")
                 # Compute age from history snapshot
                 try:
                     snap_ts = datetime.fromisoformat(
@@ -5979,6 +5989,17 @@ def _compute_utilization(window):
                 seven_day = _safe_float(seven_day, 0) if seven_day not in (None, "—") else None
                 snapshot_age = cap_row.get("snapshot_age_min", 999)
 
+        # Compute 7d reset countdown
+        seven_day_resets_in = None
+        if seven_day_resets_at and _safe_float(seven_day_resets_at) > 0:
+            try:
+                reset_dt = datetime.fromtimestamp(_safe_float(seven_day_resets_at), tz=timezone.utc)
+                delta = reset_dt - now_dt
+                if delta.total_seconds() > 0:
+                    seven_day_resets_in = round(delta.total_seconds() / 3600, 1)  # hours
+            except Exception:
+                pass
+
         score = _score_dimension(util_pct, 85.0)
 
         account_results.append({
@@ -5989,6 +6010,7 @@ def _compute_utilization(window):
             "idle_hours": round(idle_h, 1),
             "five_pct": five_pct,
             "seven_day_pct": seven_day,
+            "seven_day_resets_in_hours": seven_day_resets_in,
             "snapshot_age_min": round(snapshot_age, 0),
             "is_active": cap_row.get("is_active", False),
             "sessions": acct_sessions,
