@@ -2158,6 +2158,44 @@ class MCPStatsView(LazyView):
             at.add_row(Text("no data", style="dim"), "")
 
 
+class BlockAssignScreen(Screen):
+    """Modal for assigning a cycle item to a Pomodoro block (1-10)."""
+
+    BINDINGS = [Binding("escape", "pop_screen", "Cancel")]
+
+    def __init__(self, item_title, callback):
+        # type: (str, Any) -> None
+        super().__init__()
+        self._item_title = item_title
+        self._callback = callback
+
+    def compose(self) -> ComposeResult:
+        from textual.widgets import Input
+        yield Static(
+            f"Assign to Pomodoro block (1-10):\n[cyan]{self._item_title}[/cyan]",
+            id="ba-prompt",
+        )
+        yield Input(id="ba-input", placeholder="Block number (1-10)")
+
+    def on_mount(self):
+        from textual.widgets import Input
+        self.query_one("#ba-input", Input).focus()
+
+    def on_input_submitted(self, event):
+        try:
+            num = int(event.value.strip())
+            if 1 <= num <= 10:
+                self._callback(num)
+                self.app.pop_screen()
+            else:
+                self.query_one("#ba-prompt", Static).update("[red]Must be 1-10[/red]")
+        except ValueError:
+            self.query_one("#ba-prompt", Static).update("[red]Enter a number 1-10[/red]")
+
+    def action_pop_screen(self):
+        self.app.pop_screen()
+
+
 class SessionTasksView(LazyView):
     """Cycle Monitor — freeform items for the current 5h window."""
 
@@ -2181,6 +2219,7 @@ class SessionTasksView(LazyView):
         Binding("x", "toggle_done", "Done"),
         Binding("r", "roll_item", "Roll"),
         Binding("d", "delete_item", "Delete"),
+        Binding("b", "assign_block", "Block"),
         Binding("slash", "start_filter", "Filter"),
         Binding("a", "show_all", "All"),
         Binding("i", "import_cycle_sessions", "Import sessions"),
@@ -2424,7 +2463,7 @@ class SessionTasksView(LazyView):
         self.query_one("#cm-header", Static).update(
             f"[bold]CYCLE MONITOR[/bold]  {mode_label}  "
             f"[green]{open_count} open[/green]  [dim]{done_count} done[/dim]{filter_str}  "
-            f"[dim](n=add  /=filter  a=all  Enter=edit  x=done  r=roll  d=delete  q=back)[/dim]"
+            f"[dim](n=add  /=filter  a=all  Enter=edit  x=done  r=roll  b=block  d=delete  q=back)[/dim]"
         )
 
         # Objective banner from cycle plan
@@ -2794,6 +2833,30 @@ class SessionTasksView(LazyView):
             "resolved_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         })
         self._reload()
+
+    def action_assign_block(self):
+        from claude_watch_data import _assign_item_to_pomodoro
+        dt = self.query_one("#cm-table", DataTable)
+        if dt.cursor_row is None:
+            return
+        try:
+            row_key_str = str(dt._row_order[dt.cursor_row])
+        except Exception:
+            return
+        item = self._get_item_by_row_key(row_key_str)
+        if not item:
+            return
+        item_id = item["id"]
+        item_title = item.get("title", "")
+        view = self
+
+        def _do_assign(block_num):
+            # type: (int) -> None
+            _assign_item_to_pomodoro(item_id, block_num)
+            view._reload()
+            view.notify(f"Assigned to P{block_num}")
+
+        self.app.push_screen(BlockAssignScreen(item_title, _do_assign))
 
     def action_delete_item(self):
         from claude_watch_data import _delete_cycle_item
@@ -4711,8 +4774,10 @@ class TestQueueView(LazyView):
         proj_label = self._filter_project or "all projects"
         total_points = sum(i.get("points", 1) for i in self._items if i.get("status") in ("pass",))
         pending_points = sum(i.get("points", 1) for i in self._items if i.get("status") == "pending")
+        cycle_id = getattr(self.app, '_active_cycle_id', None) if hasattr(self, 'app') else None
+        cycle_tag = "[magenta]ALL[/magenta]" if cycle_id is None else "[dim]cycle[/dim]"
         self.query_one("#tq-header", Static).update(
-            f"[bold cyan]Test Queue[/bold cyan]  "
+            f"[bold cyan]Test Queue[/bold cyan] {cycle_tag}  "
             f"[yellow]{pending} pending ({pending_points}pts)[/yellow]  "
             f"[green]{passed} passed ({total_points}pts)[/green]  "
             f"[red]{failed} failed[/red]  "
@@ -4926,13 +4991,27 @@ class MissionControlView(LazyView):
         data = _get_build_ledger(days=7, limit=100, cycle_id=cycle_id)
         stats = data["stats"]
 
+        # Cycle navigation indicator
+        cycle_id = getattr(self.app, '_active_cycle_id', None)
+        if cycle_id is None:
+            cycle_label = "[bold magenta]ALL CYCLES[/bold magenta]"
+        else:
+            try:
+                from datetime import datetime
+                dt = datetime.fromisoformat(cycle_id)
+                cycle_label = f"[bold]Cycle: {dt.strftime('%b %-d, %H:%M')}[/bold]"
+                if getattr(self.app, '_cycle_idx', 0) == 0:
+                    cycle_label += " [green](current)[/green]"
+            except Exception:
+                cycle_label = f"[bold]Cycle: {cycle_id[:16]}[/bold]"
+
         self.query_one("#mission-header", Static).update(
-            f"[bold]Mission Control[/bold]  "
-            f"[dim]{stats['total']} items shipped  ·  "
+            f"{cycle_label}  "
+            f"[dim]\u25C0 [  ] \u25B6  |  0=all[/dim]  "
+            f"[dim]{stats['total']} shipped  ·  "
             f"[yellow]{stats['untested']} untested[/yellow]  ·  "
             f"[cyan]{stats['decisions']} decisions[/cyan]  ·  "
-            f"{stats['sessions']} sessions  ·  "
-            f"{stats['projects']} projects[/dim]"
+            f"{stats['sessions']} sessions[/dim]"
         )
 
         table = self.query_one("#mission-table", DataTable)
@@ -5228,6 +5307,7 @@ class ClaudeWatchApp(App):
         Binding("M", "show_mission", "Mission"),
         Binding("[", "prev_cycle", "Prev Cycle"),
         Binding("]", "next_cycle", "Next Cycle"),
+        Binding("0", "all_cycles", "All Cycles"),
         Binding("g", "show_rules", "Rules"),
         Binding("w", "show_attribution", "Who?"),
         Binding("slash", "start_search", "Search"),
@@ -5457,6 +5537,18 @@ class ClaudeWatchApp(App):
         else:
             pomo_str = ""
 
+        # Detect Pomodoro block transition and notify about next planned task
+        if pomo and pomo != getattr(self, "_last_pomo", None):
+            self._last_pomo = pomo
+            try:
+                from claude_watch_data import _get_next_pomodoro_task
+                next_task = _get_next_pomodoro_task()
+                if next_task:
+                    task_title = next_task.get("title", "")[:50]
+                    self.notify(f"Block P{pomo} started \u2014 next task: {task_title}")
+            except Exception:
+                pass
+
         sessions = _get_cycle_sessions(current["cycle_id"])
         from claude_watch_data import _get_cycle_items
         bd = _get_burndown_data()
@@ -5632,6 +5724,19 @@ class ClaudeWatchApp(App):
             self._active_cycle_id = start.isoformat() if hasattr(start, 'isoformat') else str(start)
             self._update_cycle_banner()
             self.refresh_data()
+
+    def action_all_cycles(self):
+        """Toggle between current cycle and all cycles."""
+        if self._active_cycle_id is None:
+            # Switch back to current
+            from claude_watch_data import _get_current_cycle_id
+            self._active_cycle_id = _get_current_cycle_id()
+            self._cycle_idx = 0
+        else:
+            # Show all
+            self._active_cycle_id = None
+        self._update_cycle_banner()
+        self.refresh_data()
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         btn_map = {

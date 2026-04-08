@@ -4818,6 +4818,56 @@ def _get_cycle_items_for_scoring(window_start):
     return done_count, projects
 
 
+def _assign_item_to_pomodoro(item_id, block_num):
+    # type: (str, int) -> bool
+    """Assign a cycle item to a Pomodoro block by prepending/replacing P{n}: prefix."""
+    import urllib.request
+    # First fetch the item to get current title
+    try:
+        req = urllib.request.Request(
+            f"{_SUPABASE_URL}/cycle_items?id=eq.{item_id}&select=title",
+            headers={
+                "apikey": _SUPABASE_KEY,
+                "Authorization": f"Bearer {_SUPABASE_KEY}",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            rows = json.loads(resp.read())
+    except Exception:
+        return False
+    if not rows:
+        return False
+    title = rows[0].get("title", "")
+    # Strip existing P-prefix if present (e.g. "P3: foo" or "P3-FE: foo")
+    new_title = re.sub(r"^P\d+[-:\s]*(?:FE|BE|QA)?[-:\s]*", "", title).strip()
+    new_title = f"P{block_num}: {new_title}"
+    return _update_cycle_item(item_id, {"title": new_title})
+
+
+def _get_next_pomodoro_task():
+    # type: () -> Optional[dict]
+    """Find the first open cycle item assigned to the next Pomodoro block."""
+    pomo = _get_current_pomodoro()
+    if pomo is None or pomo >= 10:
+        return None
+    next_block = pomo + 1
+    bd = _get_burndown_data()
+    if not bd or not bd.get("window_start"):
+        return None
+    ws = bd["window_start"]
+    ws_str = ws.isoformat() if isinstance(ws, datetime) else str(ws)
+    items = _get_cycle_items(ws_str)
+    prefix = f"P{next_block}"
+    for item in items:
+        if item.get("status") != "open":
+            continue
+        title = item.get("title", "")
+        m = re.match(r"^P(\d+)", title)
+        if m and int(m.group(1)) == next_block:
+            return item
+    return None
+
+
 def _roll_cycle_items(old_window_start, new_window_start):
     # type: (str, str) -> int
     """Roll open items from old window to new window. Returns count rolled."""
