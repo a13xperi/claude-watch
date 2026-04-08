@@ -3397,17 +3397,42 @@ def _score_window(window_start_ts, window_reset_ts):
 
 
 
-def _get_build_ledger(days=1, limit=100):
+
+
+def _get_current_cycle_id():
+    """Get the current cycle_id (window_start ISO) from statusline data."""
+    from datetime import datetime, timedelta, timezone
+    try:
+        five, seven, five_reset_ts, seven_reset_ts = _current_pct()
+        if five_reset_ts:
+            reset = datetime.fromisoformat(five_reset_ts.replace("Z", "+00:00"))
+            return (reset - timedelta(hours=5)).isoformat()
+    except Exception:
+        pass
+    # Fallback: read from statusline debug
+    try:
+        import json
+        with open("/tmp/statusline-debug.json") as f:
+            d = json.load(f)
+        ts = d["rate_limits"]["five_hour"]["resets_at"]
+        reset = datetime.fromtimestamp(int(ts), tz=timezone.utc)
+        return (reset - timedelta(hours=5)).isoformat()
+    except Exception:
+        return None
+
+def _get_build_ledger(days=1, limit=100, cycle_id=None):
     """Fetch build ledger items grouped by company/project."""
     import urllib.request
     from datetime import datetime, timedelta, timezone
     try:
         cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%SZ")
-        url = (
-            f"{_SUPABASE_URL}/build_ledger"
-            f"?created_at=gte.{cutoff}"
-            f"&order=created_at.desc&limit={limit}"
-        )
+        url = f"{_SUPABASE_URL}/build_ledger?"
+        if cycle_id:
+            from urllib.parse import quote
+            url += f"cycle_id=eq.{quote(str(cycle_id))}&"
+        else:
+            url += f"created_at=gte.{cutoff}&"
+        url += f"order=created_at.desc&limit={limit}"
         req = urllib.request.Request(url, headers={
             "apikey": _SUPABASE_KEY,
             "Authorization": f"Bearer {_SUPABASE_KEY}",
@@ -3447,15 +3472,16 @@ def _get_build_ledger(days=1, limit=100):
     except Exception:
         return {"items": [], "by_company": {}, "stats": {"total": 0, "untested": 0, "decisions": 0, "sessions": 0, "projects": 0}}
 
-def _get_wire_messages(limit=50):
+def _get_wire_messages(limit=50, cycle_id=None):
     """Fetch recent Wire messages from Supabase session_messages table."""
     import urllib.request
     try:
-        url = (
-            f"{_SUPABASE_URL}/session_messages"
-            f"?select=id,from_session,to_session,msg_type,payload,read,acked,created_at"
-            f"&order=created_at.desc&limit={limit}"
-        )
+        url = f"{_SUPABASE_URL}/session_messages"
+        url += f"?select=id,from_session,to_session,msg_type,payload,read,acked,created_at"
+        if cycle_id:
+            from urllib.parse import quote
+            url += f"&cycle_id=eq.{quote(str(cycle_id))}"
+        url += f"&order=created_at.desc&limit={limit}"
         req = urllib.request.Request(url, headers={
             "apikey": _SUPABASE_KEY,
             "Authorization": f"Bearer {_SUPABASE_KEY}",
@@ -4016,6 +4042,134 @@ def _get_cycle_sessions(cycle_id):
         except Exception:
             pass
     return result
+
+
+# ── Pomodoro Block Stats ─────────────────────────────────────────────────────
+
+_pomo_cache = {}   # type: dict
+_pomo_cache_ts = 0.0
+
+
+def _get_pomodoro_stats(cycle_id):
+    # type: (str) -> list
+    """Slice a 5h cycle into 10 x 30-min Pomodoro blocks with per-block stats."""
+    global _pomo_cache, _pomo_cache_ts
+    now = time.time()
+    if cycle_id in _pomo_cache and (now - _pomo_cache_ts) < 30:
+        return _pomo_cache[cycle_id]
+
+    # Resolve cycle boundaries
+    boundaries = _get_cycle_boundaries()
+    target_start = None
+    target_end = None
+    for start, end in boundaries:
+        if start.isoformat() == cycle_id:
+            target_start = start
+            target_end = end
+            break
+
+    if target_start is None or target_end is None:
+        return []
+
+    # Load ledger entries within this cycle window
+    ledger = _load_ledger()
+    cycle_ledger = []
+    for entry in ledger:
+        try:
+            ts = datetime.fromisoformat(entry["ts"].replace("Z", "+00:00"))
+            if target_start <= ts < target_end:
+                cycle_ledger.append((ts, entry))
+        except Exception:
+            pass
+
+    # Load sessions for this cycle
+    cycle_sessions = _get_cycle_sessions(cycle_id)
+
+    now_utc = datetime.now(timezone.utc)
+    blocks = []
+    for i in range(10):
+        block_start = target_start + timedelta(minutes=i * 30)
+        block_end = target_start + timedelta(minutes=(i + 1) * 30)
+
+        # Filter ledger entries for this block
+        block_entries = [(ts, e) for ts, e in cycle_ledger if block_start <= ts < block_end]
+
+        # Filter sessions whose first_ts falls in this block
+        block_session_ids = set()
+        for s in cycle_sessions:
+            try:
+                first = s["first_ts"]
+                if not isinstance(first, datetime):
+                    first = datetime.fromisoformat(str(first).replace("Z", "+00:00"))
+                if first.tzinfo is None:
+                    first = first.replace(tzinfo=timezone.utc)
+                if block_start <= first < block_end:
+                    sid = s.get("session_id") or s.get("id", "")
+                    if sid:
+                        block_session_ids.add(sid)
+            except Exception:
+                pass
+
+        # Also collect session IDs from ledger entries in this block
+        for _ts, e in block_entries:
+            sid = e.get("session")
+            if sid:
+                block_session_ids.add(sid)
+
+        # Compute stats
+        output_tokens = sum(e.get("output_tokens", 0) for _ts, e in block_entries)
+
+        five_pct_start = None
+        five_pct_end = None
+        for _ts, e in block_entries:
+            val = e.get("five_pct")
+            if val is not None:
+                five_pct_start = _safe_float(val)
+                break
+        for _ts, e in reversed(block_entries):
+            val = e.get("five_pct")
+            if val is not None:
+                five_pct_end = _safe_float(val)
+                break
+
+        if five_pct_start is not None and five_pct_end is not None:
+            delta_pct = five_pct_end - five_pct_start
+        else:
+            delta_pct = 0.0
+
+        cost = sum(
+            _estimate_cost(e.get("output_tokens", 0), e.get("model", ""))
+            for _ts, e in block_entries
+        )
+
+        blocks.append({
+            "block_num": i + 1,
+            "start_ts": block_start.isoformat(),
+            "end_ts": block_end.isoformat(),
+            "output_tokens": output_tokens,
+            "five_pct_start": five_pct_start,
+            "five_pct_end": five_pct_end,
+            "delta_pct": delta_pct,
+            "tool_calls": len(block_entries),
+            "session_ids": sorted(block_session_ids),
+            "cost": cost,
+            "is_current": block_start <= now_utc < block_end,
+            "is_future": block_start > now_utc,
+        })
+
+    _pomo_cache[cycle_id] = blocks
+    _pomo_cache_ts = now
+    return blocks
+
+
+def _get_current_pomodoro():
+    # type: () -> Optional[int]
+    """Return the current 1-indexed Pomodoro block number (1-10), or None."""
+    bd = _get_burndown_data()
+    if not bd:
+        return None
+    mins_elapsed = bd["mins_total"] - bd["mins_to_reset"]
+    return min(10, int(mins_elapsed / 30) + 1)
 
 
 # ── Cycle Planning ───────────────────────────────────────────────────────────
@@ -4738,7 +4892,7 @@ def _roll_cycle_items(old_window_start, new_window_start):
 
 # ── Test Queue ────────────────────────────────────────────────────────────────
 
-def _get_test_queue(project=None, status="pending"):
+def _get_test_queue(project=None, status="pending", cycle_id=None):
     # type: (str, str) -> list
     """Fetch test items from build_ledger (single source of truth).
     Maps build_ledger fields to test_queue format for backward compat."""
@@ -4750,6 +4904,8 @@ def _get_test_queue(project=None, status="pending"):
     bl_status = status_map.get(status) if status else None
 
     url = f"{_SUPABASE_URL}/build_ledger?"
+    if cycle_id:
+        url += f"cycle_id=eq.{quote(cycle_id)}&"
     if bl_status is not None:
         url += f"test_status=eq.{quote(bl_status)}&"
     if project:

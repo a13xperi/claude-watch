@@ -855,6 +855,34 @@ class BurndownChart(Static):
         # Budget per 10 minutes (to use it all evenly)
         budget_per_10 = (remaining / mins_to_reset * 10) if mins_to_reset > 0 else 0
 
+        # Per-Pomodoro block stats
+        from claude_watch_data import _get_current_pomodoro, _get_pomodoro_stats, _get_current_cycle
+        pomo_num = _get_current_pomodoro()
+        pomo_stats = None
+        pomo_strip = ""
+        if pomo_num:
+            try:
+                current_cycle = _get_current_cycle()
+                if current_cycle:
+                    all_blocks = _get_pomodoro_stats(current_cycle["cycle_id"])
+                    if all_blocks and 0 < pomo_num <= len(all_blocks):
+                        pomo_stats = all_blocks[pomo_num - 1]
+                    # Build mini strip: past=█ current=▓ future=░
+                    chars = []
+                    for b in all_blocks:
+                        if b["is_current"]:
+                            chars.append("[bold white]\u2593[/bold white]")
+                        elif b["is_future"]:
+                            chars.append("[dim]\u2591[/dim]")
+                        else:
+                            chars.append("[cyan]\u2588[/cyan]")
+                    pomo_strip = "".join(chars)
+            except Exception:
+                pass
+
+        block_used = abs(pomo_stats["delta_pct"]) if pomo_stats else 0.0
+        block_color = "green" if block_used <= 10 else ("yellow" if block_used <= 15 else "red")
+
         # Render 8 chart rows (fills full vertical space)
         num_rows = 8
         row_height = 100.0 / num_rows
@@ -1099,8 +1127,10 @@ class BurndownChart(Static):
             f"  [bold]7d[/bold] {mini_bar(seven)} {_safe_float(seven):.0f}%  [dim]{_reset_day(sr)[:10]}[/dim]",
             f"  [{five_zcolor}]{five_zone}[/{five_zcolor}] 5h  [{seven_zcolor}]{seven_zone}[/{seven_zcolor}] 7d",
             f"  [{acct_color}]Acct {label}[/{acct_color}]: {name} [dim]({lane})[/dim]",
-            "",
+            f"  P: {pomo_strip} {pomo_num or '?'}/10" if pomo_num else "",
             f"  {verdict}",
+            (f"  P{pomo_num}: [{block_color}]{block_used:.1f}%[/{block_color}] (budget: 10%)"
+             f"  [{budget_color}]{budget_per_10:.1f}%/10m[/{budget_color}]") if pomo_stats else
             f"  [{remaining_color}]{remaining:.0f}% left[/{remaining_color}]  [{budget_color}]Budget: {budget_per_10:.1f}%/10m[/{budget_color}]",
             f"  {pace_str}",
             f"  {score_line}",
@@ -2160,6 +2190,7 @@ class SessionTasksView(LazyView):
         from textual.widgets import Input
         yield Static(id="cm-header")
         yield Static(id="cm-objective")
+        yield Static(id="cm-pomodoro")
         with Horizontal(id="cm-add-row"):
             yield Input(id="cm-add-input", placeholder="Add item... (Tab=cat, Shift+Tab=project, Enter=save)")
             yield Button("Task \u2610", id="cm-cat-task", classes="cm-cat", variant="primary")
@@ -2251,8 +2282,13 @@ class SessionTasksView(LazyView):
     def _reload(self):
         from claude_watch_data import (
             _get_cycle_items, _get_recent_cycle_summaries, _get_current_cycle,
-            _get_cycle_plan,
+            _get_cycle_plan, _get_pomodoro_stats, _get_current_pomodoro,
+            _format_cost,
         )
+
+        # Load lane map from cycle plan
+        plan = _get_cycle_plan(self._window_start) if self._window_start else None
+        self._lane_map = plan.get("lanes", {}) if plan else {}
 
         # Fetch items
         self._items = _get_cycle_items(self._window_start, all_windows=self._show_all_windows)
@@ -2310,6 +2346,7 @@ class SessionTasksView(LazyView):
                     Text("", style="dim"),
                     Text("", style="dim"),
                     Text("", style="dim"),
+                    Text("", style="dim"),
                     key=f"sep-{cat}",
                 )
             first_group = False
@@ -2333,12 +2370,30 @@ class SessionTasksView(LazyView):
                         break
                 age = self._fmt_age(item.get("created_at", ""))
 
+                # Auto-assign lane from cycle plan
+                lane = ""
+                if hasattr(self, "_lane_map") and self._lane_map:
+                    item_title_lower = (item.get("title") or "").lower()
+                    item_proj_lower = (item.get("project") or "").lower()
+                    for lane_name, lane_info in self._lane_map.items():
+                        lane_proj = (lane_info.get("project") or "").lower()
+                        if lane_proj and lane_proj in item_proj_lower:
+                            lane = lane_name[:6]
+                            break
+                        for task in lane_info.get("tasks", []):
+                            if task.lower() in item_title_lower:
+                                lane = lane_name[:6]
+                                break
+                        if lane:
+                            break
+
                 dt.add_row(
                     Text(cat_icon),
                     Text(st_icon, style=st_style),
                     Text(title, style="strike" if status == "done" else ""),
                     Text(company, style="magenta"),
                     Text(project, style="cyan"),
+                    Text(lane, style="yellow"),
                     Text(age, style="dim"),
                     key=f"ci-{item['id']}",
                 )
@@ -2348,6 +2403,7 @@ class SessionTasksView(LazyView):
                 Text(""),
                 Text(""),
                 Text("No items yet — press n to add", style="dim"),
+                Text(""),
                 Text(""),
                 Text(""),
                 Text(""),
@@ -2387,6 +2443,84 @@ class SessionTasksView(LazyView):
                     parts.append(f"  Lanes: {' | '.join(lane_strs)}")
                 obj_text = "\n".join(parts)
         self.query_one("#cm-objective", Static).update(obj_text)
+
+        # Pomodoro block summary — show what got done in each block
+        pomo_text = ""
+        pomo_num = _get_current_pomodoro()
+        if cycle and pomo_num:
+            from claude_watch_data import _get_cycle_sessions
+            blocks = _get_pomodoro_stats(cycle["cycle_id"])
+            all_sessions = _get_cycle_sessions(cycle["cycle_id"])
+
+            if blocks:
+                # Map session_id -> directive
+                dir_map = {}
+                for s in all_sessions:
+                    sid = s.get("session_id", "")
+                    d = s.get("directive", "") or ""
+                    if sid and d:
+                        dir_map[sid] = d
+
+                # Map cycle items to block numbers by P-prefix
+                import re
+                item_by_block = {}  # type: dict
+                for item in self._items:
+                    title = item.get("title", "")
+                    m = re.match(r"^P(\d+)", title)
+                    if m:
+                        bnum = int(m.group(1))
+                        clean = re.sub(r"^P\d+[-:\s]*(?:FE|BE|QA)?[-:\s]*", "", title).strip()
+                        if clean:
+                            item_by_block.setdefault(bnum, []).append(
+                                (clean[:30], item.get("status") == "done")
+                            )
+
+                lines = []
+                for b in blocks:
+                    bn = b["block_num"]
+                    delta = abs(b["delta_pct"])
+
+                    if b["is_current"]:
+                        label = f"[bold cyan]\u25b8P{bn}[/bold cyan]"
+                    elif b["is_future"]:
+                        label = f"[dim]P{bn}[/dim]"
+                    else:
+                        color = "green" if delta <= 10 else ("yellow" if delta <= 15 else "red")
+                        label = f"[{color}]P{bn}[/{color}]"
+
+                    # Gather what happened: cycle items first, then session directives
+                    things = []
+                    if bn in item_by_block:
+                        for title, done in item_by_block[bn]:
+                            if done:
+                                things.append(f"[green]\u2713{title}[/green]")
+                            else:
+                                things.append(title)
+                    else:
+                        # Fall back to unique session directives
+                        seen = set()
+                        for sid in b.get("session_ids", []):
+                            d = dir_map.get(sid, "")
+                            if d and d not in seen:
+                                seen.add(d)
+                                things.append(d[:25])
+
+                    if b["is_future"]:
+                        desc = "[dim]\u2500\u2500[/dim]"
+                    elif not things and b["tool_calls"] == 0:
+                        desc = "[dim]idle[/dim]"
+                    elif things:
+                        desc = "[dim], [/dim]".join(things[:2])
+                        if len(things) > 2:
+                            desc += f" [dim]+{len(things)-2}[/dim]"
+                    else:
+                        desc = f"[dim]{len(b['session_ids'])} sessions[/dim]"
+
+                    pct = f" [dim]{delta:.0f}%[/dim]" if not b["is_future"] and delta > 0 else ""
+                    lines.append(f" {label}{pct} {desc}")
+
+                pomo_text = "[bold]POMODORO[/bold]\n" + "\n".join(lines)
+        self.query_one("#cm-pomodoro", Static).update(pomo_text)
 
         # Lane visualization
         lane_widgets = ["#cm-lane-1", "#cm-lane-2", "#cm-lane-3"]
@@ -3534,11 +3668,13 @@ class CyclesView(LazyView):
         dt.add_column("Gravity", width=14)
 
         self._cycle_map = {}  # row_key -> cycle dict
-        rank = 0
-        for c in all_cycles:
-            if c.get("is_current"):
-                continue
-            rank += 1
+        # Number oldest = #1, but display newest first (top of table)
+        ordered = list(reversed(all_cycles))  # oldest first for numbering
+        display_order = []
+        for rank, c in enumerate(ordered, 1):
+            display_order.append((rank, c))
+        display_order.reverse()  # newest first for display
+        for rank, c in display_order:
             try:
                 start_dt = datetime.fromisoformat(c["start_ts"])
                 start_str = start_dt.strftime("%b %-d %-I:%M %p")
@@ -3574,8 +3710,8 @@ class CyclesView(LazyView):
                 key=row_key,
             )
 
-        if rank == 0:
-            dt.add_row("", Text("No past cycles recorded yet", style="dim"),
+        if not ordered:
+            dt.add_row("", Text("No cycles recorded yet", style="dim"),
                         "", "", "", "", "", "", "")
 
     def on_data_table_row_selected(self, event):
@@ -3615,6 +3751,7 @@ class CycleDetailScreen(Screen):
         from claude_watch_data import (
             _get_cycle_sessions, _get_cycle_plan, _stars_display,
             _format_cost, _estimate_cost, _countdown,
+            _get_pomodoro_stats,
         )
 
         c = self.cycle
@@ -3727,6 +3864,7 @@ class CycleDetailScreen(Screen):
         dt = self.query_one("#cdetail-sessions", DataTable)
         dt.cursor_type = "row"
         dt.zebra_stripes = True
+        dt.add_column("Pomo", width=28)
         dt.add_column("Session", width=12)
         dt.add_column("Project", width=18)
         dt.add_column("Duration", width=10)
@@ -3736,49 +3874,129 @@ class CycleDetailScreen(Screen):
 
         self._session_map = {}  # row_key -> session dict
 
-        for i, s in enumerate(sessions):
-            sid = s.get("session_id", "?")
-            short_sid = sid[:10] if len(sid) > 10 else sid
-            project = s.get("project", "\u2014")
-            tokens = s.get("output_tokens", 0) or 0
-            model = s.get("model", "")
-            cost = _estimate_cost(tokens, model)
-            directive = s.get("directive", "") or ""
+        blocks = _get_pomodoro_stats(c["cycle_id"])
+        session_to_block = {}
+        if blocks:
+            for b in blocks:
+                for sid in b.get("session_ids", []):
+                    session_to_block[sid] = b["block_num"]
 
-            # Duration
-            try:
-                first = s.get("first_ts")
-                last = s.get("last_ts")
-                if first and last:
-                    if not isinstance(first, datetime):
-                        first = datetime.fromisoformat(str(first).replace("Z", "+00:00"))
-                    if not isinstance(last, datetime):
-                        last = datetime.fromisoformat(str(last).replace("Z", "+00:00"))
-                    dur_secs = int((last - first).total_seconds())
-                    dur_m = dur_secs // 60
-                    dur_str = f"{dur_m}m" if dur_m < 60 else f"{dur_m // 60}h{dur_m % 60:02d}m"
+        if blocks:
+            row_idx = 0
+            for b in blocks:
+                # Block separator row
+                try:
+                    bstart = datetime.fromisoformat(b["start_ts"]).astimezone()
+                    bend = datetime.fromisoformat(b["end_ts"]).astimezone()
+                    t_start = bstart.strftime("%-I:%M")
+                    t_end = bend.strftime("%-I:%M")
+                except Exception:
+                    t_start = "?"
+                    t_end = "?"
+                tok = b["output_tokens"]
+                tok_str = f"{tok // 1000}k" if tok >= 1000 else str(tok)
+                n_sess = len(b["session_ids"])
+                delta = abs(b["delta_pct"])
+
+                if b["is_current"]:
+                    hdr_style = "bold cyan"
+                elif b["is_future"]:
+                    hdr_style = "dim"
                 else:
+                    hdr_style = "bold"
+
+                if n_sess > 0:
+                    hdr = f"P{b['block_num']} ({t_start}-{t_end}) \u2014 {n_sess} sess, {tok_str}, {delta:.1f}%"
+                else:
+                    hdr = f"P{b['block_num']} ({t_start}-{t_end}) \u2014 idle"
+
+                dt.add_row(
+                    Text(hdr, style=hdr_style),
+                    Text(""), Text(""), Text(""), Text(""), Text(""), Text(""),
+                    key=f"pomo-hdr-{b['block_num']}",
+                )
+
+                # Sessions in this block
+                block_sessions = [s for s in sessions if session_to_block.get(s.get("session_id", "")) == b["block_num"]]
+                for s in block_sessions:
+                    sid = s.get("session_id", "?")
+                    short_sid = sid[:10] if len(sid) > 10 else sid
+                    project = s.get("project", "\u2014")
+                    tokens = s.get("output_tokens", 0) or 0
+                    model = s.get("model", "")
+                    cost = _estimate_cost(tokens, model)
+                    directive = s.get("directive", "") or ""
+                    try:
+                        first = s.get("first_ts")
+                        last = s.get("last_ts")
+                        if first and last:
+                            if not isinstance(first, datetime):
+                                first = datetime.fromisoformat(str(first).replace("Z", "+00:00"))
+                            if not isinstance(last, datetime):
+                                last = datetime.fromisoformat(str(last).replace("Z", "+00:00"))
+                            dur_secs = int((last - first).total_seconds())
+                            dur_m = dur_secs // 60
+                            dur_str = f"{dur_m}m" if dur_m < 60 else f"{dur_m // 60}h{dur_m % 60:02d}m"
+                        else:
+                            dur_str = "\u2014"
+                    except Exception:
+                        dur_str = "\u2014"
+                    tok_s = f"{tokens // 1000}k" if tokens >= 1000 else str(tokens)
+                    row_key = f"csess-{row_idx}"
+                    self._session_map[row_key] = s
+                    dt.add_row(
+                        Text(""),
+                        Text(short_sid, style="cyan"),
+                        Text(project),
+                        Text(dur_str, justify="right"),
+                        Text(tok_s, justify="right"),
+                        Text(_format_cost(cost)),
+                        Text(directive[:30], style="dim"),
+                        key=row_key,
+                    )
+                    row_idx += 1
+        else:
+            # Fallback: flat list (no block data)
+            for i, s in enumerate(sessions):
+                sid = s.get("session_id", "?")
+                short_sid = sid[:10] if len(sid) > 10 else sid
+                project = s.get("project", "\u2014")
+                tokens = s.get("output_tokens", 0) or 0
+                model = s.get("model", "")
+                cost = _estimate_cost(tokens, model)
+                directive = s.get("directive", "") or ""
+                try:
+                    first = s.get("first_ts")
+                    last = s.get("last_ts")
+                    if first and last:
+                        if not isinstance(first, datetime):
+                            first = datetime.fromisoformat(str(first).replace("Z", "+00:00"))
+                        if not isinstance(last, datetime):
+                            last = datetime.fromisoformat(str(last).replace("Z", "+00:00"))
+                        dur_secs = int((last - first).total_seconds())
+                        dur_m = dur_secs // 60
+                        dur_str = f"{dur_m}m" if dur_m < 60 else f"{dur_m // 60}h{dur_m % 60:02d}m"
+                    else:
+                        dur_str = "\u2014"
+                except Exception:
                     dur_str = "\u2014"
-            except Exception:
-                dur_str = "\u2014"
-
-            tok_str = f"{tokens // 1000}k" if tokens >= 1000 else str(tokens)
-
-            row_key = f"csess-{i}"
-            self._session_map[row_key] = s
-            dt.add_row(
-                Text(short_sid, style="cyan"),
-                Text(project),
-                Text(dur_str, justify="right"),
-                Text(tok_str, justify="right"),
-                Text(_format_cost(cost)),
-                Text(directive[:30], style="dim"),
-                key=row_key,
-            )
+                tok_str = f"{tokens // 1000}k" if tokens >= 1000 else str(tokens)
+                row_key = f"csess-{i}"
+                self._session_map[row_key] = s
+                dt.add_row(
+                    Text(""),
+                    Text(short_sid, style="cyan"),
+                    Text(project),
+                    Text(dur_str, justify="right"),
+                    Text(tok_str, justify="right"),
+                    Text(_format_cost(cost)),
+                    Text(directive[:30], style="dim"),
+                    key=row_key,
+                )
 
         if not sessions:
             dt.add_row(
-                Text("\u2014", style="dim"), Text("No sessions in this cycle", style="dim"),
+                Text("\u2014", style="dim"), Text(""), Text("No sessions in this cycle", style="dim"),
                 Text(""), Text(""), Text(""), Text(""),
             )
 
@@ -4374,6 +4592,15 @@ class TestDetailScreen(Screen):
     def on_mount(self):
         item = self._item
         files = item.get("files") or []
+
+        # Format timestamp: "01:10 — Apr 8, 2026" 
+        raw_ts = item.get("created_at", "")
+        try:
+            from datetime import datetime
+            dt = datetime.fromisoformat(raw_ts.replace("Z", "+00:00"))
+            formatted_ts = dt.strftime("%H:%M — %b %-d, %Y")
+        except Exception:
+            formatted_ts = raw_ts
         files_list = "\n".join(f"    {f}" for f in files) if files else "    (none)"
         hint = item.get("test_hint", "") or item.get("route", "") or "No instructions"
         notes = item.get("notes", "") or ""
@@ -4384,6 +4611,7 @@ class TestDetailScreen(Screen):
         st_color = status_style.get(status, "white")
 
         body = f"""[bold]{item.get('title', '—')}[/bold]
+[dim]{formatted_ts}[/dim]
 
 [dim]{'─' * 60}[/dim]
 
@@ -4393,10 +4621,10 @@ class TestDetailScreen(Screen):
 [bold cyan]Details[/bold cyan]
     Project:  [cyan]{item.get('project', '—')}[/cyan]  ({item.get('company', '—')})
     Type:     {item.get('item_type', '—')}
+    Difficulty: {item.get('difficulty', 'medium')}  |  Points: {item.get('points', 1)}
     Session:  {item.get('session_id', '—')}
     Commit:   {item.get('commit_sha', '—')}
     Source:   {item.get('source', '—')}
-    Created:  {item.get('created_at', '—')}
     Status:   [{st_color}]{status}[/{st_color}]
 
 [bold cyan]Files Changed[/bold cyan]
@@ -4469,7 +4697,8 @@ class TestQueueView(LazyView):
     def _reload_data(self):
         status_filter = None if self._show_all else "pending"
         project_filter = self._filter_project if self._filter_project else None
-        self._items = _get_test_queue(project=project_filter, status=status_filter)
+        cycle_id = getattr(self.app, '_active_cycle_id', None) if hasattr(self, 'app') else None
+        self._items = _get_test_queue(project=project_filter, status=status_filter, cycle_id=cycle_id)
         self._render_table()
 
     def _render_table(self):
@@ -4480,10 +4709,12 @@ class TestQueueView(LazyView):
 
         mode_label = "all" if self._show_all else "pending only"
         proj_label = self._filter_project or "all projects"
+        total_points = sum(i.get("points", 1) for i in self._items if i.get("status") in ("pass",))
+        pending_points = sum(i.get("points", 1) for i in self._items if i.get("status") == "pending")
         self.query_one("#tq-header", Static).update(
             f"[bold cyan]Test Queue[/bold cyan]  "
-            f"[yellow]{pending} pending[/yellow]  "
-            f"[green]{passed} passed[/green]  "
+            f"[yellow]{pending} pending ({pending_points}pts)[/yellow]  "
+            f"[green]{passed} passed ({total_points}pts)[/green]  "
             f"[red]{failed} failed[/red]  "
             f"[dim]{skipped} skipped  ·  {mode_label}  ·  {proj_label}[/dim]"
         )
@@ -4503,11 +4734,11 @@ class TestQueueView(LazyView):
         dt.zebra_stripes = True
         dt.add_column("#",       width=4)
         dt.add_column("Project", width=10)
-        dt.add_column("Title",   width=32)
-        dt.add_column("How to Verify", width=28)
-        dt.add_column("Src",     width=10)
-        dt.add_column("Pri",     width=5)
-        dt.add_column("Age",     width=5)
+        dt.add_column("Title",   width=30)
+        dt.add_column("How to Verify", width=26)
+        dt.add_column("Diff",    width=6)
+        dt.add_column("Pts",     width=4)
+        dt.add_column("Src",     width=8)
         dt.add_column("St",      width=4)
 
         if not self._items:
@@ -4560,14 +4791,17 @@ class TestQueueView(LazyView):
                     src_display = src[:8] if src else "—"
 
                 hint = item.get("test_hint", "") or item.get("route", "") or ""
+                diff = item.get("difficulty", "medium")
+                diff_style = {"easy": "green", "medium": "yellow", "hard": "red", "complex": "bold red"}.get(diff, "white")
+                pts = str(item.get("points", 1))
                 dt.add_row(
                     str(idx),
                     Text(proj, style=proj_style),
-                    Text(item.get("title", "—")[:32]),
-                    Text(hint[:28], style="italic"),
+                    Text(item.get("title", "—")[:30]),
+                    Text(hint[:26], style="italic"),
+                    Text(diff[:5], style=diff_style),
+                    Text(pts, style="bold"),
                     Text(src_display, style="dim"),
-                    Text(pri[:4], style=pri_style),
-                    Text(age, style="dim"),
                     st_icon,
                     key=item["id"],
                 )
@@ -4578,22 +4812,26 @@ class TestQueueView(LazyView):
             "[dim]y[/dim]=import sessions  [dim]a[/dim]=toggle all/pending  [dim]r[/dim]=reload"
         )
 
-    def _get_selected_id(self):
-        # type: () -> str
+    def _get_selected_index(self):
+        """Get the index into self._items for the cursor row."""
         dt = self.query_one("#tq-table", DataTable)
-        if not dt.row_count:
-            return ""
-        try:
-            key = dt.get_row_at(dt.cursor_row)
-            # key is the row_key value we set (item UUID)
-            rk = dt._row_order[dt.cursor_row]
-            return str(rk) if rk else ""
-        except Exception:
-            return ""
+        if not dt.row_count or not self._items:
+            return -1
+        row = dt.cursor_row
+        # Row 0 = item 0 (if items exist and no header rows)
+        if 0 <= row < len(self._items):
+            return row
+        return -1
+
+    def _get_selected_id(self):
+        idx = self._get_selected_index()
+        if idx >= 0:
+            return str(self._items[idx].get("id", ""))
+        return ""
 
     def _mark_selected(self, status):
         item_id = self._get_selected_id()
-        if item_id and not item_id.startswith("—"):
+        if item_id:
             _update_test_item(item_id, status)
             self._reload_data()
 
@@ -4654,14 +4892,15 @@ class TestQueueView(LazyView):
 
     def action_show_detail(self):
         """Open detail view for selected test item."""
-        item_id = self._get_selected_id()
-        if not item_id or item_id.startswith("—"):
-            return
-        # Find the item in our list
-        for item in self._items:
-            if str(item.get("id", "")) == item_id:
-                self.app.push_screen(TestDetailScreen(item))
-                return
+        idx = self._get_selected_index()
+        if idx >= 0:
+            self.app.push_screen(TestDetailScreen(self._items[idx]))
+
+    def on_data_table_row_selected(self, event):
+        """Enter pressed on a row — open detail view."""
+        idx = self._get_selected_index()
+        if idx >= 0:
+            self.app.push_screen(TestDetailScreen(self._items[idx]))
 
 
 class MissionControlView(LazyView):
@@ -4683,7 +4922,8 @@ class MissionControlView(LazyView):
 
     def load_content(self):
         from claude_watch_data import _get_build_ledger
-        data = _get_build_ledger(days=1, limit=100)
+        cycle_id = getattr(self.app, '_active_cycle_id', None)
+        data = _get_build_ledger(days=7, limit=100, cycle_id=cycle_id)
         stats = data["stats"]
 
         self.query_one("#mission-header", Static).update(
@@ -4790,7 +5030,8 @@ class WireView(LazyView):
 
     def load_content(self):
         from claude_watch_data import _get_wire_messages
-        data = _get_wire_messages(limit=50)
+        cycle_id = getattr(self.app, '_active_cycle_id', None)
+        data = _get_wire_messages(limit=50, cycle_id=cycle_id)
 
         self.query_one("#wire-header", Static).update(
             f"[bold]Wire — Inter-Session Messages[/bold]  "
@@ -4977,14 +5218,16 @@ class ClaudeWatchApp(App):
         Binding("s", "show_session_tasks", "Cycle"),
         Binding("p", "show_project_board", "Board"),
         Binding("l", "show_leaderboard", "Leaderboard"),
-        Binding("a", "toggle_accounts", "Accounts"),
+        Binding("a", "show_audit", "Audit"),
         Binding("c", "show_capacity", "Capacity"),
         Binding("h", "toggle_health", "Health"),
         Binding("y", "show_cycles", "Cycles"),
         Binding("x", "show_test", "Test"),
-        Binding("A", "show_audit", "Audit"),
+        Binding("A", "toggle_accounts", "Accounts"),
         Binding("w", "show_wire", "Wire"),
         Binding("M", "show_mission", "Mission"),
+        Binding("[", "prev_cycle", "Prev Cycle"),
+        Binding("]", "next_cycle", "Next Cycle"),
         Binding("g", "show_rules", "Rules"),
         Binding("w", "show_attribution", "Who?"),
         Binding("slash", "start_search", "Search"),
@@ -5071,6 +5314,11 @@ class ClaudeWatchApp(App):
         self.query_one("#account-capacity").display = False
         self.set_interval(1.0, self.refresh_data)
         self.refresh_data()
+        # Cycle navigation state
+        from claude_watch_data import _get_current_cycle_id, _get_all_cycles
+        self._active_cycle_id = _get_current_cycle_id()
+        self._cycle_list = []  # populated on first nav
+        self._cycle_idx = 0
         # Start hot-reload watcher in background
         import threading
         threading.Thread(target=_start_hot_reload_watcher, args=(self,), daemon=True).start()
@@ -5159,7 +5407,7 @@ class ClaudeWatchApp(App):
         """Update the global cycle status banner shown on all tabs."""
         from claude_watch_data import (
             _get_current_cycle, _get_cycle_sessions,
-            _countdown, _current_pct,
+            _countdown, _current_pct, _get_current_pomodoro,
         )
         try:
             banner = self.query_one("#cycle-banner", Static)
@@ -5202,6 +5450,13 @@ class ClaudeWatchApp(App):
             time_pct = 100
             time_str = "?"
 
+        pomo = _get_current_pomodoro()
+        if pomo:
+            pomo_color = "cyan" if pomo <= 3 else ("white" if pomo <= 7 else ("yellow" if pomo <= 9 else "red"))
+            pomo_str = f"[{pomo_color}]P{pomo}/10[/{pomo_color}]  "
+        else:
+            pomo_str = ""
+
         sessions = _get_cycle_sessions(current["cycle_id"])
         from claude_watch_data import _get_cycle_items
         bd = _get_burndown_data()
@@ -5220,6 +5475,7 @@ class ClaudeWatchApp(App):
         time_lc = "red" if time_pct < 20 else ("yellow" if time_pct < 40 else "green")
         banner.update(
             f"T{_bar(time_pct)}[{time_lc}]{time_str}[/{time_lc}] "
+            f"{pomo_str}"
             f"5h{_bar(five_left)}[{five_lc}]{five_left:.0f}%[/{five_lc}] "
             f"7d{_bar(seven_left)}[{seven_lc}]{seven_left:.0f}%[/{seven_lc}]  "
             f"{items_str}  "
@@ -5343,6 +5599,39 @@ class ClaudeWatchApp(App):
 
     def action_show_mission(self):
         self.switch_view("view-mission")
+
+    def _ensure_cycle_list(self):
+        """Load cycle list if not loaded."""
+        if not self._cycle_list:
+            try:
+                from claude_watch_data import _get_all_cycles
+                cycles = _get_all_cycles(limit=20)
+                self._cycle_list = [(c["start"], c["end"], c.get("is_current", False)) for c in cycles]
+                # Find current cycle index
+                for i, (s, e, cur) in enumerate(self._cycle_list):
+                    if cur:
+                        self._cycle_idx = i
+                        break
+            except Exception:
+                pass
+
+    def action_prev_cycle(self):
+        self._ensure_cycle_list()
+        if self._cycle_list and self._cycle_idx < len(self._cycle_list) - 1:
+            self._cycle_idx += 1
+            start, end, _ = self._cycle_list[self._cycle_idx]
+            self._active_cycle_id = start.isoformat() if hasattr(start, 'isoformat') else str(start)
+            self._update_cycle_banner()
+            self.refresh_data()
+
+    def action_next_cycle(self):
+        self._ensure_cycle_list()
+        if self._cycle_list and self._cycle_idx > 0:
+            self._cycle_idx -= 1
+            start, end, _ = self._cycle_list[self._cycle_idx]
+            self._active_cycle_id = start.isoformat() if hasattr(start, 'isoformat') else str(start)
+            self._update_cycle_banner()
+            self.refresh_data()
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         btn_map = {
