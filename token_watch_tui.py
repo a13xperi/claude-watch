@@ -1912,6 +1912,7 @@ class NavBar(Horizontal):
     ALL_TAB_GROUPS = [
         ("Core", [
             ("Dashboard", "nav-dashboard"),
+            ("Advisor", "nav-advisor"),
             ("Health", "nav-health"),
             ("Capacity", "nav-capacity"),
         ]),
@@ -1924,7 +1925,6 @@ class NavBar(Horizontal):
         ("Intelligence", [
             ("Mission", "nav-mission"),
             ("Delphi", "nav-delphi"),
-            ("Advisor", "nav-advisor"),
             ("Analytics", "nav-analytics"),
             ("Audit", "nav-audit"),
         ]),
@@ -1950,10 +1950,10 @@ class NavBar(Horizontal):
         # Compact top bar — key tabs + Nav button for the rest
         buttons = [
             ("Dashboard", "nav-dashboard"),
+            ("Advisor", "nav-advisor"),
             ("Dispatch", "nav-dispatch"),
             ("Cycle", "nav-sessions"),
             ("Mission", "nav-mission"),
-            ("Test", "nav-test"),
             ("Nav", "nav-open-nav"),
         ]
         for label, btn_id in buttons:
