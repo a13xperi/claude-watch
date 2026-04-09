@@ -80,12 +80,9 @@ def _safe_float(val, default=0.0):
 def _current_pct():
     """Returns (five, seven, five_reset_ts, seven_reset_ts)."""
     try:
-        r = subprocess.run(
-            ["bash", "-c", "cat /tmp/statusline-debug.json 2>/dev/null"],
-            capture_output=True, text=True, timeout=2,
-        )
-        if r.stdout.strip():
-            d = json.loads(r.stdout)
+        raw = Path("/tmp/statusline-debug.json").read_text()
+        if raw.strip():
+            d = json.loads(raw)
             rl = d.get("rate_limits", {})
             five = rl.get("five_hour", {}).get("used_percentage", "?")
             seven = rl.get("seven_day", {}).get("used_percentage", "?")
