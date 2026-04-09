@@ -440,13 +440,8 @@ class EngineTable(DataTable):
                     pass
 
         # Detect active account for local sessions
-        import json as _json
-        try:
-            with open("/tmp/statusline-debug.json") as _f:
-                _sd = _json.load(_f)
-            active_label = _sd.get("account", {}).get("label", "?")
-        except Exception:
-            active_label = "?"
+        from token_watch_data import _get_active_account
+        active_label, _, _ = _get_active_account()
         acct_color_map = {"A": "cyan", "B": "magenta", "C": "yellow"}
         acct_color_local = acct_color_map.get(active_label, "dim")
 
@@ -1010,7 +1005,12 @@ class TokenAttributionPanel(Static):
                 ot_str = f"{others_tok} tok"
             legend_parts.append(f"[grey50]\u2591\u2591[/grey50] [dim]+ {len(others)} others  {others_pct:.1f}%  {ot_str}[/dim]")
         if has_unaccounted:
-            legend_parts.append(f"[dim]\u2591\u2591 rolled off window  {unaccounted:.1f}%[/dim]")
+            candidates = data.get("unaccounted_candidates", [])
+            if candidates:
+                cand_str = ", ".join(f"cc-{c['pid']}" for c in candidates[:3])
+                legend_parts.append(f"[dim]\u2591\u2591 unattributed  {unaccounted:.1f}%  likely: {cand_str}[/dim]")
+            else:
+                legend_parts.append(f"[dim]\u2591\u2591 unattributed  {unaccounted:.1f}%[/dim]")
         content = bar_line + "\n" + "\n".join(legend_parts)
         self.update(Panel(
             content,
@@ -6275,7 +6275,11 @@ class DispatchDetailScreen(Screen):
 
         sep = "[dim]" + chr(9472) * 60 + "[/dim]"
         lines.append(sep)
-        lines.append("  [bold]Priority:[/bold]    [" + pc + "]" + pri + "[/" + pc + "]        [bold]Difficulty:[/bold]  " + difficulty)
+        lane = t.get("lane") or "unassigned"
+        lane_colors = {"ui-simplification": "green", "voice-lab": "magenta", "twitter-integration": "cyan"}
+        lc = lane_colors.get(lane, "dim")
+        lines.append("  [bold]Priority:[/bold]    [" + pc + "]" + pri + "[/" + pc + "]        [bold]Lane:[/bold]        [" + lc + "]" + lane + "[/" + lc + "]")
+        lines.append("  [bold]Difficulty:[/bold]  " + difficulty)
         lines.append("  [bold]Points:[/bold]      " + points + "              [bold]Est tokens:[/bold] ~" + tokens + "kT")
         lines.append("  [bold]Tier:[/bold]        " + tier + "             [bold]Run count:[/bold]  " + runs)
         lines.append("  [bold]Source:[/bold]      " + source + "           [bold]Session:[/bold]    " + session)
@@ -6314,11 +6318,15 @@ class DispatchDetailScreen(Screen):
 class DispatchView(LazyView):
     """Dispatch queue — ready tasks with prompts, prioritized for burn sessions."""
 
+    _lane_filter = ""
+    _LANE_CYCLE = ["", "ui-simplification", "voice-lab", "twitter-integration"]
+
     BINDINGS = [
         Binding("r", "refresh_dispatch", "Refresh"),
         Binding("c", "copy_selected", "Copy"),
         Binding("x", "claim_selected", "Claim"),
         Binding("a", "archive_selected", "Archive"),
+        Binding("l", "cycle_lane", "Lane"),
     ]
 
     def refresh_content(self):
@@ -6327,6 +6335,7 @@ class DispatchView(LazyView):
             self._last_refresh = now
             try:
                 self.query_one("#dispatch-table", DataTable).clear(columns=True)
+                self.query_one("#bugs-table", DataTable).clear(columns=True)
                 self.load_content()
             except Exception:
                 pass
@@ -6334,18 +6343,24 @@ class DispatchView(LazyView):
     def compose(self) -> ComposeResult:
         yield Static(id="dispatch-header")
         yield DataTable(id="dispatch-table")
+        yield Static(id="bugs-header")
+        yield DataTable(id="bugs-table")
 
     def load_content(self):
         from token_watch_data import _get_dispatch_queue
         data = _get_dispatch_queue()
         stats = data["stats"]
 
+        lane_info = ""
+        if self._lane_filter:
+            lane_info = f"  [bold magenta]lane:{self._lane_filter}[/bold magenta]"
+
         self.query_one("#dispatch-header", Static).update(
             f"[bold]Dispatch[/bold]  "
             f"[green]{stats['total_ready']} ready[/green]  ·  "
             f"[yellow]{stats['total_active']} active[/yellow]  ·  "
-            f"[dim]~{stats['total_tokens_k']}kT total[/dim]  "
-            f"[dim italic]enter=view  c=copy  x=claim  a=archive  r=refresh[/dim italic]"
+            f"[dim]~{stats['total_tokens_k']}kT total[/dim]{lane_info}  "
+            f"[dim italic]enter=view  c=copy  x=claim  a=archive  l=lane  r=refresh[/dim italic]"
         )
 
         table = self.query_one("#dispatch-table", DataTable)
@@ -6355,6 +6370,7 @@ class DispatchView(LazyView):
         table.add_column("Pri", width=5)
         table.add_column("Tier", width=5)
         table.add_column("Project", width=12)
+        table.add_column("Lane", width=18)
         table.add_column("Task", width=40)
         table.add_column("Source", width=8)
         table.add_column("Age", width=8)
@@ -6371,10 +6387,21 @@ class DispatchView(LazyView):
             "manual": "[red]man[/red]",
         }
 
+        lane_colors = {"ui-simplification": "green", "voice-lab": "magenta", "twitter-integration": "cyan"}
+
+        def _lane_cell(item):
+            lane = item.get("lane") or ""
+            if not lane:
+                return "[dim]—[/dim]"
+            lc = lane_colors.get(lane, "dim")
+            return f"[{lc}]{lane}[/{lc}]"
+
         self._items = []
 
         # Active items first (in-progress)
         for item in data["active"]:
+            if self._lane_filter and (item.get("lane") or "") != self._lane_filter:
+                continue
             self._items.append(item)
             age = self._format_age(item.get("created_at", ""))
             table.add_row(
@@ -6382,6 +6409,7 @@ class DispatchView(LazyView):
                 "[magenta]RUN[/magenta]",
                 tier_styles.get(item.get("tier", ""), "?"),
                 f"[cyan]{item.get('project', '?')}[/cyan]",
+                _lane_cell(item),
                 (item.get("task_name", "?")[:38] + "..") if len(item.get("task_name", "")) > 40 else item.get("task_name", "?"),
                 item.get("source", "?"),
                 age,
@@ -6389,6 +6417,8 @@ class DispatchView(LazyView):
 
         # Queue items (ready)
         for item in data["queue"]:
+            if self._lane_filter and (item.get("lane") or "") != self._lane_filter:
+                continue
             self._items.append(item)
             age = self._format_age(item.get("created_at", ""))
             table.add_row(
@@ -6396,8 +6426,57 @@ class DispatchView(LazyView):
                 pri_styles.get(item.get("priority", "medium"), "?"),
                 tier_styles.get(item.get("tier", ""), "?"),
                 f"[cyan]{item.get('project', '?')}[/cyan]",
+                _lane_cell(item),
                 (item.get("task_name", "?")[:38] + "..") if len(item.get("task_name", "")) > 40 else item.get("task_name", "?"),
                 item.get("source", "?"),
+                age,
+            )
+
+        # ── Bugs section ──
+        from token_watch_data import _get_bugs
+        try:
+            bug_data = _get_bugs()
+        except Exception:
+            bug_data = {"bugs": [], "stats": {"open": 0, "in_progress": 0, "total": 0}}
+        bug_stats = bug_data["stats"]
+
+        self.query_one("#bugs-header", Static).update(
+            f"\n[bold red]Bugs[/bold red]  "
+            f"[red]{bug_stats['open']} open[/red]  ·  "
+            f"[yellow]{bug_stats['in_progress']} in progress[/yellow]  ·  "
+            f"[dim italic]File with /bug[/dim italic]"
+        )
+
+        bug_table = self.query_one("#bugs-table", DataTable)
+        bug_table.cursor_type = "row"
+        bug_table.zebra_stripes = True
+        bug_table.add_column("#", width=6)
+        bug_table.add_column("Sev", width=6)
+        bug_table.add_column("Project", width=12)
+        bug_table.add_column("Title", width=40)
+        bug_table.add_column("Found By", width=12)
+        bug_table.add_column("Age", width=8)
+
+        sev_styles = {
+            "critical": "[red bold]CRIT[/red bold]",
+            "high": "[yellow]HIGH[/yellow]",
+            "medium": "MED",
+            "low": "[dim]LOW[/dim]",
+        }
+
+        self._bug_items = []
+        for bug in bug_data["bugs"]:
+            self._bug_items.append(bug)
+            age = self._format_age(bug.get("created_at", ""))
+            found = bug.get("found_by", "?")
+            if found and len(found) > 12:
+                found = found[:10] + ".."
+            bug_table.add_row(
+                f"BUG-{bug.get('bug_number', '?')}",
+                sev_styles.get(bug.get("severity", "medium"), "?"),
+                f"[cyan]{bug.get('project', '?')}[/cyan]",
+                (bug.get("title", "?")[:38] + "..") if len(bug.get("title", "")) > 40 else bug.get("title", "?"),
+                found,
                 age,
             )
 
@@ -6418,9 +6497,21 @@ class DispatchView(LazyView):
         except Exception:
             return "?"
 
+    def action_cycle_lane(self):
+        """Cycle lane filter: all → ui-simplification → voice-lab → twitter-integration → all."""
+        try:
+            idx = self._LANE_CYCLE.index(self._lane_filter)
+        except ValueError:
+            idx = -1
+        self._lane_filter = self._LANE_CYCLE[(idx + 1) % len(self._LANE_CYCLE)]
+        label = self._lane_filter or "all"
+        self.notify(f"Lane filter: {label}")
+        self.action_refresh_dispatch()
+
     def action_refresh_dispatch(self):
         try:
             self.query_one("#dispatch-table", DataTable).clear(columns=True)
+            self.query_one("#bugs-table", DataTable).clear(columns=True)
             self.load_content()
         except Exception:
             pass

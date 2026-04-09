@@ -2583,6 +2583,20 @@ def _get_token_attribution():
         "rolled_off_pct": round(rolled_off, 1),
         "sessions": sessions,
     }  # type: Dict[str, Any]
+
+    # Identify active sessions not in the attribution ledger
+    try:
+        active = _active_sessions()
+        attributed_pids = {s.get("session_id", "").replace("cc-", "") for s in sessions}
+        unaccounted_candidates = [
+            {"pid": a[0], "directive": a[2]}
+            for a in active
+            if a[0] not in attributed_pids
+        ]
+    except Exception:
+        unaccounted_candidates = []
+    result["unaccounted_candidates"] = unaccounted_candidates
+
     _attribution_cache = result
     _attribution_cache_time = now
     return result
@@ -3258,6 +3272,9 @@ def make_header(five, seven, five_reset_ts, seven_reset_ts):
     return Panel(t, title=title, border_style="bright_blue")
 
 
+_urgent_grace_until = 0  # timestamp — keep showing alert until this time
+_urgent_cached_panel = None
+
 def make_urgent_panel():
     """Return urgent alerts panel, or None if nothing urgent."""
     five, seven, five_reset_ts, seven_reset_ts = _current_pct()
@@ -3304,26 +3321,6 @@ def make_urgent_panel():
             delta = float(last.get("delta_5h", 0))
 
             if burn > 6 or (burn > 3 and num_sessions >= 2):
-                # Identify the top burner from active sessions
-                active = _active_sessions()
-                top_pid = None
-                top_delta = 0
-                top_directive = "—"
-                top_idle_secs = 0
-                for item in active:
-                    pid, _, directive, delta_str = item[0], item[1], item[2], item[3]
-                    try:
-                        d = float(delta_str.strip("+%"))
-                    except Exception as e:
-                        _log.debug("_make_urgent_panel: %s", e)
-                        d = 0
-                    if d > top_delta:
-                        top_delta = d
-                        top_pid = pid
-                        top_directive = directive
-                        secs, _ = _session_last_activity(pid)
-                        top_idle_secs = secs or 0
-
                 severity = "[bold red]RUNAWAY[/bold red]" if burn > 6 else "[yellow]HIGH BURN[/yellow]"
                 line1 = (
                     f"  {severity} — {burn:.1f}%/min across "
@@ -3331,23 +3328,38 @@ def make_urgent_panel():
                 )
                 alerts.append(line1)
 
-                if top_pid:
-                    idle_m = top_idle_secs // 60
-                    line2 = (
-                        f"  Top burner: [bold cyan]cc-{top_pid}[/bold cyan] "
-                        f"at [bold]+{top_delta:.0f}%[/bold] "
-                        f"({top_directive[:25]})"
+                # Show ALL burning sessions, not just top one
+                active = _active_sessions()
+                burners = []
+                for item in active:
+                    pid, _, directive, delta_str = item[0], item[1], item[2], item[3]
+                    try:
+                        d = float(delta_str.strip("+%"))
+                    except Exception:
+                        d = 0
+                    if d > 0:
+                        secs, _ = _session_last_activity(pid)
+                        burners.append((pid, d, directive, secs or 0))
+                burners.sort(key=lambda x: -x[1])
+
+                for i, (pid, bdelta, directive, idle_secs) in enumerate(burners[:5]):
+                    idle_m = idle_secs // 60
+                    prefix = "  Top" if i == 0 else "     "
+                    line = (
+                        f"{prefix} [bold cyan]cc-{pid}[/bold cyan] "
+                        f"at [bold]+{bdelta:.0f}%[/bold] "
+                        f"({directive[:25]})"
                     )
-                    if top_idle_secs > 300:
-                        line2 += (
+                    if idle_secs > 300:
+                        line += (
                             f" — [bold red]idle {idle_m}m[/bold red]. "
-                            f"Likely stuck. Run: [bold]kill {top_pid}[/bold]"
+                            f"Likely stuck. Run: [bold]kill {pid}[/bold]"
                         )
-                    elif top_idle_secs > 60:
-                        line2 += f" — idle {idle_m}m. Monitor or close if unneeded."
+                    elif idle_secs > 60:
+                        line += f" — idle {idle_m}m"
                     else:
-                        line2 += " — actively working."
-                    alerts.append(line2)
+                        line += " — active"
+                    alerts.append(line)
     except Exception as e:
         _log.debug("_make_urgent_panel: %s", e)
         pass
@@ -3400,16 +3412,25 @@ def make_urgent_panel():
         _log.debug("_make_urgent_panel: %s", e)
         pass
 
-    if not alerts:
-        return None
+    global _urgent_grace_until, _urgent_cached_panel
 
-    from rich.text import Text
-    t = Table(box=None, padding=(0, 0), expand=True, show_header=False)
-    t.add_column(ratio=1)
-    for alert in alerts:
-        t.add_row(alert)
-    
-    return Panel(t, title="[bold red]⚠ URGENT[/bold red]", border_style="red")
+    if alerts:
+        from rich.text import Text
+        t = Table(box=None, padding=(0, 0), expand=True, show_header=False)
+        t.add_column(ratio=1)
+        for alert in alerts:
+            t.add_row(alert)
+        panel = Panel(t, title="[bold red]⚠ URGENT[/bold red]", border_style="red")
+        _urgent_grace_until = time.time() + 10  # keep visible for 10s minimum
+        _urgent_cached_panel = panel
+        return panel
+
+    # Grace period: keep last alert visible for 10s after conditions clear
+    if time.time() < _urgent_grace_until and _urgent_cached_panel is not None:
+        return _urgent_cached_panel
+
+    _urgent_cached_panel = None
+    return None
 
 
 def _etime_to_secs(etime):
@@ -3941,7 +3962,7 @@ def _get_dispatch_queue():
             f"{_SUPABASE_URL}/project_tasks"
             f"?dispatch_prompt=not.is.null"
             f"&status=in.(ready,in_progress)"
-            f"&select=id,task_name,dispatch_prompt,project,company,status,tier,priority,difficulty,points,est_tokens_k,source,claimed_by,run_count,notes,created_at,build_order"
+            f"&select=id,task_name,dispatch_prompt,project,company,status,tier,priority,difficulty,points,est_tokens_k,source,claimed_by,run_count,notes,created_at,build_order,lane"
             f"&order=created_at.desc"
             f"&limit=100"
         )
@@ -3960,10 +3981,13 @@ def _get_dispatch_queue():
         active = [i for i in items if i.get("status") == "in_progress"]
 
         by_project = {}
+        by_lane = {}
         total_tokens = 0
         for i in items:
             proj = i.get("project", "general")
             by_project[proj] = by_project.get(proj, 0) + 1
+            lane = i.get("lane") or "unassigned"
+            by_lane[lane] = by_lane.get(lane, 0) + 1
             total_tokens += i.get("est_tokens_k") or 0
 
         result = {
@@ -3974,6 +3998,7 @@ def _get_dispatch_queue():
                 "total_active": len(active),
                 "total_tokens_k": total_tokens,
                 "by_project": by_project,
+                "by_lane": by_lane,
             },
         }
         _dispatch_queue_cache = (now, result)
@@ -4030,6 +4055,74 @@ def _dispatch_archive_task(task_id):
         return len(result) > 0
     except Exception as e:
         _log.warning("_dispatch_archive_task: %s", e)
+        return False
+
+
+# ── bug tracker ──────────────────────────────────────────────────────────────
+
+_bugs_cache = None  # type: Optional[Dict]
+_bugs_cache_time = 0.0
+
+
+def _get_bugs(force=False):
+    """Fetch open/in-progress bugs from Supabase."""
+    import urllib.request
+    global _bugs_cache, _bugs_cache_time
+    now = time.time()
+    if not force and _bugs_cache and (now - _bugs_cache_time) < 30:
+        return _bugs_cache
+
+    try:
+        url = (
+            f"{_SUPABASE_URL}/bugs?"
+            f"status=in.(open,in_progress)&"
+            f"order=bug_number.desc&limit=50"
+        )
+        req = urllib.request.Request(url, headers={
+            "apikey": _SUPABASE_KEY,
+            "Authorization": f"Bearer {_SUPABASE_KEY}",
+        })
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            bugs = json.loads(resp.read())
+    except Exception as e:
+        _log.debug("_get_bugs: %s", e)
+        bugs = []
+
+    open_count = sum(1 for b in bugs if b.get("status") == "open")
+    in_progress = sum(1 for b in bugs if b.get("status") == "in_progress")
+
+    result = {
+        "bugs": bugs,
+        "stats": {
+            "open": open_count,
+            "in_progress": in_progress,
+            "total": len(bugs),
+        },
+    }
+    _bugs_cache = result
+    _bugs_cache_time = now
+    return result
+
+
+def _update_bug_status(bug_id, new_status):
+    """PATCH a bug's status."""
+    import urllib.request
+    try:
+        url = f"{_SUPABASE_URL}/bugs?id=eq.{bug_id}"
+        payload = json.dumps({"status": new_status, "updated_at": "now()"}).encode()
+        req = urllib.request.Request(url, data=payload, method="PATCH", headers={
+            "apikey": _SUPABASE_KEY,
+            "Authorization": "Bearer " + _SUPABASE_KEY,
+            "Content-Type": "application/json",
+            "Prefer": "return=minimal",
+        })
+        with urllib.request.urlopen(req, timeout=5):
+            pass
+        global _bugs_cache
+        _bugs_cache = None
+        return True
+    except Exception as e:
+        _log.debug("_update_bug_status: %s", e)
         return False
 
 
