@@ -439,26 +439,56 @@ def focus_session_terminal(pid):
     return (False, hint)
 
 
+_last_activity_map_cache = {"mtime": -1.0, "by_sid": {}}  # type: Dict[str, Any]
+
+
 def _session_last_activity(session_id):
-    """Return (seconds_ago, last_tool) for a session from the ledger."""
-    entries = _load_ledger(last_n=200)
+    """Return (seconds_ago, last_tool) for a session from the ledger.
+
+    Hot path — called once per session per refresh tick. Old impl re-walked
+    up to 200 ledger entries with datetime.fromisoformat per call, which
+    pegged CPU at 9 sessions × 1 Hz × 200 entries. New impl rebuilds a
+    {sid: (ts_str, tool)} map only when the ledger file mtime changes,
+    then does an O(1) lookup + a single datetime parse per call.
+    """
+    global _last_activity_map_cache
+    if not LEDGER.exists():
+        return None, None
+    try:
+        mtime = LEDGER.stat().st_mtime
+    except OSError:
+        return None, None
+    if mtime != _last_activity_map_cache["mtime"]:
+        new_map = {}  # type: Dict[str, tuple]
+        try:
+            entries = _load_ledger(last_n=200)
+            for e in entries:  # forward scan, last write wins
+                if e.get("type") != "tool_use":
+                    continue
+                esid = e.get("session", "")
+                ts_str = e.get("ts", "")
+                if esid and ts_str:
+                    new_map[esid] = (ts_str, e.get("tool", "?"))
+        except Exception as e:
+            _log.debug("_session_last_activity rebuild: %s", e)
+        _last_activity_map_cache = {"mtime": mtime, "by_sid": new_map}
+
     sid = f"cc-{session_id}"
-    now = datetime.now(timezone.utc)
-    for e in reversed(entries):
-        if e.get("session") == sid and e.get("type") == "tool_use":
-            try:
-                ts = datetime.fromisoformat(e["ts"].replace("Z", "+00:00"))
-                secs = int((now - ts).total_seconds())
-                tool = e.get("tool", "?")
-                if tool.startswith("mcp__claude_ai_"):
-                    tool = "mcp:" + tool.replace("mcp__claude_ai_", "").replace("__", "/")
-                elif tool.startswith("mcp__"):
-                    tool = "mcp:" + tool[5:]
-                return secs, tool
-            except Exception as e:
-                _log.debug("__session_last_activity: %s", e)
-                pass
-    return None, None
+    entry = _last_activity_map_cache["by_sid"].get(sid)
+    if not entry:
+        return None, None
+    ts_str, tool = entry
+    try:
+        ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+        secs = int((datetime.now(timezone.utc) - ts).total_seconds())
+    except Exception as e:
+        _log.debug("_session_last_activity parse: %s", e)
+        return None, None
+    if tool.startswith("mcp__claude_ai_"):
+        tool = "mcp:" + tool.replace("mcp__claude_ai_", "").replace("__", "/")
+    elif tool.startswith("mcp__"):
+        tool = "mcp:" + tool[5:]
+    return secs, tool
 
 
 def _detect_source(pid):
@@ -510,7 +540,7 @@ def _load_ledger(last_n=None):
     else:
         entries = []
         try:
-            with open(LEDGER) as f:
+            with open(LEDGER, encoding="utf-8", errors="replace") as f:
                 for line in f:
                     line = line.strip()
                     if line:
@@ -1322,7 +1352,9 @@ def _ensure_index():
             _index_thread.start()
 
 
-def _get_session_history():
+def _get_session_history_sync():
+    """Sync impl — call only from a background thread or CLI export."""
+    global _session_history_cache, _session_history_cache_ts
     _ensure_index()
     with _index_lock:
         snapshot = _index_cache
@@ -1384,7 +1416,58 @@ def _get_session_history():
         })
 
     sessions.sort(key=lambda s: (s["last_ts"], s["session_id"]), reverse=True)
+    _session_history_cache = sessions
+    _session_history_cache_ts = time.time()
     return sessions
+
+
+# Async wrapper state for _get_session_history
+_session_history_cache = None  # type: Optional[List[dict]]
+_session_history_cache_ts = 0.0
+_session_history_warming_thread = None  # type: Optional[Any]
+_session_history_warming_lock = None  # type: Optional[Any]
+_SESSION_HISTORY_TTL = 60.0  # cache for 60s
+
+
+def _get_session_history():
+    """Non-blocking session history with 60s cache + background warming.
+
+    Cold call: returns [] immediately and warms cache in a background thread.
+    The sync impl walks 1700+ index entries and re-parses the ledger per
+    today's session via _interpolate_five_pct (~10k datetime parses each).
+    Calling that on the TUI's 1 Hz refresh tick blocks the event loop for
+    seconds and leaves the screen black.
+    """
+    global _session_history_warming_thread, _session_history_warming_lock
+    import threading as _threading
+
+    now = time.time()
+    if (
+        _session_history_cache is not None
+        and (now - _session_history_cache_ts) < _SESSION_HISTORY_TTL
+    ):
+        return _session_history_cache
+
+    if _session_history_warming_lock is None:
+        _session_history_warming_lock = _threading.Lock()
+
+    with _session_history_warming_lock:
+        already_warming = (
+            _session_history_warming_thread is not None
+            and _session_history_warming_thread.is_alive()
+        )
+        if not already_warming:
+            def _warm():
+                try:
+                    _get_session_history_sync()
+                except Exception as e:
+                    _log.warning("session_history warm: %s", e)
+            _session_history_warming_thread = _threading.Thread(
+                target=_warm, daemon=True, name="session-history-warm"
+            )
+            _session_history_warming_thread.start()
+
+    return _session_history_cache if _session_history_cache is not None else []
 
 
 # ── session drill-down ───────────────────────────────────────────────────────
@@ -2762,9 +2845,28 @@ def _get_system_health():
 
 
 
+_engine_status_cache_ts = 0.0
+_engine_status_cache_value = None  # type: Optional[Dict[str, Any]]
+_ENGINE_STATUS_TTL = 3.0  # seconds
+
+
 def _get_engine_status():
     # type: () -> Dict[str, Any]
-    """Unified engine status: merges sessions + health + per-session scoring + pressure."""
+    """Unified engine status: merges sessions + health + per-session scoring + pressure.
+
+    Cached for ENGINE_STATUS_TTL seconds — TUI refreshes at 1 Hz, but the
+    underlying subprocess + Supabase + ledger walks are too expensive to run
+    every tick. 3 s is fast enough for humans and slow enough to keep CPU sane.
+    """
+    global _engine_status_cache_ts, _engine_status_cache_value
+    import time as _time
+    now_mono = _time.monotonic()
+    if (
+        _engine_status_cache_value is not None
+        and now_mono - _engine_status_cache_ts < _ENGINE_STATUS_TTL
+    ):
+        return _engine_status_cache_value
+
     import re as _re
 
     sessions_raw = _active_sessions()  # list of (pid, etime, directive, delta, source)
@@ -2904,7 +3006,7 @@ def _get_engine_status():
                 "directive": s["directive"],
             })
 
-    return {
+    result = {
         "sessions": sessions,
         "peers": remote_peers,
         "totals": totals,
@@ -2914,6 +3016,9 @@ def _get_engine_status():
             "trim_order": trim_order,
         },
     }
+    _engine_status_cache_ts = now_mono
+    _engine_status_cache_value = result
+    return result
 
 
 # ── Rich panel builders (used by Rich version + Textual Static widgets) ──────
@@ -3976,16 +4081,60 @@ def _get_recovery_stats():
 
 
 _dispatch_queue_cache = (0, None)
+_dispatch_queue_warming_thread = None  # type: Optional[Any]
+_dispatch_queue_warming_lock = None  # type: Optional[Any]
+
+_DISPATCH_QUEUE_EMPTY = {"queue": [], "active": [], "stats": {"total_ready": 0, "total_active": 0, "total_tokens_k": 0, "by_project": {}}}
+
 
 def _get_dispatch_queue():
-    """Fetch dispatchable tasks from project_tasks — items with dispatch_prompt, ready or in-progress."""
-    import urllib.request
-    global _dispatch_queue_cache
+    """Non-blocking dispatch queue with 30s cache + background warming.
+
+    Cold call: returns the previous cache (or an empty skeleton) immediately
+    and warms in a background thread. The underlying Supabase fetch is ~700 ms
+    which, on the TUI's 1 Hz refresh tick, was causing visible stutter on the
+    Dispatch tab. Same pattern as _get_all_cycles / _get_session_history.
+    """
+    global _dispatch_queue_warming_thread, _dispatch_queue_warming_lock
+    import threading as _threading
     now = time.time()
+
+    # Fast path — cache is populated and fresh
     if _dispatch_queue_cache[1] is not None and (now - _dispatch_queue_cache[0]) < 30:
         return _dispatch_queue_cache[1]
 
-    empty = {"queue": [], "active": [], "stats": {"total_ready": 0, "total_active": 0, "total_tokens_k": 0, "by_project": {}}}
+    # Stale or cold: warm in background
+    if _dispatch_queue_warming_lock is None:
+        _dispatch_queue_warming_lock = _threading.Lock()
+
+    with _dispatch_queue_warming_lock:
+        already_warming = (
+            _dispatch_queue_warming_thread is not None
+            and _dispatch_queue_warming_thread.is_alive()
+        )
+        if not already_warming:
+            def _warm():
+                try:
+                    _get_dispatch_queue_sync()
+                except Exception as e:
+                    _log.warning("dispatch_queue warm: %s", e)
+            _dispatch_queue_warming_thread = _threading.Thread(
+                target=_warm, daemon=True, name="dispatch-queue-warm"
+            )
+            _dispatch_queue_warming_thread.start()
+
+    if _dispatch_queue_cache[1] is not None:
+        return _dispatch_queue_cache[1]
+    return _DISPATCH_QUEUE_EMPTY
+
+
+def _get_dispatch_queue_sync():
+    """Synchronous impl — call only from a background thread or CLI."""
+    import urllib.request
+    global _dispatch_queue_cache
+    now = time.time()
+
+    empty = _DISPATCH_QUEUE_EMPTY
     try:
         url = (
             f"{_SUPABASE_URL}/project_tasks"
@@ -4434,7 +4583,8 @@ def _get_streak(scores=None):
 _last_scored_window = None
 
 
-def _check_and_score_completed_window():
+def _check_and_score_completed_window_sync():
+    """Synchronous heavy work — only call from a background thread."""
     global _last_scored_window
     try:
         data = _get_burndown_data()
@@ -4480,6 +4630,62 @@ def _check_and_score_completed_window():
         _log.debug("__check_and_score_completed_window: %s", e)
         pass
     return None
+
+
+# Async wrapper state — used by _check_and_score_completed_window below
+_csw_thread = None  # type: Optional[Any]
+# Negative sentinel so the first call always trips needs_run on macOS, where
+# time.monotonic() is process-relative and starts near 0.
+_csw_last_run = -1e9
+_csw_pending_result = None  # type: Optional[Dict[str, Any]]
+_csw_lock = None  # type: Optional[Any]
+_CSW_MIN_INTERVAL = 60.0  # at most once per 60s
+
+
+def _check_and_score_completed_window():
+    """Non-blocking wrapper. Returns the latest pending result (or None) and
+    schedules a background run if it's been long enough since the last one.
+
+    The original sync impl walks 50 cycles × N sessions × transcript files,
+    which can take many seconds. Calling that on the 1 Hz TUI refresh tick
+    blocks the event loop and leaves the screen black on startup.
+    """
+    global _csw_thread, _csw_last_run, _csw_pending_result, _csw_lock
+    import time as _time
+    import threading as _threading
+
+    if _csw_lock is None:
+        _csw_lock = _threading.Lock()
+
+    # Pop and return any pending result from a previous background run
+    with _csw_lock:
+        result = _csw_pending_result
+        _csw_pending_result = None
+
+    now_mono = _time.monotonic()
+    needs_run = (now_mono - _csw_last_run) >= _CSW_MIN_INTERVAL
+    thread_alive = _csw_thread is not None and _csw_thread.is_alive()
+
+    if needs_run and not thread_alive:
+        _csw_last_run = now_mono  # claim the slot before spawning
+
+        def _worker():
+            global _csw_pending_result
+            try:
+                r = _check_and_score_completed_window_sync()
+            except Exception as e:
+                _log.warning("CSW worker failed: %s", e)
+                r = None
+            if r is not None:
+                with _csw_lock:
+                    _csw_pending_result = r
+
+        _csw_thread = _threading.Thread(
+            target=_worker, daemon=True, name="csw-worker"
+        )
+        _csw_thread.start()
+
+    return result
 
 
 def _get_leaderboard(days=7):
@@ -4786,13 +4992,11 @@ def _build_cycle_record(start_ts, end_ts, is_current=False):
     }
 
 
-def _get_all_cycles(limit=20):
+def _get_all_cycles_sync(limit=20):
     # type: (int) -> List[dict]
-    """Get all cycle records with 30s cache TTL."""
+    """Synchronous heavy work — call only from a background thread or CLI."""
     global _cycles_cache, _cycles_cache_ts
     now = time.time()
-    if _cycles_cache is not None and (now - _cycles_cache_ts) < 30:
-        return _cycles_cache[:limit]
 
     boundaries = _get_cycle_boundaries(limit=limit)
     if not boundaries:
@@ -4828,6 +5032,55 @@ def _get_all_cycles(limit=20):
     _cycles_cache = cycles
     _cycles_cache_ts = now
     return cycles[:limit]
+
+
+# Async wrapper state for _get_all_cycles
+_cycles_warming_thread = None  # type: Optional[Any]
+_cycles_warming_lock = None  # type: Optional[Any]
+
+
+def _get_all_cycles(limit=20):
+    # type: (int) -> List[dict]
+    """Get all cycle records with 30s cache TTL.
+
+    Non-blocking on cold calls: if the cache is empty or stale, returns the
+    current (possibly empty) cache immediately and warms in a background
+    thread. The TUI calls this on every 1 Hz refresh tick from
+    _update_cycle_banner; the underlying sync work can take 60+ seconds on
+    cold start (Supabase + session history walks), which would otherwise
+    block the Textual event loop and leave the screen black.
+    """
+    global _cycles_warming_thread, _cycles_warming_lock
+    import threading as _threading
+    now = time.time()
+
+    # Fast path — cache is populated and fresh
+    if _cycles_cache is not None and (now - _cycles_cache_ts) < 30:
+        return _cycles_cache[:limit]
+
+    # Stale or cold: warm in background, return whatever we have right now
+    if _cycles_warming_lock is None:
+        _cycles_warming_lock = _threading.Lock()
+
+    with _cycles_warming_lock:
+        already_warming = (
+            _cycles_warming_thread is not None
+            and _cycles_warming_thread.is_alive()
+        )
+        if not already_warming:
+            def _warm():
+                try:
+                    _get_all_cycles_sync(limit=max(limit, 20))
+                except Exception as e:
+                    _log.warning("cycles warm: %s", e)
+            _cycles_warming_thread = _threading.Thread(
+                target=_warm, daemon=True, name="cycles-warm"
+            )
+            _cycles_warming_thread.start()
+
+    if _cycles_cache is None:
+        return []
+    return _cycles_cache[:limit]
 
 
 def _get_current_cycle():
@@ -6564,16 +6817,51 @@ def _expire_session_lock(session_id):
         "notes": "killed from token-watch"
     }).encode()
     req = urllib.request.Request(url, data=body, method="PATCH")
-    req.add_header("apikey", _SUPABASE_KEY)
-    req.add_header("Authorization", "Bearer " + _SUPABASE_KEY)
+    req.add_header("apikey", __SUPABASE_KEY)
+    req.add_header("Authorization", "Bearer " + __SUPABASE_KEY)
     req.add_header("Content-Type", "application/json")
     req.add_header("Prefer", "return=minimal")
     try:
         urllib.request.urlopen(req, timeout=3)
         # Also refresh local peers cache
         _get_peer_sessions.__wrapped__ = None  # invalidate if cached
+        return True
     except Exception as e:
         _log.warning("Failed to expire session lock %s: %s", session_id, e)
+        return False
+
+
+def _post_build_ledger_event(session_id, item_type, title, project="", company="", source="token-watch", test_status="untested"):
+    # type: (str, str, str, str, str, str, str) -> bool
+    """POST a row to build_ledger. Used for force_quit and other manual events."""
+    import urllib.request
+    payload = {
+        "session_id": session_id,
+        "project": project or "",
+        "company": company or "",
+        "item_type": item_type,
+        "title": title,
+        "source": source,
+        "test_status": test_status,
+    }
+    try:
+        data = json.dumps(payload).encode()
+        req = urllib.request.Request(
+            f"{_SUPABASE_URL}/build_ledger",
+            data=data,
+            headers={
+                "apikey": __SUPABASE_KEY,
+                "Authorization": f"Bearer {__SUPABASE_KEY}",
+                "Content-Type": "application/json",
+                "Prefer": "return=minimal",
+            },
+            method="POST",
+        )
+        urllib.request.urlopen(req, timeout=5)
+        return True
+    except Exception as e:
+        _log.warning("_post_build_ledger_event: %s", e)
+        return False
 
 
 def _get_blocked_attempts(minutes=60):
