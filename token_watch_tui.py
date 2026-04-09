@@ -1784,6 +1784,7 @@ class NavBar(Horizontal):
         ]),
         ("Intelligence", [
             ("Mission", "nav-mission"),
+            ("Delphi", "nav-delphi"),
             ("Advisor", "nav-advisor"),
             ("Analytics", "nav-analytics"),
             ("Audit", "nav-audit"),
@@ -1856,6 +1857,7 @@ class NavigationScreen(Screen):
                 "nav-rules": "view-rules",
                 "nav-audit": "view-audit",
                 "nav-mission": "view-mission",
+                "nav-delphi": "view-delphi",
                 "nav-wire": "view-wire",
                 "nav-advisor": "view-advisor",
                 "nav-analytics": "view-analytics",
@@ -5847,6 +5849,160 @@ class MissionControlView(LazyView):
                     )
 
 
+class DelphiView(LazyView):
+    """Delphi — token/activity usage scoped to Atlas + Paperclip."""
+
+    def refresh_content(self):
+        now = time.time()
+        if not hasattr(self, '_last_refresh') or (now - self._last_refresh) > 15:
+            self._last_refresh = now
+            try:
+                self.query_one("#delphi-apps", DataTable).clear(columns=True)
+                self.query_one("#delphi-sessions", DataTable).clear(columns=True)
+                self.query_one("#delphi-builds", DataTable).clear(columns=True)
+                self.load_content()
+            except Exception:
+                pass
+
+    def compose(self) -> ComposeResult:
+        yield Static(id="delphi-header")
+        yield Static("[bold]App Breakdown[/bold]  [dim]Delphi OS — Atlas + Paperclip[/dim]", id="delphi-apps-label")
+        yield DataTable(id="delphi-apps")
+        yield Static("[bold]Active Sessions[/bold]  [dim]working on Delphi right now[/dim]", id="delphi-sessions-label")
+        yield DataTable(id="delphi-sessions")
+        yield Static("[bold]Recent Builds[/bold]  [dim]last 48h[/dim]", id="delphi-builds-label")
+        yield DataTable(id="delphi-builds")
+
+    def load_content(self):
+        from token_watch_data import (
+            _get_delphi_app_breakdown,
+            _get_delphi_active_sessions,
+            _get_delphi_recent_builds,
+        )
+
+        breakdown = _get_delphi_app_breakdown()
+        sessions = _get_delphi_active_sessions()
+        builds = _get_delphi_recent_builds()
+
+        total_items = sum(row.get("item_count", 0) for row in breakdown)
+        total_sessions = len(sessions)
+        total_builds = len(builds)
+
+        self.query_one("#delphi-header", Static).update(
+            f"[bold blue]DELPHI[/bold blue]  [dim]Atlas + Paperclip[/dim]  "
+            f"[dim]{total_items} items shipped (7d)  ·  "
+            f"[green]{total_sessions} active sessions[/green]  ·  "
+            f"[cyan]{total_builds} builds (48h)[/cyan][/dim]"
+        )
+
+        # ── Table 1: App Breakdown ────────────────────────────────────────
+        apps = self.query_one("#delphi-apps", DataTable)
+        apps.cursor_type = "row"
+        apps.zebra_stripes = True
+        apps.add_column("Project", width=22)
+        apps.add_column("Company", width=10)
+        apps.add_column("Items", width=7)
+        apps.add_column("Sessions", width=9)
+        apps.add_column("Last Activity", width=16)
+
+        # Index active sessions by project for quick lookup
+        active_by_project = {}  # type: dict
+        for s in sessions:
+            proj = (s.get("repo") or "").strip().lower()
+            if not proj:
+                continue
+            active_by_project[proj] = active_by_project.get(proj, 0) + 1
+
+        if not breakdown:
+            apps.add_row(
+                Text("(no data yet — warming)", style="dim italic"),
+                Text(""), Text(""), Text(""), Text(""),
+            )
+        else:
+            for row in breakdown:
+                proj = row.get("project", "")
+                last = row.get("last_activity", "") or ""
+                if "T" in last:
+                    # Render as "MM-DD HH:MM"
+                    last = last.replace("T", " ")[5:16]
+                active_count = active_by_project.get(proj.lower(), 0)
+                apps.add_row(
+                    Text(proj, style="bold"),
+                    Text(row.get("company", "") or "—", style="blue"),
+                    Text(str(row.get("item_count", 0)), style="cyan"),
+                    Text(str(active_count) if active_count else "—",
+                         style="green" if active_count else "dim"),
+                    Text(last, style="dim"),
+                )
+
+        # ── Table 2: Active Sessions ──────────────────────────────────────
+        sess_table = self.query_one("#delphi-sessions", DataTable)
+        sess_table.cursor_type = "row"
+        sess_table.zebra_stripes = True
+        sess_table.add_column("Session", width=11)
+        sess_table.add_column("Repo", width=20)
+        sess_table.add_column("Task", width=40)
+        sess_table.add_column("Heartbeat", width=10)
+
+        if not sessions:
+            sess_table.add_row(
+                Text("(no active Delphi sessions)", style="dim italic"),
+                Text(""), Text(""), Text(""),
+            )
+        else:
+            for s in sessions:
+                sid = (s.get("session_id") or "").replace("cc-", "")
+                hb = s.get("heartbeat_at") or ""
+                if "T" in hb:
+                    hb = hb.split("T")[1][:8]
+                sess_table.add_row(
+                    Text(sid, style="bold"),
+                    Text((s.get("repo") or "—")[:20]),
+                    Text((s.get("task_name") or "—")[:40], style="italic"),
+                    Text(hb, style="dim"),
+                )
+
+        # ── Table 3: Recent Builds ────────────────────────────────────────
+        builds_table = self.query_one("#delphi-builds", DataTable)
+        builds_table.cursor_type = "row"
+        builds_table.zebra_stripes = True
+        builds_table.add_column("Time", width=11)
+        builds_table.add_column("Project", width=18)
+        builds_table.add_column("Type", width=9)
+        builds_table.add_column("Title", width=55)
+
+        type_styles = {
+            "feature": ("feat", "bold"),
+            "fix": ("fix", "red"),
+            "refactor": ("refac", "blue"),
+            "decision": ("\u25B3", "cyan"),
+            "docs": ("docs", "dim"),
+            "test": ("test", "green"),
+            "chore": ("chore", "dim"),
+            "infra": ("infra", "magenta"),
+        }
+
+        if not builds:
+            builds_table.add_row(
+                Text("(no recent Delphi builds)", style="dim italic"),
+                Text(""), Text(""), Text(""),
+            )
+        else:
+            for item in builds:
+                ts = item.get("created_at", "") or ""
+                if "T" in ts:
+                    ts = ts.replace("T", " ")[5:16]
+                type_label, type_style = type_styles.get(
+                    item.get("item_type", ""), ("?", "white")
+                )
+                builds_table.add_row(
+                    Text(ts, style="dim"),
+                    Text((item.get("project") or "—")[:18]),
+                    Text(type_label, style=type_style),
+                    Text((item.get("title") or "")[:55]),
+                )
+
+
 class WireView(LazyView):
     """Wire — inter-session message log."""
 
@@ -7133,6 +7289,7 @@ class ClaudeWatchApp(App):
         Binding("A", "toggle_accounts", "Accounts"),
         Binding("w", "show_wire", "Wire"),
         Binding("M", "show_mission", "Mission"),
+        Binding("shift+d", "show_delphi", "Delphi"),
         Binding("v", "show_advisor", "TW Advisor"),
         Binding("i", "show_inbox", "Inbox"),
         Binding("[", "prev_cycle", "Prev Cycle"),
@@ -7184,6 +7341,7 @@ class ClaudeWatchApp(App):
             yield TestQueueView(id="view-test")
             yield AuditView(id="view-audit")
             yield MissionControlView(id="view-mission")
+            yield DelphiView(id="view-delphi")
             yield WireView(id="view-wire")
             yield RulesView(id="view-rules")
             yield AdvisorView(id="view-advisor")
@@ -7218,6 +7376,7 @@ class ClaudeWatchApp(App):
             "view-audit": "nav-audit",
             "view-wire": "nav-wire",
             "view-mission": "nav-mission",
+            "view-delphi": "nav-delphi",
             "view-advisor": "nav-advisor",
             "view-analytics": "nav-analytics",
             "view-dispatch": "nav-dispatch",
@@ -7543,6 +7702,9 @@ class ClaudeWatchApp(App):
     def action_show_mission(self):
         self.switch_view("view-mission")
 
+    def action_show_delphi(self):
+        self.switch_view("view-delphi")
+
     def action_show_advisor(self):
         self.switch_view("view-advisor")
 
@@ -7618,6 +7780,7 @@ class ClaudeWatchApp(App):
             "nav-audit": "view-audit",
             "nav-wire": "view-wire",
             "nav-mission": "view-mission",
+            "nav-delphi": "view-delphi",
             "nav-advisor": "view-advisor",
             "nav-analytics": "view-analytics",
             "nav-dispatch": "view-dispatch",

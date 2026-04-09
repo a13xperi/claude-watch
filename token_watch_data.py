@@ -7795,3 +7795,251 @@ def _get_capacity_history(account=None, since=None, limit=500):
         if _cap_hist_cache is not None:
             return _cap_hist_cache[1][:limit]
         return []
+
+
+# ── Delphi (Atlas + Paperclip) scoped views ───────────────────────────────
+
+# Projects considered part of Delphi OS regardless of the `company` field.
+_DELPHI_PROJECTS = {
+    "atlas",
+    "atlas-portal",
+    "atlas-backend",
+    "atlas-be",
+    "atlas-fe",
+    "paperclip",
+}
+
+
+def _is_delphi_row(row):
+    # type: (Dict[str, Any]) -> bool
+    """Return True if a build_ledger / session_locks row is Delphi-scoped."""
+    co = (row.get("company") or "").lower()
+    if "delphi" in co:
+        return True
+    proj = (row.get("project") or "").lower().strip()
+    if proj in _DELPHI_PROJECTS:
+        return True
+    repo = (row.get("repo") or "").lower()
+    if "atlas" in repo or "paperclip" in repo:
+        return True
+    return False
+
+
+# Async-warm cache — same pattern as _get_dispatch_queue. Refresh tick must
+# never block on the network; return stale cache immediately and warm in a
+# background thread.
+_delphi_cache = {
+    "app_breakdown": (0.0, None),   # type: Tuple[float, Optional[List[Dict[str, Any]]]]
+    "active_sessions": (0.0, None), # type: Tuple[float, Optional[List[Dict[str, Any]]]]
+    "recent_builds": (0.0, None),   # type: Tuple[float, Optional[List[Dict[str, Any]]]]
+}
+_delphi_warming_threads = {}  # type: Dict[str, Any]
+_delphi_warming_lock = None   # type: Optional[Any]
+_DELPHI_CACHE_TTL = 30        # seconds
+
+
+def _delphi_warm(key, fn):
+    # type: (str, Any) -> None
+    """Warm a delphi cache entry in the background if not already warming."""
+    global _delphi_warming_lock
+    import threading as _threading
+    if _delphi_warming_lock is None:
+        _delphi_warming_lock = _threading.Lock()
+    with _delphi_warming_lock:
+        existing = _delphi_warming_threads.get(key)
+        if existing is not None and existing.is_alive():
+            return
+
+        def _run():
+            try:
+                fn()
+            except Exception as e:
+                _log.warning("_delphi_warm(%s): %s", key, e)
+
+        t = _threading.Thread(target=_run, daemon=True, name=f"delphi-warm-{key}")
+        _delphi_warming_threads[key] = t
+        t.start()
+
+
+def _get_delphi_app_breakdown():
+    # type: () -> List[Dict[str, Any]]
+    """Token usage per Delphi app from build_ledger + session_locks.
+
+    Returns list of dicts sorted by item_count desc:
+        {project, company, item_count, session_count, last_activity}
+    Non-blocking: returns cached data and warms in a background thread.
+    """
+    now = time.time()
+    cached_at, cached_data = _delphi_cache["app_breakdown"]
+    if cached_data is not None and (now - cached_at) < _DELPHI_CACHE_TTL:
+        return cached_data
+
+    _delphi_warm("app_breakdown", _get_delphi_app_breakdown_sync)
+
+    if cached_data is not None:
+        return cached_data
+    return []
+
+
+def _get_delphi_app_breakdown_sync():
+    # type: () -> List[Dict[str, Any]]
+    """Synchronous impl — call only from a background thread or CLI."""
+    import urllib.request
+    from datetime import datetime, timedelta, timezone
+    global _delphi_cache
+
+    try:
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=7)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        url = (
+            f"{_SUPABASE_URL}/build_ledger"
+            f"?created_at=gte.{cutoff}"
+            f"&order=created_at.desc&limit=1000"
+            f"&select=project,company,session_id,created_at,item_type"
+        )
+        req = urllib.request.Request(url, headers={
+            "apikey": __SUPABASE_KEY,
+            "Authorization": f"Bearer {__SUPABASE_KEY}",
+        })
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            rows = json.loads(resp.read())
+
+        # Filter to Delphi-scoped rows and group by project
+        by_proj = {}  # type: Dict[str, Dict[str, Any]]
+        for r in rows:
+            if not _is_delphi_row(r):
+                continue
+            proj = (r.get("project") or "general").strip() or "general"
+            entry = by_proj.setdefault(proj, {
+                "project": proj,
+                "company": r.get("company") or "delphi",
+                "item_count": 0,
+                "session_ids": set(),
+                "last_activity": "",
+            })
+            entry["item_count"] += 1
+            sid = r.get("session_id") or ""
+            if sid:
+                entry["session_ids"].add(sid)
+            ts = r.get("created_at") or ""
+            if ts > entry["last_activity"]:
+                entry["last_activity"] = ts
+
+        breakdown = []
+        for proj, entry in by_proj.items():
+            breakdown.append({
+                "project": entry["project"],
+                "company": entry["company"],
+                "item_count": entry["item_count"],
+                "session_count": len(entry["session_ids"]),
+                "last_activity": entry["last_activity"],
+            })
+        breakdown.sort(key=lambda x: x["item_count"], reverse=True)
+
+        _delphi_cache["app_breakdown"] = (time.time(), breakdown)
+        return breakdown
+    except Exception as e:
+        _log.warning("_get_delphi_app_breakdown_sync: %s", e)
+        cached_at, cached_data = _delphi_cache["app_breakdown"]
+        if cached_data is not None:
+            return cached_data
+        return []
+
+
+def _get_delphi_active_sessions():
+    # type: () -> List[Dict[str, Any]]
+    """Active sessions working on Delphi projects from session_locks.
+
+    Non-blocking: returns cached data and warms in a background thread.
+    """
+    now = time.time()
+    cached_at, cached_data = _delphi_cache["active_sessions"]
+    if cached_data is not None and (now - cached_at) < _DELPHI_CACHE_TTL:
+        return cached_data
+
+    _delphi_warm("active_sessions", _get_delphi_active_sessions_sync)
+
+    if cached_data is not None:
+        return cached_data
+    return []
+
+
+def _get_delphi_active_sessions_sync():
+    # type: () -> List[Dict[str, Any]]
+    """Synchronous impl — call only from a background thread or CLI."""
+    import urllib.request
+    global _delphi_cache
+
+    try:
+        url = (
+            f"{_SUPABASE_URL}/session_locks"
+            f"?status=eq.active"
+            f"&order=heartbeat_at.desc"
+            f"&select=session_id,tool,repo,task_name,company,account,claimed_at,heartbeat_at,files_touched"
+            f"&limit=200"
+        )
+        req = urllib.request.Request(url, headers={
+            "apikey": __SUPABASE_KEY,
+            "Authorization": f"Bearer {__SUPABASE_KEY}",
+        })
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            rows = json.loads(resp.read())
+
+        delphi_rows = [r for r in rows if _is_delphi_row(r)]
+        _delphi_cache["active_sessions"] = (time.time(), delphi_rows)
+        return delphi_rows
+    except Exception as e:
+        _log.warning("_get_delphi_active_sessions_sync: %s", e)
+        cached_at, cached_data = _delphi_cache["active_sessions"]
+        if cached_data is not None:
+            return cached_data
+        return []
+
+
+def _get_delphi_recent_builds():
+    # type: () -> List[Dict[str, Any]]
+    """Recent build_ledger entries for Delphi projects, last 48h (up to 50).
+
+    Non-blocking: returns cached data and warms in a background thread.
+    """
+    now = time.time()
+    cached_at, cached_data = _delphi_cache["recent_builds"]
+    if cached_data is not None and (now - cached_at) < _DELPHI_CACHE_TTL:
+        return cached_data
+
+    _delphi_warm("recent_builds", _get_delphi_recent_builds_sync)
+
+    if cached_data is not None:
+        return cached_data
+    return []
+
+
+def _get_delphi_recent_builds_sync():
+    # type: () -> List[Dict[str, Any]]
+    """Synchronous impl — call only from a background thread or CLI."""
+    import urllib.request
+    from datetime import datetime, timedelta, timezone
+    global _delphi_cache
+
+    try:
+        cutoff = (datetime.now(timezone.utc) - timedelta(hours=48)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        url = (
+            f"{_SUPABASE_URL}/build_ledger"
+            f"?created_at=gte.{cutoff}"
+            f"&order=created_at.desc&limit=500"
+        )
+        req = urllib.request.Request(url, headers={
+            "apikey": __SUPABASE_KEY,
+            "Authorization": f"Bearer {__SUPABASE_KEY}",
+        })
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            rows = json.loads(resp.read())
+
+        delphi_rows = [r for r in rows if _is_delphi_row(r)][:50]
+        _delphi_cache["recent_builds"] = (time.time(), delphi_rows)
+        return delphi_rows
+    except Exception as e:
+        _log.warning("_get_delphi_recent_builds_sync: %s", e)
+        cached_at, cached_data = _delphi_cache["recent_builds"]
+        if cached_data is not None:
+            return cached_data
+        return []
