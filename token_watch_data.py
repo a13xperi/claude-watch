@@ -405,8 +405,8 @@ def focus_session_terminal(pid):
     directive = ""
     try:
         directive = Path(f"/tmp/claude-directive-{pid}").read_text().strip()
-    except Exception:
-        pass
+    except Exception as e:
+        _log.warning("focus_session_terminal: %s", e)
     hint = directive or f"cc-{pid}"
 
     # Strategy 1: match by conversation title
@@ -434,8 +434,8 @@ def focus_session_terminal(pid):
             )
             if r.returncode == 0:
                 return (False, hint)
-        except Exception:
-            pass
+        except Exception as e:
+            _log.warning("focus_session_terminal: %s", e)
     return (False, hint)
 
 
@@ -1747,7 +1747,8 @@ def _get_expensive_turns(limit=20, days=3):
             ts = datetime.fromisoformat(entry["last_ts"].replace("Z", "+00:00"))
             if ts < cutoff:
                 continue
-        except Exception:
+        except Exception as e:
+            _log.warning("_get_expensive_turns: %s", e)
             continue
 
         sid = entry.get("session_id", "")
@@ -1776,7 +1777,8 @@ def _model_cost_stats(days=3):
             ts = datetime.fromisoformat(entry["last_ts"].replace("Z", "+00:00"))
             if ts < cutoff:
                 continue
-        except Exception:
+        except Exception as e:
+            _log.warning("_model_cost_stats: %s", e)
             continue
 
         sid = entry.get("session_id", "")
@@ -2676,7 +2678,8 @@ def _get_token_attribution():
             for a in active
             if a[0] not in attributed_pids
         ]
-    except Exception:
+    except Exception as e:
+        _log.warning("_get_token_attribution: %s", e)
         unaccounted_candidates = []
     result["unaccounted_candidates"] = unaccounted_candidates
 
@@ -3440,7 +3443,8 @@ def make_urgent_panel():
                     pid, _, directive, delta_str = item[0], item[1], item[2], item[3]
                     try:
                         d = float(delta_str.strip("+%"))
-                    except Exception:
+                    except Exception as e:
+                        _log.warning("make_urgent_panel: %s", e)
                         d = 0
                     if d > 0:
                         secs, _ = _session_last_activity(pid)
@@ -4404,8 +4408,8 @@ def _release_session_files(session_id):
                     p["files_touched"] = []
             with open(peers_file, "w") as f:
                 json.dump(peers, f)
-        except Exception:
-            pass
+        except Exception as e:
+            _log.warning("_release_session_files: %s", e)
         return True
     except Exception as e:
         _log.debug("_release_session_files: %s", e)
@@ -6732,7 +6736,8 @@ def _get_gate_state():
     """Read gate state from /tmp/paperclip-gate-state. Default 'on' if missing."""
     try:
         return Path("/tmp/paperclip-gate-state").read_text().strip()
-    except Exception:
+    except Exception as e:
+        _log.warning("_get_gate_state: %s", e)
         return "on"
 
 
@@ -6771,8 +6776,8 @@ def _check_auto_gate(five_pct):
                     five_pct, _AUTO_GATE_THRESHOLD
                 ),
             )
-        except Exception:
-            pass
+        except Exception as e:
+            _log.warning("_check_auto_gate: %s", e)
 
     elif five_pct < _AUTO_GATE_RESUME and gate == "off" and auto_gated:
         # Window reset — resume agents
@@ -6784,15 +6789,16 @@ def _check_auto_gate(five_pct):
                 "Token Watch",
                 "Auto-gated agents ON — window reset ({:.0f}%)".format(five_pct),
             )
-        except Exception:
-            pass
+        except Exception as e:
+            _log.warning("_check_auto_gate: %s", e)
 
 
 def _is_auto_gated():
     """Check if current gate-off was triggered by auto-gate (not manual)."""
     try:
         return Path("/tmp/paperclip-gate-auto").read_text().strip() == "true"
-    except Exception:
+    except Exception as e:
+        _log.warning("_is_auto_gated: %s", e)
         return False
 
 
@@ -6800,8 +6806,8 @@ def _set_auto_gated(val):
     """Mark whether current gate state was set by auto-gate."""
     try:
         Path("/tmp/paperclip-gate-auto").write_text("true" if val else "false")
-    except Exception:
-        pass
+    except Exception as e:
+        _log.warning("_set_auto_gated: %s", e)
 
 
 def _expire_session_lock(session_id):
