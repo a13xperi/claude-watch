@@ -957,6 +957,107 @@ def check_capacity_waste(ctx: Dict) -> List[Insight]:
     return insights
 
 
+# ── GitHub / cross-session coordination checks ──────────────────────────────
+
+@advisor_check("github_stale_prs", ["project_tasks"])
+def check_github_stale_prs(ctx: Dict) -> List[Insight]:
+    """Surface open GitHub PRs with no activity in 3+ days and no active claimer."""
+    from datetime import datetime, timezone, timedelta
+    tasks = ctx.get("project_tasks") or []
+    active_sessions = ctx.get("peer_sessions") or []
+    claimed_tasks = {s.get("task_ref", "") for s in active_sessions}
+
+    stale_threshold = datetime.now(timezone.utc) - timedelta(days=3)
+    stale = []
+    for t in tasks:
+        if t.get("source") != "github":
+            continue
+        github_id = t.get("github_issue_id", "")
+        if "#pr-" not in github_id:
+            continue
+        if t.get("status") in ("done", "blocked"):
+            continue
+        # Check notes for updated date
+        notes = t.get("notes", "")
+        updated_str = ""
+        for part in notes.split():
+            if part.startswith("updated:"):
+                updated_str = part[8:]
+        if updated_str:
+            try:
+                updated = datetime.fromisoformat(updated_str + "T00:00:00+00:00")
+                if updated < stale_threshold:
+                    task_id = str(t.get("id", ""))
+                    is_claimed = any(task_id in c for c in claimed_tasks)
+                    stale.append((t, is_claimed))
+            except Exception:
+                pass
+
+    insights = []
+    unclaimed_stale = [t for t, claimed in stale if not claimed]
+    if len(unclaimed_stale) >= 2:
+        repos = list({t.get("project", "?") for t in unclaimed_stale})
+        insights.append(Insight(
+            category="PIPELINE", severity="warning",
+            title=f"{len(unclaimed_stale)} stale PRs unclaimed",
+            message=f"{len(unclaimed_stale)} GitHub PRs open 3+ days with no active session in {', '.join(repos[:3])}.",
+            action="Claim in Dispatch (d) or close stale branches.",
+            source="github_stale_prs",
+            data={"count": len(unclaimed_stale), "repos": repos},
+        ))
+    elif len(unclaimed_stale) == 1:
+        t = unclaimed_stale[0]
+        insights.append(Insight(
+            category="PIPELINE", severity="info",
+            title="Stale PR needs attention",
+            message=f"'{t.get('task_name','?')[:50]}' open 3+ days, no active session.",
+            action="Claim or close.",
+            source="github_stale_prs",
+            data={"task_id": t.get("id")},
+        ))
+    return insights
+
+
+@advisor_check("cross_session_work_gap", ["project_tasks", "peer_sessions"])
+def check_cross_session_work_gap(ctx: Dict) -> List[Insight]:
+    """Flag repos with ready work in Dispatch but no active session working in them."""
+    tasks = ctx.get("project_tasks") or []
+    peer_sessions = ctx.get("peer_sessions") or []
+
+    # Active repos from session_locks
+    active_repos = {s.get("repo", "") for s in peer_sessions if s.get("repo")}
+
+    # Ready tasks grouped by project, excluding projects with active sessions
+    gap: dict = {}
+    for t in tasks:
+        if t.get("status") != "ready":
+            continue
+        if t.get("claimed_by"):
+            continue
+        proj = t.get("project", "?")
+        # Map project to repo name for comparison
+        repo_equiv = proj.replace("-backend", "").replace("-portal", "")
+        if any(repo_equiv in r or r in repo_equiv for r in active_repos):
+            continue
+        gap[proj] = gap.get(proj, 0) + 1
+
+    if not gap:
+        return []
+
+    top = sorted(gap.items(), key=lambda x: -x[1])[:3]
+    summary = ", ".join(f"{proj}:{n}" for proj, n in top)
+    total = sum(gap.values())
+
+    return [Insight(
+        category="PIPELINE", severity="info",
+        title=f"{total} ready tasks, no session active",
+        message=f"Ready work with no active session: {summary}.",
+        action="Open Dispatch (d) and claim a task.",
+        source="cross_session_work_gap",
+        data={"gap": gap},
+    )]
+
+
 # ── Main entry point ────────────────────────────────────────────────────────
 
 _advisor_cache: Optional[AdvisorReport] = None
