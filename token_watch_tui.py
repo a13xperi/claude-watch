@@ -184,6 +184,18 @@ def _restore_backup_files():
     return restored
 
 
+def _get_backup_age():
+    """Return seconds since backup was written, or float('inf') if no backup."""
+    try:
+        for fname in _BACKUP_FILES:
+            bak = _BACKUP_DIR / fname
+            if bak.exists():
+                return time.time() - bak.stat().st_mtime
+    except Exception:
+        pass
+    return float('inf')
+
+
 def _project_to_company(project: str, company: str = "") -> tuple[str, str]:
     """Return (company_name, style) from company field or project string."""
     if company:
@@ -662,6 +674,20 @@ class EngineTable(DataTable):
             # Memory gauge
             mem_text = Text.from_markup(_mem_mini_gauge(mem_mb)) if mem_mb > 0 else Text("—", style="dim")
 
+            # Estimate cost from output tokens
+            try:
+                out_tok = token_delta  # already computed above
+                mdl_str = model_map.get(sid, "")
+                from token_watch_data import _estimate_cost, _format_cost
+                session_cost = _estimate_cost(out_tok, mdl_str)
+                if session_cost >= 0.01:
+                    cost_style = "red" if session_cost >= 2.0 else ("yellow" if session_cost >= 0.50 else "green")
+                    used_text = Text.from_markup(f"[{cost_style}]{_format_cost(session_cost)}[/{cost_style}]  [{color}]{delta}[/{color}]")
+                else:
+                    used_text = Text(delta, style=color)
+            except Exception:
+                used_text = Text(delta, style=color)
+
             self.add_row(
                 Text(start_str, style="dim"),
                 Text.from_markup(f"[{dot_color}]● [/{dot_color}][cyan]{sid}[/cyan]"),
@@ -672,7 +698,7 @@ class EngineTable(DataTable):
                 Text(mdl, style=mdl_style),
                 mem_text,
                 Text(age, style="dim"),
-                Text(delta, style=color),
+                used_text,
                 Text(directive),
                 key=f"active-{pid}",
             )
@@ -7563,15 +7589,24 @@ class ClaudeWatchApp(App):
             import time as _time
             error_msg = result.stderr or result.stdout or "Unknown import error"
             self._log_build_error(error_msg)
-            restored = _restore_backup_files()
+
+            # Only revert if backup is fresh (set within last 60s = same edit cycle)
+            backup_age = _get_backup_age()
+            should_revert = backup_age < 60
+
+            if should_revert:
+                restored = _restore_backup_files()
+            else:
+                restored = False
+
             try:
                 banner = self.query_one("#reload-banner", ReloadBanner)
                 if restored:
                     banner.show_reverted(error_msg)
                     self.notify("Build broken \u2014 reverted to last working version", severity="error", timeout=10)
                 else:
-                    banner.show_reverted("No backup available!")
-                    self.notify("Build broken \u2014 no backup to revert to!", severity="error", timeout=10)
+                    banner.show_reverted(error_msg)
+                    self.notify("Build broken \u2014 fix the error and save again", severity="error", timeout=15)
             except Exception:
                 pass
             self._pending_reload = False
