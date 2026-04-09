@@ -63,6 +63,7 @@ from token_watch_data import (
     _shorten_tool,
     _token_pacing,
     check_and_notify,
+    _check_auto_gate,
     _get_test_queue,
     _add_test_item,
     _update_test_item,
@@ -1990,7 +1991,7 @@ class TokenAccessPanel(Static):
     def update_content(self):
         from token_watch_data import (
             _get_paperclip_heartbeats, _get_blocked_attempts,
-            _get_paperclip_routines, _get_gate_state,
+            _get_paperclip_routines, _get_gate_state, _is_auto_gated,
         )
 
         try:
@@ -2003,6 +2004,7 @@ class TokenAccessPanel(Static):
             routines = []
         blocked = _get_blocked_attempts(minutes=60)
         gate = _get_gate_state()
+        auto = _is_auto_gated()
 
         total_agents = len(agents)
         active_agents = sum(1 for a in agents if a.get("heartbeatEnabled") and a.get("schedulerActive"))
@@ -2012,7 +2014,8 @@ class TokenAccessPanel(Static):
         lines = []
 
         if gate == "off":
-            gate_label = "[bold red]GATED[/bold red]"
+            auto_tag = " [dim](auto @ 70%)[/dim]" if auto else ""
+            gate_label = f"[bold red]GATED[/bold red]{auto_tag}"
             lines.append(f"[bold]Token Access[/bold]  {gate_label}  [dim]click to manage[/dim]")
             lines.append("")
             lines.append(f"  {self._STATUS_OFF} [red]all paused[/red]  "
@@ -2062,15 +2065,21 @@ class TokenAccessScreen(Screen):
     def _load(self):
         from token_watch_data import (
             _get_paperclip_heartbeats, _get_blocked_attempts,
-            _get_paperclip_routines, _get_gate_state,
+            _get_paperclip_routines, _get_gate_state, _is_auto_gated,
         )
 
         agents = _get_paperclip_heartbeats()
         routines = _get_paperclip_routines()
         blocked = _get_blocked_attempts(minutes=60)
         gate = _get_gate_state()
+        auto = _is_auto_gated()
 
-        gate_label = "[green]GATE: ON[/green]" if gate == "on" else "[red]GATE: OFF[/red]"
+        if gate == "on":
+            gate_label = "[green]GATE: ON[/green]  [dim]auto-gates at 70%[/dim]"
+        elif auto:
+            gate_label = "[red]GATE: OFF[/red]  [yellow](auto — resumes on window reset)[/yellow]"
+        else:
+            gate_label = "[red]GATE: OFF[/red]  [dim](manual)[/dim]"
         self.query_one("#taccess-header", Static).update(
             f"[bold]Token Access Control[/bold]    {gate_label}    "
             "[dim]Enter to toggle · g = gate all · Esc to go back[/dim]"
@@ -2270,11 +2279,12 @@ class TokenAccessScreen(Screen):
                 self._load()
 
     def action_gate(self):
-        from token_watch_data import _gate_all, _get_gate_state
+        from token_watch_data import _gate_all, _get_gate_state, _set_auto_gated
 
         current = _get_gate_state()
         new_state = current != "on"  # toggle
         _gate_all(new_state)
+        _set_auto_gated(False)  # manual override clears auto-gate flag
         self._load()
 
     def action_refresh(self):
@@ -7068,12 +7078,13 @@ class ClaudeWatchApp(App):
             elif rolled:
                 self.notify(f"{rolled} cycle items rolled to new window", severity="information", timeout=8)
 
-        # System notifications on spike (keep unconditional)
+        # System notifications on spike + auto-gate check (keep unconditional)
         try:
             five_f, seven_f = [float(x) for x in _current_pct()[:2]]
             burndown = _get_burndown_data()
             burn_rate = burndown.get("current_rate") if burndown else None
             check_and_notify(five_f, seven_f, burn_rate)
+            _check_auto_gate(five_f)
         except (ValueError, TypeError):
             pass
 

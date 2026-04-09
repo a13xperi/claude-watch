@@ -6396,6 +6396,74 @@ def _get_gate_state():
         return "on"
 
 
+# ── Auto-gating ──────────────────────────────────────────────────────────
+
+_AUTO_GATE_THRESHOLD = 70   # gate off when 5h >= this %
+_AUTO_GATE_RESUME = 10      # gate back on when 5h drops below this % (window reset)
+_auto_gate_last_check = 0.0
+_AUTO_GATE_COOLDOWN = 120   # seconds between auto-gate checks
+
+
+def _check_auto_gate(five_pct):
+    """Auto-gate agents off at threshold, back on after window reset.
+    Called from the TUI refresh loop with current 5h percentage.
+    Only acts if gate was set by auto-gate (not manual).
+    """
+    global _auto_gate_last_check
+
+    now = time.time()
+    if now - _auto_gate_last_check < _AUTO_GATE_COOLDOWN:
+        return
+    _auto_gate_last_check = now
+
+    gate = _get_gate_state()
+    auto_gated = _is_auto_gated()
+
+    if five_pct >= _AUTO_GATE_THRESHOLD and gate == "on":
+        # Gate off — too much burn
+        _gate_all(False)
+        _set_auto_gated(True)
+        _log.info("AUTO-GATE: off at %.0f%% (threshold: %d%%)", five_pct, _AUTO_GATE_THRESHOLD)
+        try:
+            send_system_notification(
+                "Token Watch",
+                "Auto-gated agents OFF at {:.0f}% (threshold: {}%)".format(
+                    five_pct, _AUTO_GATE_THRESHOLD
+                ),
+            )
+        except Exception:
+            pass
+
+    elif five_pct < _AUTO_GATE_RESUME and gate == "off" and auto_gated:
+        # Window reset — resume agents
+        _gate_all(True)
+        _set_auto_gated(False)
+        _log.info("AUTO-GATE: on — window reset (%.0f%%)", five_pct)
+        try:
+            send_system_notification(
+                "Token Watch",
+                "Auto-gated agents ON — window reset ({:.0f}%)".format(five_pct),
+            )
+        except Exception:
+            pass
+
+
+def _is_auto_gated():
+    """Check if current gate-off was triggered by auto-gate (not manual)."""
+    try:
+        return Path("/tmp/paperclip-gate-auto").read_text().strip() == "true"
+    except Exception:
+        return False
+
+
+def _set_auto_gated(val):
+    """Mark whether current gate state was set by auto-gate."""
+    try:
+        Path("/tmp/paperclip-gate-auto").write_text("true" if val else "false")
+    except Exception:
+        pass
+
+
 def _get_blocked_attempts(minutes=60):
     """Infer suppressed heartbeat runs for disabled agents.
     Compares each disabled agent's known interval against lastHeartbeatAt
