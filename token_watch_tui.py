@@ -230,6 +230,85 @@ class TokenHeader(Static):
         self.update(make_header(five, seven, fr, sr))
 
 
+class CompactStatusBar(Static):
+    """Single-line compact status bar — docked top above the NavBar."""
+
+    def update_content(self):
+        try:
+            from token_watch_data import (
+                _current_pct, _countdown, _get_active_account,
+                _active_pids, _get_peer_sessions, _get_dispatch_queue,
+            )
+        except ImportError:
+            from token_watch_data import (
+                _current_pct, _countdown, _get_active_account,
+                _active_pids, _get_peer_sessions,
+            )
+            _get_dispatch_queue = None
+
+        def mini_bar(pct, width=6):
+            try:
+                f = float(pct)
+                filled = int(f * width / 100)
+                color = "green" if f < 50 else ("yellow" if f < 75 else "red")
+                return f"[{color}]{'█' * filled}{'░' * (width - filled)}[/{color}]"
+            except Exception:
+                return "[dim]" + "░" * width + "[/dim]"
+
+        try:
+            five, seven, five_reset, _ = _current_pct()
+            countdown = _countdown(five_reset)
+            # Strip "(at HH:MM AM)" for compactness — keep just "4h36m"
+            countdown_short = countdown.split(" (")[0] if countdown else "?"
+        except Exception:
+            five, seven, countdown_short = "?", "?", "?"
+
+        # Task counts from dispatch queue
+        p1_str = "—"
+        try:
+            if _get_dispatch_queue is not None:
+                q = _get_dispatch_queue()
+                total = q.get("stats", {}).get("total_ready", 0)
+                p1 = sum(1 for t in q.get("queue", []) if t.get("priority") == 1)
+                p1_str = f"P{p1}/{total}"
+        except Exception:
+            pass
+
+        # Active sessions
+        try:
+            local_pids = _active_pids()
+            peers = _get_peer_sessions()
+            n_sessions = len(local_pids) + len(peers)
+            peer_ids = [p.get("session_id", "?")[:12] for p in peers[:3]]
+            local_ids = [f"cc-{pid}"[:12] for pid in local_pids[:2]]
+            all_ids = local_ids + peer_ids
+            session_str = f"{n_sessions} " + ", ".join(all_ids[:3])
+            if n_sessions > 3:
+                session_str += f" +{n_sessions - 3}"
+        except Exception:
+            session_str = "?"
+
+        five_str = str(int(float(five))) + "%" if five != "?" else "?"
+        seven_str = str(int(float(seven))) + "%" if seven != "?" else "?"
+
+        bar5 = mini_bar(five if five != "?" else 0)
+        bar7 = mini_bar(seven if seven != "?" else 0)
+
+        label, _, _ = _get_active_account()
+        acct_color = "cyan" if label == "A" else ("magenta" if label == "B" else "yellow")
+
+        line = (
+            f"[dim]T[/dim]  "
+            f"[cyan]{countdown_short}[/cyan]  "
+            f"[dim]{p1_str}[/dim]  "
+            f"5h {bar5} {five_str}  "
+            f"7d {bar7} {seven_str}  "
+            f"[{acct_color}]Acct {label}[/{acct_color}]  "
+            f"[dim]{session_str}[/dim]"
+        )
+        self.update(line)
+
+
 class AccountCapacityPanel(Static):
     """Compact side-by-side view of all Claude accounts."""
 
@@ -683,6 +762,20 @@ class EngineTable(DataTable):
             # Project/company from repo
             co_name, co_style = _project_to_company(p_repo)
 
+            # Telemetry from new session_locks columns
+            p_mem_mb = peer.get("mem_mb") or 0
+            p_out_tok = peer.get("output_tokens") or 0
+            p_model = _abbrev_model(peer.get("model") or "")
+            p_five = peer.get("five_pct")
+
+            p_mdl_style = "magenta" if "opus" in p_model else ("cyan" if "sonnet" in p_model else "dim")
+            p_mem_text = Text.from_markup(_mem_mini_gauge(p_mem_mb)) if p_mem_mb > 0 else Text("—", style="dim")
+            p_tok_str = (f"+{p_five:.1f}%" if p_five else (
+                f"{p_out_tok / 1000:.1f}k tok" if p_out_tok >= 1000 else (
+                    str(p_out_tok) + " tok" if p_out_tok else "—"
+                )
+            ))
+
             self.add_row(
                 Text(claimed_str, style="dim"),
                 Text.from_markup("[blue]☁ [/blue][dim]{}[/dim]".format(p_sid)),
@@ -690,10 +783,10 @@ class EngineTable(DataTable):
                 Text(p_tool, style="dim"),
                 Text(co_name, style=co_style),
                 Text(p_repo, style="dim"),
-                Text("—", style="dim"),
-                Text("—", style="dim"),
+                Text(p_model, style=p_mdl_style),
+                p_mem_text,
                 Text(hb_str, style=hb_style),
-                Text("—", style="dim"),
+                Text(p_tok_str, style="dim"),
                 Text(p_task),
                 key="peer-{}".format(p_sid),
             )
@@ -1708,6 +1801,26 @@ class SystemHealthPanel(Static):
             f"[bold]{total_mem_str}[/bold]",
             f"[{mem_pct_color}]{mem_pct:.0f}% of {sys_mem/1024:.0f}GB[/{mem_pct_color}]",
         )
+
+        # Paperclip ghost instance check
+        import subprocess as _sp
+        try:
+            _scan = _sp.run(
+                ["/bin/bash", "/Users/a13xperi/battlestation/scripts/paperclip-scan.sh", "--json"],
+                capture_output=True, text=True, timeout=3
+            )
+            if _scan.returncode == 0 and _scan.stdout.strip():
+                import json as _json
+                _d = _json.loads(_scan.stdout.strip())
+                if _d.get("ghost_running"):
+                    _pid = _d.get("ghost_pid", "?")
+                    t.add_row("", "[bold red]⚠ GHOST[/bold red]", "localhost", "[red]Personal[/red]", "", "", f"[bold red]Paperclip LIVE pid={_pid} — BURNING TOKENS[/bold red]")
+                else:
+                    _bc = _d.get("backup_count", 0)
+                    _bwarn = f" [yellow]({_bc} backups)[/yellow]" if _bc > 14 else ""
+                    t.add_row("", "[dim green]● ghost[/dim green]", "localhost", "[dim]Personal[/dim]", "", "", f"[dim green]Paperclip DOWN (safe)[/dim green]{_bwarn}")
+        except Exception:
+            pass
 
         self.display = True
         self.update(Panel(t, title="[bold]System Health[/bold]", border_style="magenta"))
@@ -7313,6 +7426,7 @@ class ClaudeWatchApp(App):
     def compose(self) -> ComposeResult:
         from textual.widgets import Input, Footer
         yield ReloadBanner(id="reload-banner")
+        yield CompactStatusBar(id="compact-status-bar")
         yield NavBar(id="nav-bar")
         yield Static(id="cycle-banner")
         with ContentSwitcher(initial="view-dashboard", id="content-switcher"):
@@ -7578,6 +7692,12 @@ class ClaudeWatchApp(App):
         )
 
     def refresh_data(self):
+        # Compact status bar — always visible regardless of active tab
+        try:
+            self.query_one("#compact-status-bar", CompactStatusBar).update_content()
+        except Exception:
+            pass
+
         # Global cycle banner — always update regardless of active tab
         self._update_cycle_banner()
 

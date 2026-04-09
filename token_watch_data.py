@@ -78,25 +78,44 @@ def _safe_float(val, default=0.0):
 
 
 def _current_pct():
-    """Returns (five, seven, five_reset_ts, seven_reset_ts)."""
+    """Returns (five, seven, five_reset_ts, seven_reset_ts).
+
+    Primary source: /tmp/statusline-debug.json (written by active session).
+    Fallback: Supabase account_capacity table (works without a session running).
+    """
+    def _ts(raw):
+        if isinstance(raw, (int, float)):
+            return datetime.fromtimestamp(raw, tz=timezone.utc).isoformat()
+        return raw or ""
+
+    # Primary: live statusline data (fresh = written within last 5 minutes)
     try:
-        raw = Path("/tmp/statusline-debug.json").read_text()
-        if raw.strip():
-            d = json.loads(raw)
+        debug_path = Path("/tmp/statusline-debug.json")
+        if debug_path.exists() and time.time() - debug_path.stat().st_mtime < 300:
+            d = json.loads(debug_path.read_text())
             rl = d.get("rate_limits", {})
             five = rl.get("five_hour", {}).get("used_percentage", "?")
             seven = rl.get("seven_day", {}).get("used_percentage", "?")
-
-            def _ts(raw):
-                if isinstance(raw, (int, float)):
-                    return datetime.fromtimestamp(raw, tz=timezone.utc).isoformat()
-                return raw or ""
-
             five_reset = _ts(rl.get("five_hour", {}).get("resets_at", ""))
             seven_reset = _ts(rl.get("seven_day", {}).get("resets_at", ""))
-            return five, seven, five_reset, seven_reset
+            if five != "?" and five_reset:
+                return five, seven, five_reset, seven_reset
     except Exception as e:
-        _log.warning("Failed to read rate limits: %s", e)
+        _log.debug("_current_pct statusline: %s", e)
+
+    # Fallback: Supabase account_capacity (no session required)
+    try:
+        active_label, _, _ = _get_active_account()
+        for row in _get_supabase_account_capacity():
+            if row.get("account") == active_label:
+                five = row.get("five_hour_used_pct", "?")
+                seven = row.get("seven_day_used_pct", "?")
+                five_reset = _ts(row.get("five_hour_resets_at", ""))
+                seven_reset = _ts(row.get("seven_day_resets_at", ""))
+                return five, seven, five_reset, seven_reset
+    except Exception as e:
+        _log.warning("_current_pct supabase fallback: %s", e)
+
     return "?", "?", "", ""
 
 
@@ -236,7 +255,8 @@ def _get_peer_sessions():
         "{base}/session_locks"
         "?status=eq.active"
         "&order=claimed_at.desc"
-        "&select=session_id,tool,repo,task_name,account,claimed_at,heartbeat_at,files_touched"
+        "&select=session_id,tool,repo,task_name,account,claimed_at,heartbeat_at,"
+        "files_touched,mem_mb,output_tokens,model,five_pct"
     ).format(base=_SUPABASE_URL)
 
     req = urllib.request.Request(url, headers={

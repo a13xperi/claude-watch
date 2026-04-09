@@ -2,6 +2,14 @@ Screen {
     layout: vertical;
 }
 
+/* ── Compact Status Bar ── */
+#compact-status-bar {
+    height: 1;
+    dock: top;
+    padding: 0 1;
+    background: $surface-darken-2;
+}
+
 /* ── Nav Bar ── */
 #nav-bar {
     height: 3;
