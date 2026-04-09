@@ -172,13 +172,15 @@ def _project_to_company(project: str, company: str = "") -> tuple[str, str]:
         if "personal" in c: return "Personal", "dim"
         return company[:12], "dim"
     p = (project or "").lower().strip()
-    if p in ("atlas", "atlas-be", "atlas-fe"):
+    if p in ("atlas", "atlas-be", "atlas-fe", "atlas-portal", "atlas-backend"):
         return "Delphi", "blue"
     if p in ("kaa",):
         return "KAA", "green"
-    if p in ("frank",):
+    if p in ("frank", "frank-pilot"):
         return "Frank", "magenta"
-    if p in ("openclaw", "paperclip", "Token Watch"):
+    if p in ("sage",):
+        return "SAGE", "yellow"
+    if p in ("openclaw", "paperclip", "token watch", "token-watch", "battlestation"):
         return "Personal", "dim"
     return "—", "dim"
 
