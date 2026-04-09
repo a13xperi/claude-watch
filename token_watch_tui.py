@@ -99,6 +99,29 @@ class LazyView(ScrollableContainer):
         pass
 
 
+class BaseMetricsView(LazyView):
+    """LazyView with a standard 30s refresh throttle and table-clear logic.
+
+    Subclasses set _table_ids to the list of DataTable widget IDs that should
+    be cleared before each reload. refresh_content is fully handled here;
+    subclasses only need to implement load_content().
+    """
+    _refresh_interval: float = 30.0
+    _table_ids: list = []
+
+    def refresh_content(self) -> None:
+        now = time.time()
+        last = getattr(self, "_last_refresh", 0.0)
+        if (now - last) >= self._refresh_interval:
+            self._last_refresh = now
+            try:
+                for tid in self._table_ids:
+                    self.query_one(tid, DataTable).clear(columns=True)
+                self.load_content()
+            except Exception:
+                pass
+
+
 def _start_hot_reload_watcher(app):
     # type: (Any) -> None
     """Watch source files for changes. Signal the app instead of auto-restarting."""
@@ -2446,18 +2469,8 @@ class TokenAccessScreen(Screen):
         self.app.pop_screen()
 
 
-class UsageMetricsView(LazyView):
-
-    def refresh_content(self):
-        now = time.time()
-        if not hasattr(self, '_last_refresh') or (now - self._last_refresh) > 30:
-            self._last_refresh = now
-            try:
-                self.query_one("#metrics-table", DataTable).clear(columns=True)
-                self.query_one("#scores-table", DataTable).clear(columns=True)
-                self.load_content()
-            except Exception:
-                pass
+class UsageMetricsView(BaseMetricsView):
+    _table_ids = ["#metrics-table", "#scores-table"]
 
     def compose(self) -> ComposeResult:
         yield Static(id="metrics-header")
@@ -2583,18 +2596,8 @@ class UsageMetricsView(LazyView):
             )
 
 
-class MCPStatsView(LazyView):
-
-    def refresh_content(self):
-        now = time.time()
-        if not hasattr(self, '_last_refresh') or (now - self._last_refresh) > 30:
-            self._last_refresh = now
-            try:
-                self.query_one("#mcp-servers-table", DataTable).clear(columns=True)
-                self.query_one("#mcp-actions-table", DataTable).clear(columns=True)
-                self.load_content()
-            except Exception:
-                pass
+class MCPStatsView(BaseMetricsView):
+    _table_ids = ["#mcp-servers-table", "#mcp-actions-table"]
 
     def compose(self) -> ComposeResult:
         yield Static(id="mcp-header")
