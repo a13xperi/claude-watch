@@ -4007,6 +4007,56 @@ def _get_dispatch_queue():
         _log.warning("_get_dispatch_queue: %s", e)
         return empty
 
+_lane_progress_cache = (0, None)
+
+def _get_lane_progress():
+    """Get per-lane task progress for swarm monitoring."""
+    import urllib.request
+    global _lane_progress_cache
+    now = time.time()
+    if _lane_progress_cache[1] is not None and (now - _lane_progress_cache[0]) < 30:
+        return _lane_progress_cache[1]
+    try:
+        url = (
+            f"{_SUPABASE_URL}/project_tasks"
+            f"?lane=not.is.null"
+            f"&select=id,task_name,lane,status,priority,claimed_by"
+            f"&order=lane,build_order"
+            f"&limit=200"
+        )
+        req = urllib.request.Request(url, headers={
+            "apikey": _SUPABASE_KEY,
+            "Authorization": f"Bearer {_SUPABASE_KEY}",
+        })
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            items = json.loads(resp.read())
+
+        lanes = {}
+        for item in items:
+            lane = item.get("lane", "")
+            if not lane:
+                continue
+            if lane not in lanes:
+                lanes[lane] = {"total": 0, "built": 0, "active": 0, "ready": 0, "blocked": 0, "tasks": []}
+            lanes[lane]["total"] += 1
+            lanes[lane]["tasks"].append(item)
+            status = item.get("status", "")
+            if status == "built":
+                lanes[lane]["built"] += 1
+            elif status == "in_progress":
+                lanes[lane]["active"] += 1
+            elif status == "ready":
+                lanes[lane]["ready"] += 1
+            elif status == "blocked":
+                lanes[lane]["blocked"] += 1
+
+        _lane_progress_cache = (now, lanes)
+        return lanes
+    except Exception as e:
+        _log.warning("_get_lane_progress: %s", e)
+        return {}
+
+
 def _dispatch_claim_task(task_id):
     """Claim a task from the dispatch queue — set status=in_progress."""
     import urllib.request, os

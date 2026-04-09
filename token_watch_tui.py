@@ -6344,6 +6344,7 @@ class DispatchView(LazyView):
 
     def compose(self) -> ComposeResult:
         yield Static(id="dispatch-header")
+        yield Static(id="dispatch-lanes")
         yield DataTable(id="dispatch-table")
         yield Static(id="bugs-header")
         yield DataTable(id="bugs-table")
@@ -6364,6 +6365,37 @@ class DispatchView(LazyView):
             f"[dim]~{stats['total_tokens_k']}kT total[/dim]{lane_info}  "
             f"[dim italic]enter=view  c=copy  x=claim  a=archive  l=lane  r=refresh[/dim italic]"
         )
+
+        # Lane progress bars for swarm monitoring
+        from token_watch_data import _get_lane_progress
+        lane_data = _get_lane_progress()
+        lane_widget = self.query_one("#dispatch-lanes", Static)
+        if lane_data:
+            _lc = {"ui-simplification": "green", "voice-lab": "magenta", "twitter-integration": "cyan"}
+            lines = []
+            for lane_name in sorted(lane_data.keys()):
+                info = lane_data[lane_name]
+                total = info["total"]
+                built = info["built"]
+                active = info["active"]
+                blocked = info["blocked"]
+                color = _lc.get(lane_name, "dim")
+                bar_w = 20
+                filled = int((built / total) * bar_w) if total else 0
+                active_fill = int((active / total) * bar_w) if total else 0
+                bar = f"[{color}]{chr(9608) * filled}[/{color}][yellow]{chr(9618) * active_fill}[/yellow]{chr(9617) * (bar_w - filled - active_fill)}"
+                agents = [t for t in info["tasks"] if t.get("status") == "in_progress"]
+                agent_str = ""
+                if agents:
+                    parts = [f"{t.get('claimed_by', '?')}: #{t['id']}" for t in agents[:2]]
+                    agent_str = f"  [{color}]{', '.join(parts)}[/{color}]"
+                blk_str = f"  [dim]{blocked} blocked[/dim]" if blocked else ""
+                lines.append(f"  [{color}]{lane_name:<22}[/{color}] {bar} {built}/{total} built{agent_str}{blk_str}")
+            lane_widget.update("\n".join(lines))
+            lane_widget.display = True
+        else:
+            lane_widget.update("")
+            lane_widget.display = False
 
         table = self.query_one("#dispatch-table", DataTable)
         table.cursor_type = "row"
