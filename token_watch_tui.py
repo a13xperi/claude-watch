@@ -491,9 +491,18 @@ class EngineTable(DataTable):
                        else ("cyan" if "atlas" in source else "dim"))
             )
 
-            # Derive project
+            # Derive project — check repo from session_locks first, then source, then directive
             project = "—"
-            if source in ("atlas-be", "atlas-fe"):
+            repo = session.get("repo", "")
+            if repo in ("atlas-portal", "atlas-backend"):
+                project = "atlas"
+            elif repo == "token-watch":
+                project = "Token Watch"
+            elif repo in ("paperclip", "openclaw", "frank-pilot", "battlestation"):
+                project = repo
+            elif repo and repo not in ("a13xperi", "unknown", "—", ""):
+                project = repo
+            elif source in ("atlas-be", "atlas-fe"):
                 project = "atlas"
             elif source == "openclaw":
                 project = "openclaw"
@@ -502,11 +511,16 @@ class EngineTable(DataTable):
             elif "/" in source:
                 parts = source.split("/", 1)
                 project = parts[1] if len(parts) > 1 else parts[0]
-            else:
+
+            # Fallback: check directive text
+            if project == "—":
                 d_lower = directive.lower() if directive else ""
-                for p in ("Token Watch", "atlas", "paperclip", "openclaw", "frank"):
-                    if p in d_lower:
-                        project = p
+                for kw, pname in [("token watch", "Token Watch"), ("tw ", "Token Watch"),
+                                   ("atlas", "atlas"), ("paperclip", "paperclip"),
+                                   ("openclaw", "openclaw"), ("frank", "frank"),
+                                   ("kaa", "kaa"), ("sage", "sage")]:
+                    if kw in d_lower:
+                        project = pname
                         break
 
             if "/" in source:
