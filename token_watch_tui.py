@@ -339,10 +339,11 @@ class EngineTable(DataTable):
     """Engine management — unified session health + system pressure."""
 
     BORDER_TITLE = "Engine Management (live)"
-    BORDER_SUBTITLE = "Enter/f to focus terminal"
+    BORDER_SUBTITLE = "Enter/f to focus · k to kill"
 
     BINDINGS = [
         Binding("f", "focus_selected", "Focus terminal", show=True),
+        Binding("k", "kill_selected", "Kill session", show=True),
     ]
 
     def on_mount(self):
@@ -736,6 +737,27 @@ class EngineTable(DataTable):
                 self.app.notify(f"Focused: {hint}", severity="information", timeout=2)
             else:
                 self.app.notify(f"Opened Warp — find: {hint}", severity="warning", timeout=3)
+
+    def action_kill_selected(self):
+        """Handle 'k' key — send SIGTERM to the selected session."""
+        import signal
+        pid = self._get_pid_from_cursor()
+        if not pid:
+            self.app.notify("No session selected", severity="warning", timeout=2)
+            return
+        # Don't kill yourself
+        my_pid = str(os.getpid())
+        parent_pid = str(os.getppid())
+        if pid in (my_pid, parent_pid):
+            self.app.notify("Can't kill token-watch's own process", severity="warning", timeout=3)
+            return
+        try:
+            os.kill(int(pid), signal.SIGTERM)
+            self.app.notify(f"Killed cc-{pid}", severity="information", timeout=3)
+        except ProcessLookupError:
+            self.app.notify(f"cc-{pid} already dead", severity="warning", timeout=2)
+        except PermissionError:
+            self.app.notify(f"No permission to kill cc-{pid}", severity="error", timeout=3)
 
     def _focus_terminal_for_row(self, row_key):
         """Extract PID from row key and focus the corresponding terminal."""
@@ -5465,10 +5487,13 @@ class MissionControlView(LazyView):
         yield Static(id="mission-header")
         yield DataTable(id="mission-table")
 
+    _recovery_filter = False
+
     def load_content(self):
         from token_watch_data import _get_build_ledger
         cycle_id = getattr(self.app, '_active_cycle_id', None)
-        data = _get_build_ledger(days=7, limit=100, cycle_id=cycle_id)
+        source = "recovery" if self._recovery_filter else None
+        data = _get_build_ledger(days=7, limit=100, cycle_id=cycle_id, source=source)
         stats = data["stats"]
 
         # Cycle navigation indicator
@@ -5485,9 +5510,11 @@ class MissionControlView(LazyView):
             except Exception:
                 cycle_label = f"[bold]Cycle: {cycle_id[:16]}[/bold]"
 
+        recovery_tag = "  [bold yellow][RECOVERY FILTER][/bold yellow]" if self._recovery_filter else ""
         self.query_one("#mission-header", Static).update(
             f"{cycle_label}  "
-            f"[dim]\u25C0 [  ] \u25B6  |  0=all[/dim]  "
+            f"[dim]\u25C0 [  ] \u25B6  |  0=all  |  r=recovery[/dim]"
+            f"{recovery_tag}  "
             f"[dim]{stats['total']} shipped  ·  "
             f"[yellow]{stats['untested']} untested[/yellow]  ·  "
             f"[cyan]{stats['decisions']} decisions[/cyan]  ·  "
@@ -6369,6 +6396,8 @@ class DispatchView(LazyView):
         Binding("a", "archive_selected", "Archive"),
         Binding("l", "cycle_lane", "Lane"),
         Binding("p", "cycle_company", "Company"),
+        Binding("s", "cycle_bug_status", "Bug Status"),
+        Binding("f", "fix_bug", "Fix Bug"),
     ]
 
     def refresh_content(self):
@@ -6525,7 +6554,7 @@ class DispatchView(LazyView):
             f"\n[bold red]Bugs[/bold red]  "
             f"[red]{bug_stats['open']} open[/red]  ·  "
             f"[yellow]{bug_stats['in_progress']} in progress[/yellow]  ·  "
-            f"[dim italic]File with /bug[/dim italic]"
+            f"[dim italic]/bug to file  s=status  f=fix[/dim italic]"
         )
 
         bug_table = self.query_one("#bugs-table", DataTable)
@@ -6533,8 +6562,9 @@ class DispatchView(LazyView):
         bug_table.zebra_stripes = True
         bug_table.add_column("#", width=6)
         bug_table.add_column("Sev", width=6)
+        bug_table.add_column("Status", width=8)
         bug_table.add_column("Project", width=12)
-        bug_table.add_column("Title", width=40)
+        bug_table.add_column("Title", width=38)
         bug_table.add_column("Found By", width=12)
         bug_table.add_column("Age", width=8)
 
@@ -6552,11 +6582,19 @@ class DispatchView(LazyView):
             found = bug.get("found_by", "?")
             if found and len(found) > 12:
                 found = found[:10] + ".."
+            status = bug.get("status", "open")
+            status_styles = {
+                "open": "[red]OPEN[/red]",
+                "in_progress": "[yellow]WIP[/yellow]",
+                "fixed": "[green]FIXED[/green]",
+                "verified": "[bold green]DONE[/bold green]",
+            }
             bug_table.add_row(
                 f"BUG-{bug.get('bug_number', '?')}",
                 sev_styles.get(bug.get("severity", "medium"), "?"),
+                status_styles.get(status, status),
                 f"[cyan]{bug.get('project', '?')}[/cyan]",
-                (bug.get("title", "?")[:38] + "..") if len(bug.get("title", "")) > 40 else bug.get("title", "?"),
+                (bug.get("title", "?")[:36] + "..") if len(bug.get("title", "")) > 38 else bug.get("title", "?"),
                 found,
                 age,
             )
@@ -6675,6 +6713,54 @@ class DispatchView(LazyView):
                     self.notify("Archive failed", severity="error")
         except Exception:
             self.notify("Archive failed", severity="error")
+
+    def _get_focused_bug(self):
+        """Return the bug item if the bugs table has focus, else None."""
+        try:
+            bug_table = self.query_one("#bugs-table", DataTable)
+            if not bug_table.has_focus or not hasattr(self, '_bug_items') or not self._bug_items:
+                return None
+            row_idx = bug_table.cursor_row
+            if 0 <= row_idx < len(self._bug_items):
+                return self._bug_items[row_idx]
+        except Exception:
+            pass
+        return None
+
+    def action_cycle_bug_status(self):
+        """Cycle bug status: open → in_progress → fixed → open."""
+        bug = self._get_focused_bug()
+        if not bug:
+            self.notify("Focus a bug row first", severity="warning")
+            return
+        from token_watch_data import _update_bug_status
+        cycle = {"open": "in_progress", "in_progress": "fixed", "fixed": "open"}
+        current = bug.get("status", "open")
+        new_status = cycle.get(current, "open")
+        ok = _update_bug_status(bug["id"], new_status)
+        if ok:
+            num = bug.get("bug_number", "?")
+            self.notify(f"BUG-{num}: {current} → {new_status}")
+            self.action_refresh_dispatch()
+        else:
+            self.notify("Status update failed", severity="error")
+
+    def action_fix_bug(self):
+        """Mark bug as fixed by this session."""
+        bug = self._get_focused_bug()
+        if not bug:
+            self.notify("Focus a bug row first", severity="warning")
+            return
+        from token_watch_data import _fix_bug
+        import os
+        session_id = f"cc-{os.getppid()}"
+        ok = _fix_bug(bug["id"], session_id)
+        if ok:
+            num = bug.get("bug_number", "?")
+            self.notify(f"BUG-{num} fixed by {session_id}")
+            self.action_refresh_dispatch()
+        else:
+            self.notify("Fix failed", severity="error")
 
 
 class ExpensiveTurnsView(LazyView):
@@ -7348,6 +7434,13 @@ class ClaudeWatchApp(App):
                 event.stop()
         elif event.key == "p" and switcher.current == "view-cycles":
             self.push_screen(CyclePlanScreen())
+            event.prevent_default()
+            event.stop()
+        elif event.key == "r" and switcher.current == "view-mission":
+            view = self.query_one("#view-mission", MissionControlView)
+            view._recovery_filter = not view._recovery_filter
+            view._last_refresh = 0  # force refresh
+            view.refresh_content()
             event.prevent_default()
             event.stop()
 
