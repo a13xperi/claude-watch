@@ -15,6 +15,11 @@ dependencies = [
 
 [project.optional-dependencies]
 tui = ["textual>=0.50"]
+test = ["pytest>=7.0", "pytest-asyncio>=0.21"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
 
 [project.scripts]
 token-watch = "token_watch:main"

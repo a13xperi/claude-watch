@@ -78,3 +78,10 @@ Full cross-system backlog sweep across Notion (3 databases), GitHub (5 repos), a
 4. Deduplicate Backlog Tracker (2 pairs)
 5. Clean Supabase zombies (ids 97, 139/159, 142)
 6. Alex manual: Railway env vars, kaa.design, KAA agent config, Anil seed
+
+## 2026-04-09 — #211: Add test infrastructure (pytest + fixtures) (cc-$PPID)
+- **Source:** dispatch — project_task:211
+- **Branch:** main
+- **Account:** A
+- **Points:** — | **Attempt:** 1
+- **Status:** In Progress
