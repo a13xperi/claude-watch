@@ -5917,8 +5917,9 @@ class MissionControlView(LazyView):
         table.zebra_stripes = True
         table.add_column("", width=2)       # status icon
         table.add_column("Time", width=6)
-        table.add_column("Title", width=35)
-        table.add_column("How to Verify", width=40)
+        table.add_column("SHA", width=8)
+        table.add_column("Title", width=33)
+        table.add_column("How to Verify", width=38)
         table.add_column("Session", width=7)
         table.add_column("Files", width=4)
         table.add_column("Test", width=8)
@@ -5954,6 +5955,7 @@ class MissionControlView(LazyView):
                 table.add_row(
                     Text(""),
                     Text(""),
+                    Text(""),
                     Text(f"\u2500\u2500 {label} \u2500\u2500", style="dim bold"),
                     Text(""),
                     Text(""),
@@ -5977,11 +5979,13 @@ class MissionControlView(LazyView):
                     file_count = str(len(files)) if files else ""
 
                     hint = item.get("test_hint", "") or ""
+                    sha = (item.get("commit_sha") or "")[:7]
                     table.add_row(
                         Text(icon, style=icon_style),
                         Text(ts, style="dim"),
-                        Text(item.get("title", "")[:35]),
-                        Text(hint[:40], style="italic"),
+                        Text(sha, style="dim cyan"),
+                        Text(item.get("title", "")[:33]),
+                        Text(hint[:38], style="italic"),
                         Text(item.get("session_id", "").replace("cc-", ""), style="dim"),
                         Text(file_count, style="dim"),
                         Text(test, style=icon_style),
