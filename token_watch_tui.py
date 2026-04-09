@@ -1972,61 +1972,41 @@ class TokenAccessPanel(Static):
     _STATUS_MIXED = "[bold yellow]◐[/bold yellow]"
 
     def update_content(self):
-        from token_watch_data import _get_paperclip_heartbeats, _get_blocked_attempts
+        from token_watch_data import (
+            _get_paperclip_heartbeats, _get_blocked_attempts,
+            _get_paperclip_routines, _get_gate_state,
+        )
 
         try:
             agents = _get_paperclip_heartbeats()
         except Exception:
             agents = []
+        try:
+            routines = _get_paperclip_routines()
+        except Exception:
+            routines = []
         blocked = _get_blocked_attempts(minutes=60)
+        gate = _get_gate_state()
 
-        # Group agents by company
-        companies = {}  # type: dict
-        for a in agents:
-            co = a.get("companyName", "?")
-            if co not in companies:
-                companies[co] = []
-            companies[co].append(a)
+        total_agents = len(agents)
+        active_agents = sum(1 for a in agents if a.get("heartbeatEnabled") and a.get("schedulerActive"))
+        total_routines = len(routines)
+        active_routines = sum(1 for r in routines if r.get("status") == "active")
 
         lines = []
-        lines.append("[bold]Token Access[/bold]  [dim]click to manage · shows what can burn tokens[/dim]")
-        lines.append("")
-        lines.append(f"  {self._STATUS_ON} [green]CLI[/green] [dim](always on)[/dim]")
 
-        for co_name, co_agents in sorted(companies.items()):
-            active = [a for a in co_agents if a.get("heartbeatEnabled") and a.get("schedulerActive")]
-            total = len(co_agents)
-            n_active = len(active)
-
-            if n_active == 0:
-                status = self._STATUS_OFF
-                style = "red"
-            elif n_active < total:
-                status = self._STATUS_MIXED
-                style = "yellow"
-            else:
-                status = self._STATUS_ON
-                style = "green"
-
-            agent_parts = []
-            for a in co_agents:
-                name = a.get("agentName", "?")
-                on = a.get("heartbeatEnabled", False) and a.get("schedulerActive", False)
-                interval = a.get("intervalSec", 0)
-                if interval >= 86400:
-                    freq = f"{interval // 86400}d"
-                elif interval >= 3600:
-                    freq = f"{interval // 3600}h"
-                elif interval >= 60:
-                    freq = f"{interval // 60}m"
-                else:
-                    freq = f"{interval}s" if interval else "—"
-
-                dot = "[green]●[/green]" if on else "[red]○[/red]"
-                agent_parts.append(f"{dot} {name}({freq})")
-
-            detail = "  ".join(agent_parts)
-            lines.append(f"  {status} [{style}]{co_name}[/{style}] ({n_active}/{total})  {detail}")
+        if gate == "off":
+            gate_label = "[bold red]GATED[/bold red]"
+            lines.append(f"[bold]Token Access[/bold]  {gate_label}  [dim]click to manage[/dim]")
+            lines.append("")
+            lines.append(f"  {self._STATUS_OFF} [red]all paused[/red]  "
+                         f"[dim]{total_agents} agents · {total_routines} routines[/dim]")
+        else:
+            gate_label = "[bold green]GATE: ON[/bold green]"
+            lines.append(f"[bold]Token Access[/bold]  {gate_label}  [dim]click to manage[/dim]")
+            lines.append("")
+            lines.append(f"  {self._STATUS_ON} [green]CLI[/green] [dim](always on)[/dim]")
+            lines.append(f"  {active_agents} agents · {active_routines} routines active")
 
         if blocked:
             lines.append("")
@@ -2043,16 +2023,19 @@ class TokenAccessPanel(Static):
 
 
 class TokenAccessScreen(Screen):
-    """Full screen for toggling individual agent heartbeats."""
+    """Full screen for toggling individual agent heartbeats and routines."""
 
     BINDINGS = [
         Binding("escape", "pop_screen", "Back"),
         Binding("r", "refresh", "Refresh"),
+        Binding("g", "gate", "Gate All"),
     ]
 
     def compose(self) -> ComposeResult:
         yield Static(id="taccess-header")
         yield DataTable(id="taccess-table")
+        yield Static(id="taccess-routines-header")
+        yield DataTable(id="taccess-routines")
         yield Static(id="taccess-blocked-header")
         yield DataTable(id="taccess-blocked")
         yield Static(id="taccess-footer")
@@ -2061,15 +2044,23 @@ class TokenAccessScreen(Screen):
         self._load()
 
     def _load(self):
-        from token_watch_data import _get_paperclip_heartbeats, _get_blocked_attempts
-
-        agents = _get_paperclip_heartbeats()
-        blocked = _get_blocked_attempts(minutes=60)
-
-        self.query_one("#taccess-header", Static).update(
-            "[bold]Token Access Control[/bold]  [dim]Enter to toggle selected agent · Esc to go back[/dim]"
+        from token_watch_data import (
+            _get_paperclip_heartbeats, _get_blocked_attempts,
+            _get_paperclip_routines, _get_gate_state,
         )
 
+        agents = _get_paperclip_heartbeats()
+        routines = _get_paperclip_routines()
+        blocked = _get_blocked_attempts(minutes=60)
+        gate = _get_gate_state()
+
+        gate_label = "[green]GATE: ON[/green]" if gate == "on" else "[red]GATE: OFF[/red]"
+        self.query_one("#taccess-header", Static).update(
+            f"[bold]Token Access Control[/bold]    {gate_label}    "
+            "[dim]Enter to toggle · g = gate all · Esc to go back[/dim]"
+        )
+
+        # ── Heartbeats table ──
         table = self.query_one("#taccess-table", DataTable)
         table.clear(columns=True)
         table.cursor_type = "row"
@@ -2132,7 +2123,75 @@ class TokenAccessScreen(Screen):
                 Text(a.get("id", "?"), style="dim"),
             )
 
-        # Blocked attempts
+        # ── Routines table ──
+        active_routines = sum(1 for r in routines if r.get("status") == "active")
+        paused_routines = sum(1 for r in routines if r.get("status") == "paused")
+        self.query_one("#taccess-routines-header", Static).update(
+            f"[bold]── Routines ──[/bold]  [dim]{active_routines} active · {paused_routines} paused[/dim]"
+        )
+
+        rt = self.query_one("#taccess-routines", DataTable)
+        rt.clear(columns=True)
+        rt.cursor_type = "row"
+        rt.zebra_stripes = True
+        rt.add_column("Status", width=10)
+        rt.add_column("Company", width=14)
+        rt.add_column("Description", width=30)
+        rt.add_column("Schedule", width=16)
+        rt.add_column("Last Run", width=14)
+        rt.add_column("ID", width=38)
+
+        for r in routines:
+            r_status = r.get("status", "unknown")
+            if r_status == "active":
+                status_text = "● active"
+                status_style = "green"
+            else:
+                status_text = "○ paused"
+                status_style = "red"
+
+            # Parse triggers for schedule info
+            triggers = r.get("triggers", [])
+            schedule = "—"
+            if triggers:
+                t = triggers[0]
+                if isinstance(t, dict):
+                    cron = t.get("cron", "")
+                    interval_val = t.get("interval", "")
+                    if cron:
+                        schedule = cron
+                    elif interval_val:
+                        schedule = str(interval_val)
+                    else:
+                        schedule = t.get("type", "trigger")
+                elif isinstance(t, str):
+                    schedule = t
+
+            last = r.get("lastTriggeredAt", "")
+            age_str = ""
+            if last:
+                try:
+                    last_dt = datetime.fromisoformat(last.replace("Z", "+00:00"))
+                    age_min = (datetime.now(timezone.utc) - last_dt).total_seconds() / 60
+                    if age_min < 60:
+                        age_str = f"{age_min:.0f}m ago"
+                    elif age_min < 1440:
+                        age_str = f"{age_min / 60:.0f}h ago"
+                    else:
+                        age_str = f"{age_min / 1440:.0f}d ago"
+                except Exception:
+                    pass
+
+            rt.add_row(
+                Text(status_text, style=status_style),
+                Text(r.get("companyName", "?"), style="cyan"),
+                Text(r.get("description", "—"), style="white" if r_status == "active" else "dim"),
+                Text(schedule, style="dim"),
+                Text(age_str if age_str else "—", style="dim"),
+                Text(r.get("id", "?"), style="dim"),
+            )
+
+        # ── Blocked attempts ──
         self.query_one("#taccess-blocked-header", Static).update(
             f"[bold]Blocked Attempts[/bold]  [dim]{len(blocked)} in last hour[/dim]"
             if blocked else "[bold]Blocked Attempts[/bold]  [dim]none in last hour[/dim]"
@@ -2156,32 +2215,56 @@ class TokenAccessScreen(Screen):
             )
 
         self.query_one("#taccess-footer", Static).update(
-            "[dim]Enter = toggle selected agent · r = refresh · Esc = back[/dim]"
+            "[dim]Enter = toggle · g = gate all · r = refresh · Esc = back[/dim]"
         )
 
     def on_data_table_row_selected(self, event):
-        from token_watch_data import _get_paperclip_heartbeats, _toggle_heartbeat
+        table_id = event.data_table.id
 
-        table = self.query_one("#taccess-table", DataTable)
-        row_idx = event.cursor_row
+        if table_id == "taccess-table":
+            from token_watch_data import _get_paperclip_heartbeats, _toggle_heartbeat
 
-        # Row 0 is CLI (not toggleable)
-        if row_idx == 0:
-            return
+            row_idx = event.cursor_row
 
-        agents = _get_paperclip_heartbeats()
-        agent_idx = row_idx - 1
-        if agent_idx >= len(agents):
-            return
+            # Row 0 is CLI (not toggleable)
+            if row_idx == 0:
+                return
 
-        agent = agents[agent_idx]
-        new_state = not agent.get("heartbeatEnabled", False)
-        if _toggle_heartbeat(agent["id"], new_state):
-            self._load()
+            agents = _get_paperclip_heartbeats()
+            agent_idx = row_idx - 1
+            if agent_idx >= len(agents):
+                return
+
+            agent = agents[agent_idx]
+            new_state = not agent.get("heartbeatEnabled", False)
+            if _toggle_heartbeat(agent["id"], new_state):
+                self._load()
+
+        elif table_id == "taccess-routines":
+            from token_watch_data import _get_paperclip_routines, _toggle_routine
+
+            row_idx = event.cursor_row
+            routines = _get_paperclip_routines()
+            if row_idx >= len(routines):
+                return
+
+            routine = routines[row_idx]
+            new_active = routine.get("status") != "active"
+            if _toggle_routine(routine["id"], new_active):
+                self._load()
+
+    def action_gate(self):
+        from token_watch_data import _gate_all, _get_gate_state
+
+        current = _get_gate_state()
+        new_state = current != "on"  # toggle
+        _gate_all(new_state)
+        self._load()
 
     def action_refresh(self):
         import token_watch_data
         token_watch_data._heartbeat_cache = (0.0, [])
+        token_watch_data._routine_cache = (0.0, [])
         self._load()
 
     def action_pop_screen(self):

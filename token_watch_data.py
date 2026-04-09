@@ -6131,6 +6131,122 @@ _KNOWN_INTERVALS = {
 }
 
 
+# ── Paperclip routine management ──────────────────────────────────────────
+
+_routine_cache = (0.0, [])  # type: Tuple[float, list]
+_ROUTINE_CACHE_TTL = 10  # seconds
+
+
+def _get_paperclip_routines():
+    """Fetch all routines across all companies from Paperclip.
+    Returns list of dicts with id, companyName, description, status,
+    lastTriggeredAt, triggers.
+    """
+    global _routine_cache
+    now = time.time()
+    cached_at, cached_data = _routine_cache
+    if now - cached_at < _ROUTINE_CACHE_TTL:
+        return cached_data
+
+    import urllib.request
+    import json as _json
+
+    results = []
+    for cid, proj_info in _paperclip_map.items():
+        company_name = proj_info.get("company", "?")
+        url = f"{PAPERCLIP_BASE}/api/companies/{cid}/routines"
+        req = urllib.request.Request(url)
+        try:
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                routines = _json.loads(resp.read())
+            for r in routines:
+                results.append({
+                    "id": r.get("id", ""),
+                    "companyName": company_name,
+                    "description": r.get("description", ""),
+                    "status": r.get("status", "unknown"),
+                    "lastTriggeredAt": r.get("lastTriggeredAt", ""),
+                    "triggers": r.get("triggers", []),
+                })
+        except Exception as e:
+            _log.warning("Failed to fetch routines for %s: %s", company_name, e)
+
+    _routine_cache = (now, results)
+    return results
+
+
+def _toggle_routine(routine_id, active):
+    """Pause or resume a Paperclip routine.
+    Returns True on success, False on failure.
+    """
+    global _routine_cache
+    import urllib.request
+    import json as _json
+
+    url = f"{PAPERCLIP_BASE}/api/routines/{routine_id}"
+    payload = _json.dumps({"status": "active" if active else "paused"}).encode()
+    req = urllib.request.Request(url, data=payload, method="PATCH")
+    req.add_header("Content-Type", "application/json")
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            resp.read()
+        # Invalidate cache
+        _routine_cache = (0.0, [])
+        return True
+    except Exception as e:
+        _log.warning("Failed to toggle routine %s: %s", routine_id, e)
+        return False
+
+
+def _gate_all(enabled):
+    """Bulk pause/resume ALL heartbeats AND routines.
+    If enabled=True: enable all heartbeats + set all routines to 'active'.
+    If enabled=False: disable all heartbeats + set all routines to 'paused'.
+    Returns dict: {'heartbeats_changed': N, 'routines_changed': M}.
+    """
+    heartbeats_changed = 0
+    routines_changed = 0
+
+    # Toggle all heartbeats
+    try:
+        agents = _get_paperclip_heartbeats()
+        for a in agents:
+            current = a.get("heartbeatEnabled", False)
+            if current != enabled:
+                if _toggle_heartbeat(a["id"], enabled):
+                    heartbeats_changed += 1
+    except Exception as e:
+        _log.warning("_gate_all heartbeats error: %s", e)
+
+    # Toggle all routines
+    try:
+        routines = _get_paperclip_routines()
+        for r in routines:
+            is_active = r.get("status") == "active"
+            if is_active != enabled:
+                if _toggle_routine(r["id"], enabled):
+                    routines_changed += 1
+    except Exception as e:
+        _log.warning("_gate_all routines error: %s", e)
+
+    # Write gate state file
+    state = "on" if enabled else "off"
+    try:
+        Path("/tmp/paperclip-gate-state").write_text(state)
+    except Exception as e:
+        _log.warning("Failed to write gate state: %s", e)
+
+    return {"heartbeats_changed": heartbeats_changed, "routines_changed": routines_changed}
+
+
+def _get_gate_state():
+    """Read gate state from /tmp/paperclip-gate-state. Default 'on' if missing."""
+    try:
+        return Path("/tmp/paperclip-gate-state").read_text().strip()
+    except Exception:
+        return "on"
+
+
 def _get_blocked_attempts(minutes=60):
     """Infer suppressed heartbeat runs for disabled agents.
     Compares each disabled agent's known interval against lastHeartbeatAt
