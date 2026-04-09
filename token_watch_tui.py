@@ -5918,11 +5918,11 @@ class MissionControlView(LazyView):
         table.add_column("", width=2)       # status icon
         table.add_column("Time", width=6)
         table.add_column("SHA", width=8)
+        table.add_column("Session", width=7)
+        table.add_column("File", width=4)
+        table.add_column("Test", width=9)
         table.add_column("Title", width=33)
         table.add_column("How to Verify", width=38)
-        table.add_column("Session", width=7)
-        table.add_column("Files", width=4)
-        table.add_column("Test", width=8)
 
         status_icons = {
             "tested": ("\u2713", "green"),
@@ -5953,13 +5953,8 @@ class MissionControlView(LazyView):
                 # Separator row
                 label = f"{company_labels.get(co, co.upper())} / {proj}"
                 table.add_row(
-                    Text(""),
-                    Text(""),
-                    Text(""),
+                    Text(""), Text(""), Text(""), Text(""), Text(""), Text(""),
                     Text(f"\u2500\u2500 {label} \u2500\u2500", style="bold yellow"),
-                    Text(""),
-                    Text(""),
-                    Text(""),
                     Text(""),
                 )
 
@@ -5983,12 +5978,12 @@ class MissionControlView(LazyView):
                     table.add_row(
                         Text(icon, style=icon_style),
                         Text(ts, style="dim"),
-                        Text(sha, style="dim cyan"),
-                        Text(item.get("title", "")[:33]),
-                        Text(hint[:38], style="italic"),
+                        Text(sha, style="cyan"),
                         Text(item.get("session_id", "").replace("cc-", ""), style="dim"),
                         Text(file_count, style="dim"),
                         Text(test, style=icon_style),
+                        Text(item.get("title", "")[:33]),
+                        Text(hint[:38], style="italic dim"),
                     )
 
 
