@@ -1906,6 +1906,7 @@ class SessionDrillDown(Screen):
         Binding("escape", "pop_screen", "Back"),
         Binding("q", "pop_screen", "Back"),
         Binding("t", "toggle_view", "Toggle tokens/accomplishments"),
+        Binding("s", "toggle_sort", "Sort by cost/turn#"),
     ]
 
     def __init__(self, session_id, directive="", project="—"):
@@ -1914,6 +1915,7 @@ class SessionDrillDown(Screen):
         self.session_directive = directive
         self.session_project = project
         self.showing_tokens = True
+        self.sort_by_cost = True  # default: most expensive first
 
     def compose(self) -> ComposeResult:
         yield NavBar(active="nav-sessions")
@@ -1923,11 +1925,15 @@ class SessionDrillDown(Screen):
 
     def _update_header(self):
         hint = "[dim](t=accomplishments)[/dim]" if self.showing_tokens else "[dim](t=token usage)[/dim]"
+        sort_hint = ""
+        if self.showing_tokens:
+            sort_label = "cost↓" if self.sort_by_cost else "turn#"
+            sort_hint = f"  [dim](s=sort:{sort_label})[/dim]"
         self.query_one("#drilldown-header", Static).update(
             f"[bold]Session:[/bold] {self.session_id}  "
             f"[bold]Project:[/bold] {self.session_project}  "
             f"[bold]Directive:[/bold] {self.session_directive}  "
-            + hint
+            + hint + sort_hint
         )
 
     def on_mount(self):
@@ -2053,6 +2059,9 @@ class SessionDrillDown(Screen):
             table.add_row("—", "", "", "", "", "", "", Text("no turns found", style="dim"))
             return
 
+        if self.sort_by_cost:
+            turns = sorted(turns, key=lambda x: x["tokens_out"], reverse=True)
+
         total_in = total_out = total_pct = total_cost = 0
         for t in turns:
             tokens_in = t["tokens_in"]
@@ -2110,6 +2119,15 @@ class SessionDrillDown(Screen):
             table.display = False
             acc_view.display = True
             self._show_accomplishments()
+
+    def action_toggle_sort(self):
+        if not self.showing_tokens:
+            return
+        self.sort_by_cost = not self.sort_by_cost
+        self._update_header()
+        table = self.query_one("#drilldown-table", DataTable)
+        table.clear(columns=True)
+        self._show_tokens()
 
     def action_pop_screen(self):
         self.app.pop_screen()
