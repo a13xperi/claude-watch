@@ -5956,7 +5956,7 @@ class MissionControlView(LazyView):
                     Text(""),
                     Text(""),
                     Text(""),
-                    Text(f"\u2500\u2500 {label} \u2500\u2500", style="dim bold"),
+                    Text(f"\u2500\u2500 {label} \u2500\u2500", style="bold yellow"),
                     Text(""),
                     Text(""),
                     Text(""),
