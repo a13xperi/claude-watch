@@ -170,19 +170,21 @@ def _project_to_company(project: str, company: str = "") -> tuple[str, str]:
         if "frank" in c: return "Frank", "magenta"
         if "sage" in c: return "SAGE", "yellow"
         if "adinkra" in c: return "Adinkra", "purple"
-        if "personal" in c: return "Personal", "dim"
+        if "personal" in c: return "Personal", "bright_cyan"
         return company[:12], "dim"
     p = (project or "").lower().strip()
     if p in ("atlas", "atlas-be", "atlas-fe", "atlas-portal", "atlas-backend"):
         return "Delphi", "blue"
-    if p in ("kaa",):
+    if p == "kaa" or p.startswith("kaa-"):
         return "KAA", "green"
     if p in ("frank", "frank-pilot"):
         return "Frank", "magenta"
-    if p in ("sage",):
+    if p == "sage" or p.startswith("sage-"):
         return "SAGE", "yellow"
+    if p in ("life", "health", "finance", "home", "growth", "social", "travel"):
+        return "Personal", "bright_cyan"
     if p in ("openclaw", "paperclip", "token watch", "token-watch", "battlestation"):
-        return "Personal", "dim"
+        return "Personal", "bright_cyan"
     return "—", "dim"
 
 
@@ -3213,6 +3215,25 @@ class SessionTasksView(LazyView):
 class ProjectBoardView(LazyView):
     """Project Monitor — strategic task board."""
 
+    _company_filter = ""
+    _COMPANY_CYCLE = ["", "personal", "delphi", "kaa", "frank", "sage", "adinkra"]
+
+    BINDINGS = [
+        Binding("p", "cycle_company", "Company"),
+    ]
+
+    def action_cycle_company(self):
+        """Cycle company filter: all → personal → delphi → kaa → frank → sage → adinkra → all."""
+        try:
+            idx = self._COMPANY_CYCLE.index(self._company_filter)
+        except ValueError:
+            idx = -1
+        self._company_filter = self._COMPANY_CYCLE[(idx + 1) % len(self._COMPANY_CYCLE)]
+        label = self._company_filter or "all"
+        self.notify(f"Company filter: {label}")
+        self._last_refresh = 0
+        self.refresh_content()
+
     def refresh_content(self):
         now = time.time()
         if not hasattr(self, '_last_refresh') or (now - self._last_refresh) > 30:
@@ -3231,6 +3252,9 @@ class ProjectBoardView(LazyView):
     def load_content(self):
         from token_watch_data import _get_project_tasks
         tasks = _get_project_tasks()
+
+        if self._company_filter:
+            tasks = [t for t in tasks if (t.get("company") or "").lower() == self._company_filter]
 
         total = len(tasks)
         by_status = {}
@@ -3262,14 +3286,17 @@ class ProjectBoardView(LazyView):
         blocked = by_status.get("blocked", 0)
         remaining_points = total_points - done_points
 
+        company_label = f"  [bold green]co:{self._company_filter}[/bold green]" if self._company_filter else ""
+        board_title = "Personal To-Do" if self._company_filter == "personal" else "Project Board"
         self.query_one("#pboard-header", Static).update(
-            f"[bold]Project Board[/bold]  "
+            f"[bold]{board_title}[/bold]  "
             f"[yellow]{ready} ready[/yellow]  "
             f"[green]{in_prog} active[/green]  "
             f"[dim]{built} built  {blocked} blocked  {total} total[/dim]  "
             f"│  [bold magenta]{dispatch_ready} dispatchable[/bold magenta]  "
             f"[cyan]{remaining_points}pts left[/cyan]  "
-            f"[magenta]~{total_tokens_k}kT queued[/magenta]"
+            f"[magenta]~{total_tokens_k}kT queued[/magenta]{company_label}  "
+            f"[dim italic]p=company[/dim italic]"
         )
 
         # Top panel: project summary
@@ -6332,6 +6359,8 @@ class DispatchView(LazyView):
 
     _lane_filter = ""
     _LANE_CYCLE = ["", "ui-simplification", "voice-lab", "twitter-integration"]
+    _company_filter = ""
+    _COMPANY_CYCLE = ["", "personal", "delphi", "kaa", "frank", "sage", "adinkra"]
 
     BINDINGS = [
         Binding("r", "refresh_dispatch", "Refresh"),
@@ -6339,6 +6368,7 @@ class DispatchView(LazyView):
         Binding("x", "claim_selected", "Claim"),
         Binding("a", "archive_selected", "Archive"),
         Binding("l", "cycle_lane", "Lane"),
+        Binding("p", "cycle_company", "Company"),
     ]
 
     def refresh_content(self):
@@ -6367,13 +6397,16 @@ class DispatchView(LazyView):
         lane_info = ""
         if self._lane_filter:
             lane_info = f"  [bold magenta]lane:{self._lane_filter}[/bold magenta]"
+        company_info = ""
+        if self._company_filter:
+            company_info = f"  [bold green]co:{self._company_filter}[/bold green]"
 
         self.query_one("#dispatch-header", Static).update(
             f"[bold]Dispatch[/bold]  "
             f"[green]{stats['total_ready']} ready[/green]  ·  "
             f"[yellow]{stats['total_active']} active[/yellow]  ·  "
-            f"[dim]~{stats['total_tokens_k']}kT total[/dim]{lane_info}  "
-            f"[dim italic]enter=view  c=copy  x=claim  a=archive  l=lane  r=refresh[/dim italic]"
+            f"[dim]~{stats['total_tokens_k']}kT total[/dim]{lane_info}{company_info}  "
+            f"[dim italic]enter=view  c=copy  x=claim  a=archive  l=lane  p=company  r=refresh[/dim italic]"
         )
 
         # Lane progress bars for swarm monitoring
@@ -6446,6 +6479,8 @@ class DispatchView(LazyView):
         for item in data["active"]:
             if self._lane_filter and (item.get("lane") or "") != self._lane_filter:
                 continue
+            if self._company_filter and (item.get("company") or "").lower() != self._company_filter:
+                continue
             self._items.append(item)
             age = self._format_age(item.get("created_at", ""))
             table.add_row(
@@ -6462,6 +6497,8 @@ class DispatchView(LazyView):
         # Queue items (ready)
         for item in data["queue"]:
             if self._lane_filter and (item.get("lane") or "") != self._lane_filter:
+                continue
+            if self._company_filter and (item.get("company") or "").lower() != self._company_filter:
                 continue
             self._items.append(item)
             age = self._format_age(item.get("created_at", ""))
@@ -6550,6 +6587,17 @@ class DispatchView(LazyView):
         self._lane_filter = self._LANE_CYCLE[(idx + 1) % len(self._LANE_CYCLE)]
         label = self._lane_filter or "all"
         self.notify(f"Lane filter: {label}")
+        self.action_refresh_dispatch()
+
+    def action_cycle_company(self):
+        """Cycle company filter: all → personal → delphi → kaa → frank → sage → adinkra → all."""
+        try:
+            idx = self._COMPANY_CYCLE.index(self._company_filter)
+        except ValueError:
+            idx = -1
+        self._company_filter = self._COMPANY_CYCLE[(idx + 1) % len(self._COMPANY_CYCLE)]
+        label = self._company_filter or "all"
+        self.notify(f"Company filter: {label}")
         self.action_refresh_dispatch()
 
     def action_refresh_dispatch(self):
