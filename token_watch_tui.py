@@ -339,11 +339,11 @@ class EngineTable(DataTable):
     """Engine management — unified session health + system pressure."""
 
     BORDER_TITLE = "Engine Management (live)"
-    BORDER_SUBTITLE = "f=focus  k=kill  K=release files"
+    BORDER_SUBTITLE = "f=focus  k=force quit  K=release files"
 
     BINDINGS = [
         Binding("f", "focus_selected", "Focus terminal", show=True),
-        Binding("k", "kill_selected", "Kill session", show=True),
+        Binding("k", "kill_selected", "Force quit", show=True),
         Binding("K", "release_files", "Release files", show=True),
     ]
 
@@ -740,8 +740,7 @@ class EngineTable(DataTable):
                 self.app.notify(f"Opened Warp — find: {hint}", severity="warning", timeout=3)
 
     def action_kill_selected(self):
-        """Handle 'k' key — SIGTERM + clean up session_lock in Supabase."""
-        import signal
+        """Handle 'k' key — open Force Quit confirm modal for the selected session."""
         pid = self._get_pid_from_cursor()
         if not pid:
             self.app.notify("No session selected", severity="warning", timeout=2)
@@ -751,20 +750,125 @@ class EngineTable(DataTable):
         if pid in (my_pid, parent_pid):
             self.app.notify("Can't kill token-watch's own process", severity="warning", timeout=3)
             return
-        sid = f"cc-{pid}"
-        killed = False
+
+        # Look up the full session dict by PID for rich modal display
+        from token_watch_data import _get_engine_status
         try:
-            os.kill(int(pid), signal.SIGTERM)
-            killed = True
-        except ProcessLookupError:
-            killed = True  # already dead — still clean up lock
-        except PermissionError:
-            self.app.notify(f"No permission to kill {sid}", severity="error", timeout=3)
+            engine = _get_engine_status()
+        except Exception:
+            engine = {"sessions": [], "peers": []}
+        session = next(
+            (s for s in engine.get("sessions", []) if str(s.get("pid")) == str(pid)),
+            None,
+        )
+        if not session:
+            # Could be a peer-only session — build a minimal dict so the modal still renders
+            session = {
+                "pid": pid,
+                "sid": f"cc-{pid}",
+                "directive": "(unknown — peer session)",
+                "age": "?",
+                "delta": "?",
+                "mem_mb": 0,
+                "cpu": 0,
+                "health": "yellow",
+                "health_reason": "no local data",
+                "source": "?",
+                "repo": "—",
+            }
+
+        self.app.push_screen(ForceQuitScreen(session, self._do_force_quit))
+
+    def _do_force_quit(self, session):
+        """Callback after Force Quit confirm — runs SIGTERM/grace/SIGKILL + cleanup + log.
+
+        Runs in a background thread so the TUI stays responsive during the 3s grace.
+        """
+        import signal
+        import time
+        import threading
+
+        pid_str = str(session.get("pid"))
+        sid = session.get("sid", f"cc-{pid_str}")
+        directive = session.get("directive") or "no directive"
+        repo = session.get("repo") or ""
+
+        try:
+            pid_int = int(pid_str)
+        except (TypeError, ValueError):
+            self.app.notify(f"Invalid PID for {sid}", severity="error", timeout=3)
             return
-        if killed:
-            from token_watch_data import _expire_session_lock
-            _expire_session_lock(sid)
-            self.app.notify(f"Killed {sid} + released lock", severity="information", timeout=3)
+
+        def _notify(msg, severity="information", timeout=3):
+            self.app.call_from_thread(
+                self.app.notify, msg, severity=severity, timeout=timeout
+            )
+
+        def _worker():
+            # 1. SIGTERM
+            term_ok = False
+            try:
+                os.kill(pid_int, signal.SIGTERM)
+                term_ok = True
+            except ProcessLookupError:
+                _notify(f"{sid} already gone — cleaning up locks", "information", 2)
+            except PermissionError:
+                _notify(f"No permission to kill {sid}", "error", 4)
+                return
+            except Exception as e:
+                _notify(f"SIGTERM failed: {e}", "error", 4)
+                return
+
+            # 2. 3s grace, then SIGKILL if still alive
+            if term_ok:
+                alive = True
+                for _ in range(6):
+                    time.sleep(0.5)
+                    try:
+                        os.kill(pid_int, 0)  # signal 0 = liveness check
+                    except ProcessLookupError:
+                        alive = False
+                        break
+                    except Exception:
+                        alive = False
+                        break
+                if alive:
+                    try:
+                        os.kill(pid_int, signal.SIGKILL)
+                        _notify(f"{sid} unresponsive — SIGKILL sent", "warning", 3)
+                    except Exception as e:
+                        _notify(f"SIGKILL failed: {e}", "error", 4)
+
+            # 3. Cleanup Supabase locks
+            from token_watch_data import (
+                _expire_session_lock,
+                _release_session_files,
+                _post_build_ledger_event,
+            )
+            try:
+                _expire_session_lock(sid)
+            except Exception as e:
+                _notify(f"session_lock cleanup warning: {e}", "warning", 3)
+            try:
+                _release_session_files(sid)
+            except Exception:
+                pass
+
+            # 4. Log to build_ledger
+            try:
+                _post_build_ledger_event(
+                    session_id=sid,
+                    item_type="force_quit",
+                    title=f"Force-quit {sid} — {directive}",
+                    project=repo,
+                    source="token-watch",
+                )
+            except Exception:
+                pass
+
+            _notify(f"✓ Killed {sid} + released locks", "information", 3)
+
+        threading.Thread(target=_worker, daemon=True).start()
 
     def action_release_files(self):
         """Handle 'K' key — clear files_touched for the selected session in Supabase."""
@@ -2537,6 +2641,110 @@ class MCPStatsView(LazyView):
             )
         if not stats["top_actions"]:
             at.add_row(Text("no data", style="dim"), "")
+
+
+class ForceQuitScreen(Screen):
+    """Modal force-quit dialog mirroring macOS Force Quit Applications.
+
+    Shows full session context (sid, account, project, directive, runtime, mem,
+    used%, last activity) and warns about what cleanup will run. Requires extra
+    typed confirmation for HIGH BURN sessions to prevent panic-misclicks.
+    """
+
+    BINDINGS = [
+        Binding("escape", "cancel", "Cancel"),
+        Binding("enter", "confirm", "Force Quit"),
+    ]
+
+    def __init__(self, session, callback):
+        # type: (dict, Any) -> None
+        super().__init__()
+        self._session = session
+        self._callback = callback
+        self._high_burn = session.get("health") == "red"
+
+    def compose(self) -> ComposeResult:
+        from textual.widgets import Input
+        s = self._session
+        sid = s.get("sid", "?")
+        directive = (s.get("directive") or "—")
+        if len(directive) > 60:
+            directive = directive[:57] + "..."
+        runtime = s.get("age", "?")
+        mem = s.get("mem_mb", 0)
+        delta = s.get("delta", "?")
+        cpu = s.get("cpu", 0) or 0
+        source = s.get("source", "?")
+        repo = s.get("repo") or "—"
+        health = s.get("health", "green")
+        reason = s.get("health_reason", "") or ""
+        dot = {
+            "green": "[bold green]●[/bold green]",
+            "yellow": "[bold yellow]●[/bold yellow]",
+            "red": "[bold red]●[/bold red]",
+        }.get(health, "[dim]●[/dim]")
+
+        warn_color = "red" if self._high_burn else "yellow"
+        body = (
+            "[bold]Force Quit Session[/bold]\n\n"
+            f"{dot} [cyan]{sid}[/cyan]    [dim]({reason})[/dim]\n"
+            f"[dim]source:[/dim] {source}    [dim]repo:[/dim] {repo}\n\n"
+            f"[dim]directive:[/dim] {directive}\n"
+            f"[dim]runtime:  [/dim]{runtime}    [dim]mem:[/dim] {mem} MB    [dim]cpu:[/dim] {cpu:.0f}%\n"
+            f"[dim]used:     [/dim]{delta}\n\n"
+            f"[{warn_color}]⚠ This will:[/{warn_color}]\n"
+            "  • SIGTERM (3s grace) → SIGKILL\n"
+            "  • Release session_lock + file locks in Supabase\n"
+            "  • Log force_quit event to build_ledger\n"
+        )
+        yield Static(body, id="fq-body")
+        if self._high_burn:
+            yield Static(
+                "[bold red]HIGH BURN — type 'kill' and press Enter to confirm:[/bold red]",
+                id="fq-warn",
+            )
+            yield Input(id="fq-confirm-input", placeholder="kill")
+        yield Static(
+            "[dim]Enter[/dim] = Force Quit    [dim]Esc[/dim] = Cancel",
+            id="fq-footer",
+        )
+
+    def on_mount(self):
+        if self._high_burn:
+            from textual.widgets import Input
+            try:
+                self.query_one("#fq-confirm-input", Input).focus()
+            except Exception:
+                pass
+
+    def on_input_submitted(self, event):
+        if event.value.strip().lower() == "kill":
+            self._fire()
+        else:
+            try:
+                self.query_one("#fq-warn", Static).update(
+                    "[bold red]Type exactly 'kill' to confirm[/bold red]"
+                )
+            except Exception:
+                pass
+
+    def action_confirm(self):
+        # In HIGH BURN mode, Enter is consumed by the Input widget and routed
+        # through on_input_submitted. This screen-level binding only fires for
+        # normal sessions (no Input present).
+        if self._high_burn:
+            return
+        self._fire()
+
+    def action_cancel(self):
+        self.app.pop_screen()
+
+    def _fire(self):
+        self.app.pop_screen()
+        try:
+            self._callback(self._session)
+        except Exception as e:
+            self.app.notify(f"Force quit failed: {e}", severity="error", timeout=4)
 
 
 class BlockAssignScreen(Screen):
