@@ -339,11 +339,12 @@ class EngineTable(DataTable):
     """Engine management — unified session health + system pressure."""
 
     BORDER_TITLE = "Engine Management (live)"
-    BORDER_SUBTITLE = "Enter/f to focus · k to kill"
+    BORDER_SUBTITLE = "f=focus  k=kill  K=release files"
 
     BINDINGS = [
         Binding("f", "focus_selected", "Focus terminal", show=True),
         Binding("k", "kill_selected", "Kill session", show=True),
+        Binding("K", "release_files", "Release files", show=True),
     ]
 
     def on_mount(self):
@@ -739,25 +740,45 @@ class EngineTable(DataTable):
                 self.app.notify(f"Opened Warp — find: {hint}", severity="warning", timeout=3)
 
     def action_kill_selected(self):
-        """Handle 'k' key — send SIGTERM to the selected session."""
+        """Handle 'k' key — SIGTERM + clean up session_lock in Supabase."""
         import signal
         pid = self._get_pid_from_cursor()
         if not pid:
             self.app.notify("No session selected", severity="warning", timeout=2)
             return
-        # Don't kill yourself
         my_pid = str(os.getpid())
         parent_pid = str(os.getppid())
         if pid in (my_pid, parent_pid):
             self.app.notify("Can't kill token-watch's own process", severity="warning", timeout=3)
             return
+        sid = f"cc-{pid}"
+        killed = False
         try:
             os.kill(int(pid), signal.SIGTERM)
-            self.app.notify(f"Killed cc-{pid}", severity="information", timeout=3)
+            killed = True
         except ProcessLookupError:
-            self.app.notify(f"cc-{pid} already dead", severity="warning", timeout=2)
+            killed = True  # already dead — still clean up lock
         except PermissionError:
-            self.app.notify(f"No permission to kill cc-{pid}", severity="error", timeout=3)
+            self.app.notify(f"No permission to kill {sid}", severity="error", timeout=3)
+            return
+        if killed:
+            from token_watch_data import _expire_session_lock
+            _expire_session_lock(sid)
+            self.app.notify(f"Killed {sid} + released lock", severity="information", timeout=3)
+
+    def action_release_files(self):
+        """Handle 'K' key — clear files_touched for the selected session in Supabase."""
+        pid = self._get_pid_from_cursor()
+        if not pid:
+            self.app.notify("No session selected", severity="warning", timeout=2)
+            return
+        sid = f"cc-{pid}"
+        from token_watch_data import _release_session_files
+        ok = _release_session_files(sid)
+        if ok:
+            self.app.notify(f"Released file locks for {sid}", severity="information", timeout=3)
+        else:
+            self.app.notify(f"Failed to release files for {sid}", severity="error", timeout=3)
 
     def _focus_terminal_for_row(self, row_key):
         """Extract PID from row key and focus the corresponding terminal."""

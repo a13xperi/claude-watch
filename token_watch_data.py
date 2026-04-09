@@ -243,8 +243,8 @@ def _get_peer_sessions():
     ).format(base=_SUPABASE_URL)
 
     req = urllib.request.Request(url, headers={
-        "apikey": _SUPABASE_KEY,
-        "Authorization": "Bearer " + _SUPABASE_KEY,
+        "apikey": __SUPABASE_KEY,
+        "Authorization": "Bearer " + __SUPABASE_KEY,
     })
     try:
         with urllib.request.urlopen(req, timeout=5) as resp:
@@ -3893,22 +3893,27 @@ def _get_current_cycle_id():
         _log.debug("__get_current_cycle_id: %s", e)
         return None
 
-def _get_build_ledger(days=1, limit=100, cycle_id=None):
+def _get_build_ledger(days=1, limit=100, cycle_id=None, source=None):
     """Fetch build ledger items grouped by company/project."""
     import urllib.request
     from datetime import datetime, timedelta, timezone
     try:
         cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        # Recovery source spans all time with higher limit
+        if source == "recovery":
+            limit = 500
         url = f"{_SUPABASE_URL}/build_ledger?"
+        if source:
+            url += f"source=eq.{source}&"
         if cycle_id:
             from urllib.parse import quote
             url += f"cycle_id=eq.{quote(str(cycle_id))}&"
-        else:
+        elif source != "recovery":
             url += f"created_at=gte.{cutoff}&"
         url += f"order=created_at.desc&limit={limit}"
         req = urllib.request.Request(url, headers={
-            "apikey": _SUPABASE_KEY,
-            "Authorization": f"Bearer {_SUPABASE_KEY}",
+            "apikey": __SUPABASE_KEY,
+            "Authorization": f"Bearer {__SUPABASE_KEY}",
         })
         with urllib.request.urlopen(req, timeout=3) as resp:
             items = json.loads(resp.read())
@@ -3946,6 +3951,30 @@ def _get_build_ledger(days=1, limit=100, cycle_id=None):
         _log.warning("__get_build_ledger: %s", e)
         return {"items": [], "by_company": {}, "stats": {"total": 0, "untested": 0, "decisions": 0, "sessions": 0, "projects": 0}}
 
+def _get_recovery_stats():
+    """Return recovery item counts grouped by project and item_type."""
+    import urllib.request
+    try:
+        url = f"{_SUPABASE_URL}/build_ledger?source=eq.recovery&select=item_type,project"
+        req = urllib.request.Request(url, headers={
+            "apikey": __SUPABASE_KEY,
+            "Authorization": f"Bearer {__SUPABASE_KEY}",
+        })
+        with urllib.request.urlopen(req, timeout=3) as resp:
+            items = json.loads(resp.read())
+        by_project = {}
+        by_type = {}
+        for item in items:
+            proj = item.get("project", "general")
+            itype = item.get("item_type", "unknown")
+            by_project[proj] = by_project.get(proj, 0) + 1
+            by_type[itype] = by_type.get(itype, 0) + 1
+        return {"total": len(items), "by_project": by_project, "by_type": by_type}
+    except Exception as e:
+        _log.warning("_get_recovery_stats: %s", e)
+        return {"total": 0, "by_project": {}, "by_type": {}}
+
+
 _dispatch_queue_cache = (0, None)
 
 def _get_dispatch_queue():
@@ -3967,8 +3996,8 @@ def _get_dispatch_queue():
             f"&limit=100"
         )
         req = urllib.request.Request(url, headers={
-            "apikey": _SUPABASE_KEY,
-            "Authorization": f"Bearer {_SUPABASE_KEY}",
+            "apikey": __SUPABASE_KEY,
+            "Authorization": f"Bearer {__SUPABASE_KEY}",
         })
         with urllib.request.urlopen(req, timeout=5) as resp:
             items = json.loads(resp.read())
@@ -4025,8 +4054,8 @@ def _get_lane_progress():
             f"&limit=200"
         )
         req = urllib.request.Request(url, headers={
-            "apikey": _SUPABASE_KEY,
-            "Authorization": f"Bearer {_SUPABASE_KEY}",
+            "apikey": __SUPABASE_KEY,
+            "Authorization": f"Bearer {__SUPABASE_KEY}",
         })
         with urllib.request.urlopen(req, timeout=5) as resp:
             items = json.loads(resp.read())
@@ -4068,8 +4097,8 @@ def _dispatch_claim_task(task_id):
         }).encode()
         url = _SUPABASE_URL + "/project_tasks?id=eq." + str(task_id) + "&status=eq.ready"
         req = urllib.request.Request(url, data=data, headers={
-            "apikey": _SUPABASE_KEY,
-            "Authorization": "Bearer " + _SUPABASE_KEY,
+            "apikey": __SUPABASE_KEY,
+            "Authorization": "Bearer " + __SUPABASE_KEY,
             "Content-Type": "application/json",
             "Prefer": "return=representation",
         }, method="PATCH")
@@ -4093,8 +4122,8 @@ def _dispatch_archive_task(task_id):
         }).encode()
         url = _SUPABASE_URL + "/project_tasks?id=eq." + str(task_id)
         req = urllib.request.Request(url, data=data, headers={
-            "apikey": _SUPABASE_KEY,
-            "Authorization": "Bearer " + _SUPABASE_KEY,
+            "apikey": __SUPABASE_KEY,
+            "Authorization": "Bearer " + __SUPABASE_KEY,
             "Content-Type": "application/json",
             "Prefer": "return=representation",
         }, method="PATCH")
@@ -4129,8 +4158,8 @@ def _get_bugs(force=False):
             f"order=bug_number.desc&limit=50"
         )
         req = urllib.request.Request(url, headers={
-            "apikey": _SUPABASE_KEY,
-            "Authorization": f"Bearer {_SUPABASE_KEY}",
+            "apikey": __SUPABASE_KEY,
+            "Authorization": f"Bearer {__SUPABASE_KEY}",
         })
         with urllib.request.urlopen(req, timeout=5) as resp:
             bugs = json.loads(resp.read())
@@ -4161,8 +4190,8 @@ def _update_bug_status(bug_id, new_status):
         url = f"{_SUPABASE_URL}/bugs?id=eq.{bug_id}"
         payload = json.dumps({"status": new_status, "updated_at": "now()"}).encode()
         req = urllib.request.Request(url, data=payload, method="PATCH", headers={
-            "apikey": _SUPABASE_KEY,
-            "Authorization": "Bearer " + _SUPABASE_KEY,
+            "apikey": __SUPABASE_KEY,
+            "Authorization": "Bearer " + __SUPABASE_KEY,
             "Content-Type": "application/json",
             "Prefer": "return=minimal",
         })
@@ -4173,6 +4202,64 @@ def _update_bug_status(bug_id, new_status):
         return True
     except Exception as e:
         _log.debug("_update_bug_status: %s", e)
+        return False
+
+
+def _fix_bug(bug_id, fixed_by):
+    """Mark a bug as fixed and record who fixed it."""
+    import urllib.request
+    try:
+        url = f"{_SUPABASE_URL}/bugs?id=eq.{bug_id}"
+        payload = json.dumps({
+            "status": "fixed",
+            "fixed_by": fixed_by,
+            "fixed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "updated_at": "now()",
+        }).encode()
+        req = urllib.request.Request(url, data=payload, method="PATCH", headers={
+            "apikey": __SUPABASE_KEY,
+            "Authorization": "Bearer " + __SUPABASE_KEY,
+            "Content-Type": "application/json",
+            "Prefer": "return=minimal",
+        })
+        with urllib.request.urlopen(req, timeout=5):
+            pass
+        global _bugs_cache
+        _bugs_cache = None
+        return True
+    except Exception as e:
+        _log.debug("_fix_bug: %s", e)
+        return False
+
+
+def _release_session_files(session_id):
+    """Clear files_touched for a session in Supabase session_locks."""
+    import urllib.request
+    try:
+        url = f"{_SUPABASE_URL}/session_locks?session_id=eq.{session_id}&status=eq.active"
+        payload = json.dumps({"files_touched": []}).encode()
+        req = urllib.request.Request(url, data=payload, method="PATCH", headers={
+            "apikey": __SUPABASE_KEY,
+            "Authorization": "Bearer " + __SUPABASE_KEY,
+            "Content-Type": "application/json",
+            "Prefer": "return=minimal",
+        })
+        with urllib.request.urlopen(req, timeout=5):
+            pass
+        # Also update local peers cache immediately
+        try:
+            peers_file = "/tmp/claude-peers.json"
+            peers = json.loads(open(peers_file).read())
+            for p in peers:
+                if p.get("session_id") == session_id:
+                    p["files_touched"] = []
+            with open(peers_file, "w") as f:
+                json.dump(peers, f)
+        except Exception:
+            pass
+        return True
+    except Exception as e:
+        _log.debug("_release_session_files: %s", e)
         return False
 
 
@@ -4187,8 +4274,8 @@ def _get_wire_messages(limit=50, cycle_id=None):
             url += f"&cycle_id=eq.{quote(str(cycle_id))}"
         url += f"&order=created_at.desc&limit={limit}"
         req = urllib.request.Request(url, headers={
-            "apikey": _SUPABASE_KEY,
-            "Authorization": f"Bearer {_SUPABASE_KEY}",
+            "apikey": __SUPABASE_KEY,
+            "Authorization": f"Bearer {__SUPABASE_KEY}",
         })
         with urllib.request.urlopen(req, timeout=3) as resp:
             messages = json.loads(resp.read())
@@ -4241,7 +4328,7 @@ def _get_wire_messages(limit=50, cycle_id=None):
 
 BATTLESTATION_FILE = Path.home() / ".claude/battlestation.json"
 _SUPABASE_URL = "https://zoirudjyqfqvpxsrxepr.supabase.co/rest/v1"
-_SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InpvaXJ1ZGp5cWZxdnB4c3J4ZXByIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjgwMzE4MjgsImV4cCI6MjA4MzYwNzgyOH0.6W6OzRfJ-nmKN_23z1OBCS4Cr-ODRq9DJmF_yMwOCfo"
+__SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InpvaXJ1ZGp5cWZxdnB4c3J4ZXByIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjgwMzE4MjgsImV4cCI6MjA4MzYwNzgyOH0.6W6OzRfJ-nmKN_23z1OBCS4Cr-ODRq9DJmF_yMwOCfo"
 
 
 def _get_battlestation_config():
@@ -4284,8 +4371,8 @@ def _post_score_to_supabase(score):
             f"{_SUPABASE_URL}/window_scores",
             data=data,
             headers={
-                "apikey": _SUPABASE_KEY,
-                "Authorization": f"Bearer {_SUPABASE_KEY}",
+                "apikey": __SUPABASE_KEY,
+                "Authorization": f"Bearer {__SUPABASE_KEY}",
                 "Content-Type": "application/json",
                 "Prefer": "resolution=merge-duplicates",
             },
@@ -4407,8 +4494,8 @@ def _get_leaderboard(days=7):
     )
     try:
         req = urllib.request.Request(url, headers={
-            "apikey": _SUPABASE_KEY,
-            "Authorization": f"Bearer {_SUPABASE_KEY}",
+            "apikey": __SUPABASE_KEY,
+            "Authorization": f"Bearer {__SUPABASE_KEY}",
         })
         with urllib.request.urlopen(req, timeout=5) as resp:
             rows = _json.loads(resp.read())
@@ -5024,8 +5111,8 @@ def _get_cycle_items(window_start, all_windows=False):
         )
     try:
         req = urllib.request.Request(url, headers={
-            "apikey": _SUPABASE_KEY,
-            "Authorization": f"Bearer {_SUPABASE_KEY}",
+            "apikey": __SUPABASE_KEY,
+            "Authorization": f"Bearer {__SUPABASE_KEY}",
         })
         with urllib.request.urlopen(req, timeout=5) as resp:
             return json.loads(resp.read())
@@ -5055,8 +5142,8 @@ def _post_cycle_item(window_start, category, title, project="", source_ref="", s
             f"{_SUPABASE_URL}/cycle_items",
             data=data,
             headers={
-                "apikey": _SUPABASE_KEY,
-                "Authorization": f"Bearer {_SUPABASE_KEY}",
+                "apikey": __SUPABASE_KEY,
+                "Authorization": f"Bearer {__SUPABASE_KEY}",
                 "Content-Type": "application/json",
                 "Prefer": "return=representation",
             },
@@ -5080,8 +5167,8 @@ def _update_cycle_item(item_id, updates):
             f"{_SUPABASE_URL}/cycle_items?id=eq.{item_id}",
             data=data,
             headers={
-                "apikey": _SUPABASE_KEY,
-                "Authorization": f"Bearer {_SUPABASE_KEY}",
+                "apikey": __SUPABASE_KEY,
+                "Authorization": f"Bearer {__SUPABASE_KEY}",
                 "Content-Type": "application/json",
             },
             method="PATCH",
@@ -5101,8 +5188,8 @@ def _delete_cycle_item(item_id):
         req = urllib.request.Request(
             f"{_SUPABASE_URL}/cycle_items?id=eq.{item_id}",
             headers={
-                "apikey": _SUPABASE_KEY,
-                "Authorization": f"Bearer {_SUPABASE_KEY}",
+                "apikey": __SUPABASE_KEY,
+                "Authorization": f"Bearer {__SUPABASE_KEY}",
             },
             method="DELETE",
         )
@@ -5583,8 +5670,8 @@ def _assign_item_to_pomodoro(item_id, block_num):
         req = urllib.request.Request(
             f"{_SUPABASE_URL}/cycle_items?id=eq.{item_id}&select=title",
             headers={
-                "apikey": _SUPABASE_KEY,
-                "Authorization": f"Bearer {_SUPABASE_KEY}",
+                "apikey": __SUPABASE_KEY,
+                "Authorization": f"Bearer {__SUPABASE_KEY}",
             },
         )
         with urllib.request.urlopen(req, timeout=5) as resp:
@@ -5643,8 +5730,8 @@ def _roll_cycle_items(old_window_start, new_window_start):
     )
     try:
         req = urllib.request.Request(url, headers={
-            "apikey": _SUPABASE_KEY,
-            "Authorization": f"Bearer {_SUPABASE_KEY}",
+            "apikey": __SUPABASE_KEY,
+            "Authorization": f"Bearer {__SUPABASE_KEY}",
         })
         with urllib.request.urlopen(req, timeout=5) as resp:
             open_items = json.loads(resp.read())
@@ -5665,8 +5752,8 @@ def _roll_cycle_items(old_window_start, new_window_start):
     existing_keys = set()  # type: set
     try:
         req = urllib.request.Request(target_url, headers={
-            "apikey": _SUPABASE_KEY,
-            "Authorization": f"Bearer {_SUPABASE_KEY}",
+            "apikey": __SUPABASE_KEY,
+            "Authorization": f"Bearer {__SUPABASE_KEY}",
         })
         with urllib.request.urlopen(req, timeout=5) as resp:
             target_items = json.loads(resp.read())
@@ -5703,8 +5790,8 @@ def _roll_cycle_items(old_window_start, new_window_start):
                     f"{_SUPABASE_URL}/cycle_items?id=eq.{item['id']}",
                     data=patch_data,
                     headers={
-                        "apikey": _SUPABASE_KEY,
-                        "Authorization": f"Bearer {_SUPABASE_KEY}",
+                        "apikey": __SUPABASE_KEY,
+                        "Authorization": f"Bearer {__SUPABASE_KEY}",
                         "Content-Type": "application/json",
                     },
                     method="PATCH",
@@ -5734,8 +5821,8 @@ def _roll_cycle_items(old_window_start, new_window_start):
                 f"{_SUPABASE_URL}/cycle_items",
                 data=data,
                 headers={
-                    "apikey": _SUPABASE_KEY,
-                    "Authorization": f"Bearer {_SUPABASE_KEY}",
+                    "apikey": __SUPABASE_KEY,
+                    "Authorization": f"Bearer {__SUPABASE_KEY}",
                     "Content-Type": "application/json",
                 },
                 method="POST",
@@ -5752,8 +5839,8 @@ def _roll_cycle_items(old_window_start, new_window_start):
                 f"{_SUPABASE_URL}/cycle_items?id=eq.{item['id']}",
                 data=patch_data,
                 headers={
-                    "apikey": _SUPABASE_KEY,
-                    "Authorization": f"Bearer {_SUPABASE_KEY}",
+                    "apikey": __SUPABASE_KEY,
+                    "Authorization": f"Bearer {__SUPABASE_KEY}",
                     "Content-Type": "application/json",
                 },
                 method="PATCH",
@@ -5797,8 +5884,8 @@ def _auto_roll_stale_items(current_window_start=None):
     )
     try:
         req = urllib.request.Request(url, headers={
-            "apikey": _SUPABASE_KEY,
-            "Authorization": f"Bearer {_SUPABASE_KEY}",
+            "apikey": __SUPABASE_KEY,
+            "Authorization": f"Bearer {__SUPABASE_KEY}",
         })
         with urllib.request.urlopen(req, timeout=8) as resp:
             all_open = json.loads(resp.read())
@@ -5864,8 +5951,8 @@ def _get_test_queue(project=None, status="pending", cycle_id=None):
     url += "order=created_at.desc&limit=200"
     try:
         req = urllib.request.Request(url, headers={
-            "apikey": _SUPABASE_KEY,
-            "Authorization": f"Bearer {_SUPABASE_KEY}",
+            "apikey": __SUPABASE_KEY,
+            "Authorization": f"Bearer {__SUPABASE_KEY}",
         })
         with urllib.request.urlopen(req, timeout=5) as resp:
             items = json.loads(resp.read())
@@ -5907,8 +5994,8 @@ def _add_test_item(title, project="", source="manual", source_ref="", route="", 
             f"{_SUPABASE_URL}/test_queue",
             data=data,
             headers={
-                "apikey": _SUPABASE_KEY,
-                "Authorization": f"Bearer {_SUPABASE_KEY}",
+                "apikey": __SUPABASE_KEY,
+                "Authorization": f"Bearer {__SUPABASE_KEY}",
                 "Content-Type": "application/json",
                 "Prefer": "return=representation",
             },
@@ -5937,8 +6024,8 @@ def _update_test_item(item_id, status, notes=""):
             f"{_SUPABASE_URL}/build_ledger?id=eq.{item_id}",
             data=data,
             headers={
-                "apikey": _SUPABASE_KEY,
-                "Authorization": f"Bearer {_SUPABASE_KEY}",
+                "apikey": __SUPABASE_KEY,
+                "Authorization": f"Bearer {__SUPABASE_KEY}",
                 "Content-Type": "application/json",
             },
             method="PATCH",
@@ -5958,8 +6045,8 @@ def _delete_test_item(item_id):
         req = urllib.request.Request(
             f"{_SUPABASE_URL}/build_ledger?id=eq.{item_id}",
             headers={
-                "apikey": _SUPABASE_KEY,
-                "Authorization": f"Bearer {_SUPABASE_KEY}",
+                "apikey": __SUPABASE_KEY,
+                "Authorization": f"Bearer {__SUPABASE_KEY}",
             },
             method="DELETE",
         )
@@ -6462,6 +6549,31 @@ def _set_auto_gated(val):
         Path("/tmp/paperclip-gate-auto").write_text("true" if val else "false")
     except Exception:
         pass
+
+
+def _expire_session_lock(session_id):
+    """Mark a session_lock as done and clear its files. Called on kill."""
+    import urllib.request
+    import json as _json
+
+    url = "{}/session_locks?session_id=eq.{}".format(_SUPABASE_URL, session_id)
+    body = _json.dumps({
+        "status": "done",
+        "files_touched": [],
+        "released_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "notes": "killed from token-watch"
+    }).encode()
+    req = urllib.request.Request(url, data=body, method="PATCH")
+    req.add_header("apikey", _SUPABASE_KEY)
+    req.add_header("Authorization", "Bearer " + _SUPABASE_KEY)
+    req.add_header("Content-Type", "application/json")
+    req.add_header("Prefer", "return=minimal")
+    try:
+        urllib.request.urlopen(req, timeout=3)
+        # Also refresh local peers cache
+        _get_peer_sessions.__wrapped__ = None  # invalidate if cached
+    except Exception as e:
+        _log.warning("Failed to expire session lock %s: %s", session_id, e)
 
 
 def _get_blocked_attempts(minutes=60):
@@ -7377,8 +7489,8 @@ def _get_capacity_history(account=None, since=None, limit=500):
         url += "&snapshot_at=gte.{since}".format(since=since)
 
     req = urllib.request.Request(url, headers={
-        "apikey": _SUPABASE_KEY,
-        "Authorization": "Bearer " + _SUPABASE_KEY,
+        "apikey": __SUPABASE_KEY,
+        "Authorization": "Bearer " + __SUPABASE_KEY,
     })
     try:
         with urllib.request.urlopen(req, timeout=5) as resp:
