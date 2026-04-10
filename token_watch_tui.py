@@ -8213,6 +8213,7 @@ class DispatchView(LazyView):
         yield Static(id="dispatch-header")
         yield Static(id="dispatch-lanes")
         yield DataTable(id="dispatch-table")
+        yield Static(id="dispatch-preview")
         yield Static(id="bugs-header")
         yield DataTable(id="bugs-table")
 
@@ -8504,6 +8505,35 @@ class DispatchView(LazyView):
             self.notify("Dispatch refreshed")
         except Exception as e:
             self.notify(f"Dispatch error: {e}", severity="error")
+
+    def on_data_table_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
+        """Row hover — show first 3 lines of dispatch_prompt in preview bar."""
+        try:
+            if getattr(event, "data_table", None) is not None and event.data_table.id != "dispatch-table":
+                return
+        except Exception:
+            pass
+        try:
+            preview = self.query_one("#dispatch-preview", Static)
+        except Exception:
+            return
+        items = getattr(self, "_items", None)
+        if not items:
+            preview.update("")
+            return
+        idx = getattr(event, "cursor_row", None)
+        if idx is None or idx < 0 or idx >= len(items):
+            preview.update("")
+            return
+        item = items[idx]
+        prompt = item.get("dispatch_prompt") or ""
+        if not prompt:
+            preview.update(f"[dim]#{item.get('id', '?')} — no dispatch_prompt[/dim]")
+            return
+        lines = [ln for ln in prompt.splitlines() if ln.strip()][:3]
+        snippet = "\n".join(f"  {_rich_escape(ln[:120])}" for ln in lines)
+        header = f"[bold cyan]#{item.get('id', '?')}[/bold cyan] [dim]preview:[/dim]"
+        preview.update(f"{header}\n{snippet}")
 
     def on_data_table_row_selected(self, event):
         """Enter pressed on a row — open detail view."""
