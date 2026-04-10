@@ -440,6 +440,7 @@ DataTable > .datatable--header {
 
 /* ── Advisor View ── */
 #advisor-header { height: auto; max-height: 3; padding: 0 1; }
+#advisor-top-action { height: auto; max-height: 2; padding: 0 1; margin: 0 0 1 0; background: $boost; }
 #advisor-summary { height: auto; max-height: 2; padding: 0 1; }
 #advisor-table { height: 1fr; border: solid magenta; border-title-color: white; border-title-style: bold; }
 

@@ -6771,6 +6771,7 @@ class AdvisorView(LazyView):
 
     def compose(self) -> ComposeResult:
         yield Static(id="advisor-header")
+        yield Static(id="advisor-top-action")
         yield Static(id="advisor-summary")
         yield DataTable(id="advisor-table")
 
@@ -6813,6 +6814,10 @@ class AdvisorView(LazyView):
         summary_text = "  ".join(parts) if parts else "[dim]No insights[/dim]"
         self.query_one("#advisor-summary", Static).update(summary_text)
 
+        # Top-action banner — surfaces the single highest-priority actionable
+        # insight so the user has one clear next move without scanning the list.
+        self._render_top_action(report.insights)
+
         # Table
         table = self.query_one("#advisor-table", DataTable)
         table.clear(columns=True)
@@ -6834,6 +6839,68 @@ class AdvisorView(LazyView):
                 Text(ins.action, style="dim"),
             )
             self._insights_ordered.append(ins)
+
+    # Categories that have a well-defined, one-keystroke drill-down path
+    # (TEST_DEBT → t, PIPELINE → claim modal, CONTEXT → copy action, etc.)
+    # — used to pick the top-action banner target.
+    _ACTIONABLE_CATS = {
+        "TEST_DEBT", "PIPELINE", "CONTEXT", "CAPACITY",
+        "CYCLE", "EFFICIENCY", "QA", "SYSTEM",
+    }
+
+    def _render_top_action(self, insights):
+        """Update the bold top-of-view banner with the most urgent actionable insight."""
+        try:
+            banner = self.query_one("#advisor-top-action", Static)
+        except Exception:
+            return
+
+        # Prefer critical > warning > info, and actionable categories first.
+        sev_rank = {"critical": 0, "warning": 1, "info": 2, "positive": 3}
+        ranked = sorted(
+            insights,
+            key=lambda i: (
+                sev_rank.get(i.severity, 9),
+                0 if i.category in self._ACTIONABLE_CATS else 1,
+            ),
+        )
+
+        top = next(
+            (i for i in ranked if i.severity == "critical" and i.category in self._ACTIONABLE_CATS),
+            None,
+        )
+        if top is None:
+            top = next((i for i in ranked if i.category in self._ACTIONABLE_CATS), None)
+        if top is None and ranked:
+            top = ranked[0]
+
+        if top is None:
+            banner.update("")
+            return
+
+        hint_map = {
+            "TEST_DEBT": "Enter to drill down, then [bold]a[/bold] to mark all tested",
+            "PIPELINE":  "Enter to auto-claim the next ready task",
+            "CONTEXT":   "Enter for detail, [bold]x[/bold] to copy the fix command",
+            "CAPACITY":  "Enter to jump to Capacity tab",
+            "CYCLE":     "Enter to jump to Cycles tab",
+            "EFFICIENCY": "Enter to jump to Sessions tab",
+        }
+        hint = hint_map.get(top.category, "Enter to drill down")
+        sev_color = {
+            "critical": "bold red",
+            "warning":  "yellow",
+            "info":     "blue",
+            "positive": "green",
+        }.get(top.severity, "white")
+
+        msg = (top.message or top.title or "").strip()
+        if len(msg) > 90:
+            msg = msg[:87] + "..."
+
+        banner.update(
+            f"[{sev_color}]#1 ACTION:[/{sev_color}] {msg}  [dim]· {hint}[/dim]"
+        )
 
     def action_run_advisor(self):
         from token_watch_advisor import _advisor_cache_ts
