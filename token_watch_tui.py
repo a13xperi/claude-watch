@@ -14,6 +14,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from rich.text import Text
+from rich.markup import escape as _rich_escape
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, ScrollableContainer, Vertical
@@ -3630,10 +3631,24 @@ class ProjectBoardView(LazyView):
 
     _company_filter = ""
     _COMPANY_CYCLE = ["", "personal", "delphi", "kaa", "frank", "sage", "adinkra"]
+    _sort_col: str = ""   # column label currently sorted by
+    _sort_asc: bool = True
 
     BINDINGS = [
         Binding("p", "cycle_company", "Company"),
     ]
+
+    def on_data_table_header_selected(self, event: DataTable.HeaderSelected) -> None:
+        label = str(event.label)
+        if self._sort_col == label:
+            self._sort_asc = not self._sort_asc
+        else:
+            self._sort_col = label
+            self._sort_asc = True
+        arrow = "↑" if self._sort_asc else "↓"
+        self.notify(f"Sort by {label} {arrow}")
+        self._last_refresh = 0
+        self.refresh_content()
 
     def action_cycle_company(self):
         """Cycle company filter: all → personal → delphi → kaa → frank → sage → adinkra → all."""
@@ -3745,6 +3760,10 @@ class ProjectBoardView(LazyView):
         dt = self.query_one("#pboard-table", DataTable)
         dt.cursor_type = "row"
         dt.zebra_stripes = True
+        dt.add_column("Created", width=12)
+        dt.add_column("Sess", width=9)
+        dt.add_column("Co", width=8)
+        dt.add_column("Project", width=12)
         dt.add_column("#", width=5)
         dt.add_column("Pri", width=4)
         dt.add_column("Diff", width=5)
@@ -3752,27 +3771,46 @@ class ProjectBoardView(LazyView):
         dt.add_column("Tier", width=5)
         dt.add_column("~kT", width=4)
         dt.add_column("St", width=12)
-        dt.add_column("Co", width=8)
-        dt.add_column("Project", width=10)
-        dt.add_column("Task", width=30)
-        dt.add_column("Created", width=12)
-        dt.add_column("Sess", width=7)
-        dt.add_column("🚀", width=2)  # dispatch-ready indicator
+        dt.add_column("🚀", width=2)
+        dt.add_column("Task", width=36)
 
-        # Sort: in_progress first, then ready, then blocked, then built; within each, by priority
+        # Sort
         status_order = {"in_progress": 0, "ready": 1, "blocked": 2, "built": 3, "archived": 4}
         priority_order = {"critical": 0, "high": 1, "medium": 2, "low": 3}
-        sorted_tasks = sorted(tasks, key=lambda t: (
-            status_order.get(t.get("status", ""), 9),
-            priority_order.get((t.get("priority") or "medium").lower(), 9),
-            t.get("build_order") or 9999,
-        ))
-
-        # Show in_progress + ready + blocked (skip built for readability, they can scroll)
-        shown = [t for t in sorted_tasks if t.get("status") in ("in_progress", "ready", "blocked")]
-        # Add up to 10 built at the end
-        built_tasks = [t for t in sorted_tasks if t.get("status") == "built"][:10]
-        shown.extend(built_tasks)
+        col = self._sort_col
+        rev = not self._sort_asc
+        _col_key = {
+            "Co":      lambda t: (
+                            (t.get("company") or "").lower(),
+                            (t.get("project") or "").lower(),
+                            status_order.get(t.get("status", ""), 9),
+                        ),
+            "Project": lambda t: (
+                            (t.get("project") or "").lower(),
+                            status_order.get(t.get("status", ""), 9),
+                        ),
+            "#":       lambda t: t.get("id") or 0,
+            "Pri":     lambda t: priority_order.get((t.get("priority") or "medium").lower(), 9),
+            "Task":    lambda t: (t.get("task_name") or "").lower(),
+            "Created": lambda t: t.get("created_at") or "",
+            "St":      lambda t: status_order.get(t.get("status", ""), 9),
+            "Pts":     lambda t: t.get("points") or 0,
+            "~kT":     lambda t: t.get("est_tokens_k") or 0,
+            "Sess":    lambda t: (t.get("created_by_session") or "").lower(),
+        }
+        if col and col in _col_key:
+            # Column sort: single flat list, no status-based split
+            sorted_tasks = sorted(tasks, key=_col_key[col], reverse=rev)
+            shown = sorted_tasks
+        else:
+            sorted_tasks = sorted(tasks, key=lambda t: (
+                status_order.get(t.get("status", ""), 9),
+                priority_order.get((t.get("priority") or "medium").lower(), 9),
+                t.get("build_order") or 9999,
+            ))
+            # Default: in_progress + ready + blocked first, then up to 10 built
+            shown = [t for t in sorted_tasks if t.get("status") in ("in_progress", "ready", "blocked")]
+            shown.extend([t for t in sorted_tasks if t.get("status") == "built"][:10])
 
         _pri_label = {"critical": "P0", "high": "P1", "medium": "P2", "low": "P3"}
         _pri_style = {"critical": "bold red", "high": "bold yellow", "medium": "cyan", "low": "dim"}
@@ -3803,9 +3841,13 @@ class ProjectBoardView(LazyView):
             company_raw = t.get("company", "")
             co_name, co_style = _project_to_company(t.get("project", ""), company_raw)
             session_raw = t.get("created_by_session", "")
-            session_display = session_raw.replace("cc-", "") if session_raw else "—"
+            session_display = session_raw if session_raw else "—"
 
             dt.add_row(
+                Text(created_display, style="dim"),
+                Text(session_display[:9], style="dim"),
+                Text(co_name[:8], style=co_style),
+                Text(t.get("project", "—")[:12], style="cyan"),
                 Text(tid, justify="right"),
                 Text(_pri_label.get(pri, "—"), style=_pri_style.get(pri, "dim")),
                 Text(_diff_label.get(diff, "—"), style=_diff_style.get(diff, "dim")),
@@ -3813,12 +3855,8 @@ class ProjectBoardView(LazyView):
                 Text(tier[:4], style=_tier_style.get(tier, "dim")),
                 Text(str(tok) if tok else "—", justify="right", style="magenta" if tok else "dim"),
                 Text(f"{status_icon} {status}", style=status_style),
-                Text(co_name[:8], style=co_style),
-                Text(t.get("project", "—")[:10], style="cyan"),
-                Text((t.get("task_name") or "—")[:30]),
-                Text(created_display, style="dim"),
-                Text(session_display[:7], style="dim"),
                 Text(dispatch_icon, style=dispatch_style),
+                Text((t.get("task_name") or "—")[:36]),
             )
 
         if not shown:
@@ -5002,7 +5040,12 @@ class CyclePlanScreen(Screen):
         Binding("a", "add_task", "Add"),
         Binding("d", "done_task", "Done"),
         Binding("s", "skip_task", "Skip"),
+        Binding("R", "toggle_rolled", "Rolled"),
     ]
+
+    # Hide items whose title starts with "[rolled]" by default so the
+    # plan focuses on fresh work. Press R to reveal them.
+    _show_rolled = False
 
     def compose(self) -> ComposeResult:
         yield NavBar(active="nav-cycles")
@@ -5059,12 +5102,22 @@ class CyclePlanScreen(Screen):
             f"[green]{_light * free_chars}[/green]"
         )
 
+        tasks = plan.get("tasks", [])
+        rolled_count = sum(
+            1 for t in tasks if (t.get("title", "") or "").startswith("[rolled]")
+        )
+        rolled_note = ""
+        if rolled_count and not self._show_rolled:
+            rolled_note = f"  [dim yellow]{rolled_count} rolled hidden (R to show)[/dim yellow]"
+        elif rolled_count and self._show_rolled:
+            rolled_note = f"  [yellow]{rolled_count} rolled shown (R to hide)[/yellow]"
+
         header.update(
             f"[bold]CYCLE PLAN[/bold]  {bar}  "
             f"Burned: [red]{burned:.0f}%[/red]  "
             f"Allocated: [yellow]{allocated:.0f}%[/yellow]  "
-            f"Free: [green]{plan_remaining:.0f}%[/green]\n"
-            f"  [dim](a=add task  d=mark done  s=skip)[/dim]"
+            f"Free: [green]{plan_remaining:.0f}%[/green]{rolled_note}\n"
+            f"  [dim](a=add task  d=mark done  s=skip  R=toggle rolled)[/dim]"
         )
 
         # ── Planned tasks table ──
@@ -5079,25 +5132,40 @@ class CyclePlanScreen(Screen):
         pt.add_column("Est%", width=6)
         pt.add_column("Act%", width=6)
 
-        tasks = plan.get("tasks", [])
+        # Row index → index into self._plan["tasks"]. Needed because we
+        # may hide rolled rows; action_done_task / action_skip_task use
+        # cursor_row, which won't match the raw task list otherwise.
+        self._visible_task_indexes: list = []
         for i, t in enumerate(tasks):
+            title = t.get("title", "?") or ""
+            if title.startswith("[rolled]") and not self._show_rolled:
+                continue
             status = t.get("status", "pending")
             icon = "\u2713 done" if status == "done" else ("\u2298 skip" if status == "skipped" else "\u25cb pend")
             color = "green" if status == "done" else ("dim" if status == "skipped" else "white")
+            if title.startswith("[rolled]"):
+                color = "dim " + color if color != "dim" else color
 
             pt.add_row(
                 Text(str(i + 1), justify="right"),
                 Text(icon, style=color),
-                Text(t.get("title", "?")[:35]),
+                Text(title[:35], style=color if title.startswith("[rolled]") else ""),
                 Text(t.get("project", "?")),
                 Text(f"{t.get('est_pct', 0):.0f}%", justify="right"),
                 Text(f"{t.get('act_pct', 0):.0f}%", justify="right"),
                 key=f"ptask-{i}",
             )
+            self._visible_task_indexes.append(i)
 
         if not tasks:
             pt.add_row("", Text("No tasks planned \u2014 press 'a' on available tasks below", style="dim"),
                         "", "", "", "")
+        elif not self._visible_task_indexes:
+            pt.add_row(
+                "",
+                Text(f"All {rolled_count} tasks are rolled \u2014 press R to show", style="dim yellow"),
+                "", "", "", "",
+            )
 
         # ── Available tasks table ──
         at = self.query_one("#cplan-available", DataTable)
@@ -5162,6 +5230,15 @@ class CyclePlanScreen(Screen):
         _save_cycle_plan(self._plan)
         self._load_and_render()
 
+    def _resolve_visible_task_index(self, cursor_row):
+        """Map the DataTable cursor row to an index into self._plan['tasks']."""
+        visible = getattr(self, "_visible_task_indexes", None) or []
+        if cursor_row is None or cursor_row < 0:
+            return None
+        if cursor_row >= len(visible):
+            return None
+        return visible[cursor_row]
+
     def action_done_task(self):
         from token_watch_data import _save_cycle_plan
         pt = self.query_one("#cplan-tasks", DataTable)
@@ -5169,8 +5246,8 @@ class CyclePlanScreen(Screen):
         if not pt.row_count or not tasks:
             return
         try:
-            idx = pt.cursor_row
-            if idx >= len(tasks):
+            idx = self._resolve_visible_task_index(pt.cursor_row)
+            if idx is None or idx >= len(tasks):
                 return
             tasks[idx]["status"] = "done"
             _save_cycle_plan(self._plan)
@@ -5185,14 +5262,22 @@ class CyclePlanScreen(Screen):
         if not pt.row_count or not tasks:
             return
         try:
-            idx = pt.cursor_row
-            if idx >= len(tasks):
+            idx = self._resolve_visible_task_index(pt.cursor_row)
+            if idx is None or idx >= len(tasks):
                 return
             tasks[idx]["status"] = "skipped"
             _save_cycle_plan(self._plan)
             self._load_and_render()
         except (IndexError, AttributeError):
             return
+
+    def action_toggle_rolled(self):
+        """Toggle visibility of [rolled] tasks in the plan."""
+        self._show_rolled = not self._show_rolled
+        self._load_and_render()
+        self.notify(
+            "Showing rolled items" if self._show_rolled else "Hiding rolled items"
+        )
 
     def action_pop_screen(self):
         self.app.pop_screen()
@@ -5864,6 +5949,10 @@ class TestQueueView(LazyView):
 class MissionControlView(LazyView):
     """Mission Control — unified view of everything built, grouped by company/project."""
 
+    BINDINGS = [
+        Binding("t", "toggle_test_status", "Test"),
+    ]
+
     def refresh_content(self):
         now = time.time()
         if not hasattr(self, '_last_refresh') or (now - self._last_refresh) > 15:
@@ -5944,6 +6033,12 @@ class MissionControlView(LazyView):
         company_order = ["delphi", "kaa", "frank", "personal"]
         company_labels = {"delphi": "DELPHI", "kaa": "KAA", "frank": "FRANK", "personal": "PERSONAL"}
 
+        # Track row keys and data for t-hotkey lookup.
+        # _row_keys_ordered is parallel to the DataTable rows: each entry is
+        # either a row_key string (for item rows) or None (for separator rows).
+        self._row_data = {}
+        self._row_keys_ordered = []
+
         for co in company_order:
             projects = data["by_company"].get(co, {})
             if not projects:
@@ -5957,8 +6052,9 @@ class MissionControlView(LazyView):
                     Text(f"\u2500\u2500 {label} \u2500\u2500", style="bold yellow"),
                     Text(""),
                 )
+                self._row_keys_ordered.append(None)  # separator row
 
-                for item in items:
+                for _row_idx, item in enumerate(items):
                     ts = item.get("created_at", "")
                     if "T" in ts:
                         ts = ts.split("T")[1][:5]
@@ -5975,16 +6071,110 @@ class MissionControlView(LazyView):
 
                     hint = item.get("test_hint", "") or ""
                     sha = (item.get("commit_sha") or "")[:7]
+                    row_key = (
+                        f"{item.get('project', '')}|{sha}|{_row_idx}|{item.get('id', '')}"
+                        if sha else None
+                    )
                     table.add_row(
                         Text(icon, style=icon_style),
                         Text(ts, style="dim"),
                         Text(sha, style="cyan"),
-                        Text(item.get("session_id", "").replace("cc-", ""), style="dim"),
+                        Text(item.get("session_id", ""), style="dim"),
                         Text(file_count, style="dim"),
                         Text(test, style=icon_style),
                         Text(item.get("title", "")[:33]),
                         Text(hint[:38], style="italic dim"),
+                        key=row_key,
                     )
+                    self._row_keys_ordered.append(row_key)
+                    if row_key:
+                        self._row_data[row_key] = item
+
+    def on_data_table_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
+        try:
+            table = self.query_one("#mission-table", DataTable)
+        except Exception:
+            return
+        cursor_key = str(event.row_key.value or "")
+        if not cursor_key or "|" not in cursor_key:
+            table.tooltip = None
+            return
+        item = self._row_data.get(cursor_key, {})
+        title = item.get("title", "") or ""
+        hint = item.get("test_hint", "") or ""
+        sha = (item.get("commit_sha") or "")[:7]
+        project = item.get("project", "") or ""
+        ts = item.get("created_at", "")
+        if "T" in ts:
+            ts = ts.split("T")[1][:5]
+        parts = []
+        if title:
+            parts.append(title)
+        if hint:
+            parts.append(f"verify: {hint}")
+        if project or sha:
+            parts.append(f"{project}  {sha}  {ts}".strip())
+        table.tooltip = "\n".join(parts) if parts else None
+
+    def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
+        key = str(event.row_key.value or "")
+        parts = key.split("|")
+        if len(parts) < 2:
+            return
+        project, sha = parts[0], parts[1]
+        if not sha:
+            return
+        repo_map = {
+            "atlas": "atlas-portal",
+            "atlas-backend": "atlas-backend",
+            "token-watch": "token-watch",
+            "battlestation": "battlestation",
+            "paperclip": "paperclip",
+            "frank-pilot": "frank-pilot",
+            "openclaw": "openclaw",
+            "kaa": "openclaw",
+        }
+        repo = repo_map.get(project, project)
+        import subprocess
+        subprocess.run(["open", f"https://github.com/a13xperi/{repo}/commit/{sha}"])
+
+    def action_toggle_test_status(self):
+        """Cycle the test_status on the currently-selected row:
+        untested → tested → failed → untested.
+        """
+        from token_watch_data import _update_test_item
+        try:
+            table = self.query_one("#mission-table", DataTable)
+        except Exception:
+            return
+        row_idx = getattr(table, "cursor_row", None)
+        if row_idx is None or row_idx < 0:
+            return
+        row_keys = getattr(self, "_row_keys_ordered", [])
+        if row_idx >= len(row_keys):
+            return
+        cursor_key = row_keys[row_idx]
+        if not cursor_key or "|" not in cursor_key:
+            return
+        parts = cursor_key.split("|")
+        if len(parts) < 4:
+            return
+        item_id = parts[3]
+        if not item_id:
+            return
+        # Look up current status
+        item = self._row_data.get(cursor_key, {})
+        current = item.get("test_status", "untested")
+        cycle = {"untested": "tested", "tested": "failed", "failed": "untested"}
+        new_status = cycle.get(current, "tested")
+        if _update_test_item(item_id, new_status):
+            try:
+                self.notify(f"{item.get('title', 'item')[:40]} → {new_status}")
+            except Exception:
+                pass
+        # Force reload
+        self._last_refresh = 0
+        self.refresh_content()
 
 
 class DelphiView(LazyView):
@@ -6340,6 +6530,7 @@ class AdvisorView(LazyView):
 
     BINDINGS = [
         Binding("R", "run_advisor", "Run Now"),
+        Binding("enter", "drill_down", "Detail", show=False),
     ]
 
     def compose(self) -> ComposeResult:
@@ -6396,6 +6587,8 @@ class AdvisorView(LazyView):
         table.add_column("Insight")
         table.add_column("Action", width=40)
 
+        # Parallel list of insights for cursor lookup (drill-down).
+        self._insights_ordered = []
         for ins in report.insights:
             icon, style = severity_display.get(ins.severity, (" ? ", "white"))
             table.add_row(
@@ -6404,6 +6597,7 @@ class AdvisorView(LazyView):
                 Text(ins.message),
                 Text(ins.action, style="dim"),
             )
+            self._insights_ordered.append(ins)
 
     def action_run_advisor(self):
         from token_watch_advisor import _advisor_cache_ts
@@ -6413,6 +6607,314 @@ class AdvisorView(LazyView):
         self._last_refresh = 0
         self._refresh_advisor()
         self.notify("TW Advisor refreshed")
+
+    def _get_selected_insight(self):
+        """Return the Insight at the cursor row, or None."""
+        try:
+            table = self.query_one("#advisor-table", DataTable)
+        except Exception:
+            return None
+        row_idx = getattr(table, "cursor_row", None)
+        if row_idx is None or row_idx < 0:
+            return None
+        insights = getattr(self, "_insights_ordered", [])
+        if row_idx >= len(insights):
+            return None
+        return insights[row_idx]
+
+    # Category → view_id map for smart "jump to the relevant view" navigation.
+    _NAV_MAP = {
+        "CYCLE": "view-sessions",
+        "CAPACITY": "view-capacity",
+        "EFFICIENCY": "view-sessions",
+        "PIPELINE": "view-dispatch",
+    }
+
+    def _handle_drill_down(self, ins):
+        """Route an insight to the right view, or fall back to the generic screen."""
+        if ins is None:
+            return
+        view_id = self._NAV_MAP.get(ins.category)
+        if view_id:
+            try:
+                self.app.switch_view(view_id)
+                return
+            except Exception:
+                # If navigation fails for any reason, fall through to detail screen.
+                pass
+        # TEST_DEBT + SYSTEM/CONTEXT/COORDINATION/QUALITY/VELOCITY/OPPORTUNITY
+        # and anything else → open the generic drill-down screen.
+        self.app.push_screen(AdvisorDetailScreen(ins))
+
+    def action_drill_down(self):
+        self._handle_drill_down(self._get_selected_insight())
+
+    def on_data_table_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
+        try:
+            table = self.query_one("#advisor-table", DataTable)
+        except Exception:
+            return
+        insights = getattr(self, "_insights_ordered", [])
+        idx = event.cursor_row
+        if idx is None or idx >= len(insights):
+            table.tooltip = None
+            return
+        ins = insights[idx]
+        parts = []
+        if ins.message:
+            parts.append(ins.message)
+        if ins.action:
+            parts.append(f"action: {ins.action}")
+        table.tooltip = "\n".join(parts) if parts else None
+
+    def on_data_table_row_selected(self, event) -> None:
+        """Enter/click on a row routes to the right view or detail screen."""
+        self._handle_drill_down(self._get_selected_insight())
+
+
+class AdvisorDetailScreen(Screen):
+    """Drill-down for an Advisor insight — shows the underlying items."""
+
+    BINDINGS = [
+        Binding("escape", "pop_screen", "Back"),
+        Binding("q", "pop_screen", "Back"),
+        Binding("t", "mark_tested", "Tested"),
+        Binding("f", "mark_failed", "Failed"),
+        Binding("o", "open_github", "GitHub"),
+    ]
+
+    def __init__(self, insight, **kwargs):
+        super().__init__(**kwargs)
+        self._insight = insight
+        # Parallel list of build_ledger items for TEST_DEBT drill-down.
+        self._test_items: list = []
+
+    def compose(self) -> ComposeResult:
+        yield Static(id="adetail-header")
+        yield Static(id="adetail-summary")
+        yield DataTable(id="adetail-table")
+        yield Static(id="adetail-footer")
+
+    def on_mount(self):
+        ins = self._insight
+        severity_style = {
+            "critical": "bold red",
+            "warning":  "yellow",
+            "info":     "blue",
+            "positive": "green",
+        }.get(ins.severity, "white")
+
+        self.query_one("#adetail-header", Static).update(
+            f"[{severity_style}]{ins.severity.upper()}[/{severity_style}]  "
+            f"[bold]{ins.category}[/bold]  [dim]·[/dim]  {ins.title}"
+        )
+        summary_lines = [
+            f"[bold]Insight:[/bold] {ins.message}",
+        ]
+        if ins.action:
+            summary_lines.append(f"[bold]Action:[/bold]  [dim]{ins.action}[/dim]")
+        self.query_one("#adetail-summary", Static).update("\n".join(summary_lines))
+
+        table = self.query_one("#adetail-table", DataTable)
+        table.cursor_type = "row"
+        table.zebra_stripes = True
+
+        footer = self.query_one("#adetail-footer", Static)
+        if ins.category == "TEST_DEBT":
+            self._render_test_debt(table)
+            footer.update(
+                "[dim]t[/dim]=mark tested  [dim]f[/dim]=mark failed  "
+                "[dim]o[/dim]=open GitHub  [dim]q/Esc[/dim]=back"
+            )
+        else:
+            self._render_generic(table)
+            footer.update("[dim]q/Esc=back[/dim]")
+
+    def _resolve_test_debt_project(self):
+        """Extract the project name from the insight data or message."""
+        ins = self._insight
+        data = getattr(ins, "data", {}) or {}
+        proj = data.get("project")
+        if proj:
+            return str(proj)
+        # Fallback: parse "... untested items in <project> (company)."
+        import re
+        m = re.search(r"untested items in (\S+?)(?:\s*\(|\.|$)", ins.message or "")
+        if m:
+            return m.group(1)
+        return ""
+
+    def _render_test_debt(self, table: DataTable):
+        from token_watch_data import _get_build_ledger
+        project = self._resolve_test_debt_project()
+
+        table.clear(columns=True)
+        table.add_column("Time", width=12)
+        table.add_column("SHA", width=8)
+        table.add_column("Title", width=36)
+        table.add_column("How to Verify", width=40)
+
+        # Reset parallel list each render.
+        self._test_items = []
+
+        if not project:
+            table.add_row(
+                Text("—"), Text(""),
+                Text("Could not resolve project from insight", style="italic dim"),
+                Text(""),
+            )
+            return
+
+        # Pull a wide slice, then filter to project + untested.
+        data = _get_build_ledger(days=30, limit=500)
+        matches = []
+        for item in data.get("items", []):
+            if (item.get("project") or "").lower() != project.lower():
+                continue
+            if (item.get("test_status") or "untested") != "untested":
+                continue
+            matches.append(item)
+
+        if not matches:
+            table.add_row(
+                Text("—"), Text(""),
+                Text(f"No untested items found for {project}", style="italic dim"),
+                Text(""),
+            )
+            return
+
+        for item in matches:
+            ts = item.get("created_at", "") or ""
+            if "T" in ts:
+                ts = ts.replace("T", " ")[5:16]
+            sha = (item.get("commit_sha") or "")[:7]
+            title = (item.get("title") or "")[:36]
+            hint = (item.get("test_hint") or "")[:40]
+            table.add_row(
+                Text(ts, style="dim"),
+                Text(sha, style="cyan"),
+                Text(title),
+                Text(hint, style="italic dim"),
+                key=item.get("id", "") or None,
+            )
+            self._test_items.append(item)
+
+    def _reload_test_debt(self):
+        """Re-fetch TEST_DEBT items from Supabase and re-render the table."""
+        try:
+            table = self.query_one("#adetail-table", DataTable)
+        except Exception:
+            return
+        self._render_test_debt(table)
+
+    def on_data_table_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
+        try:
+            table = self.query_one("#adetail-table", DataTable)
+        except Exception:
+            return
+        items = self._test_items
+        idx = event.cursor_row
+        if idx is None or idx >= len(items):
+            table.tooltip = None
+            return
+        item = items[idx]
+        title = item.get("title", "") or ""
+        hint = item.get("test_hint", "") or ""
+        sha = (item.get("commit_sha") or "")[:7]
+        project = item.get("project", "") or ""
+        parts = []
+        if title:
+            parts.append(title)
+        if hint:
+            parts.append(f"verify: {hint}")
+        if sha or project:
+            parts.append(f"{project}  {sha}".strip())
+        table.tooltip = "\n".join(parts) if parts else None
+
+    def _mark_selected(self, status: str):
+        """Mark the currently-selected TEST_DEBT row as tested/failed."""
+        from token_watch_data import _update_test_item
+        if self._insight.category != "TEST_DEBT":
+            return
+        try:
+            table = self.query_one("#adetail-table", DataTable)
+        except Exception:
+            return
+        row = getattr(table, "cursor_row", -1)
+        if row is None or row < 0 or row >= len(self._test_items):
+            return
+        item = self._test_items[row]
+        item_id = item.get("id", "")
+        if not item_id:
+            self.notify("Item has no id — cannot update", severity="warning")
+            return
+        api_status = "pass" if status == "tested" else "fail"
+        ok = _update_test_item(item_id, api_status)
+        if not ok:
+            self.notify("Failed to update Supabase", severity="error")
+            return
+        title = (item.get("title") or "")[:40]
+        self.notify(f"{title} → {status}")
+        # Reload from Supabase so the list reflects the new state.
+        self._reload_test_debt()
+        if not self._test_items:
+            self.notify("All items marked — press q to go back")
+
+    def action_mark_tested(self):
+        self._mark_selected("tested")
+
+    def action_mark_failed(self):
+        self._mark_selected("failed")
+
+    def action_open_github(self):
+        """Open the selected item's commit on GitHub in the browser."""
+        if self._insight.category != "TEST_DEBT":
+            return
+        import subprocess
+        try:
+            table = self.query_one("#adetail-table", DataTable)
+        except Exception:
+            return
+        row = getattr(table, "cursor_row", -1)
+        if row is None or row < 0 or row >= len(self._test_items):
+            return
+        item = self._test_items[row]
+        sha = (item.get("commit_sha") or "")[:7]
+        project = item.get("project", "") or ""
+        repo_map = {
+            "atlas": "atlas-portal",
+            "atlas-backend": "atlas-backend",
+            "token-watch": "token-watch",
+            "battlestation": "battlestation",
+            "paperclip": "paperclip",
+            "frank-pilot": "frank-pilot",
+            "openclaw": "openclaw",
+            "kaa": "openclaw",
+        }
+        repo = repo_map.get(project, project)
+        if sha and repo:
+            subprocess.run(["open", f"https://github.com/a13xperi/{repo}/commit/{sha}"])
+            self.notify(f"Opening {repo}@{sha}")
+        else:
+            self.notify("No commit SHA/project on row", severity="warning")
+
+    def _render_generic(self, table: DataTable):
+        ins = self._insight
+        table.add_column("Field", width=16)
+        table.add_column("Value")
+        table.add_row(Text("Category", style="bold"), Text(ins.category))
+        table.add_row(Text("Severity", style="bold"), Text(ins.severity))
+        table.add_row(Text("Title", style="bold"), Text(ins.title or "—"))
+        table.add_row(Text("Message", style="bold"), Text(ins.message or "—"))
+        table.add_row(Text("Action", style="bold"), Text(ins.action or "—"))
+        table.add_row(Text("Source", style="bold"), Text(ins.source or "—"))
+        data = getattr(ins, "data", {}) or {}
+        if data:
+            for k, v in data.items():
+                table.add_row(Text(f"data.{k}", style="dim"), Text(str(v)))
+
+    def action_pop_screen(self):
+        self.app.pop_screen()
 
 
 class AnalyticsView(LazyView):
@@ -6932,6 +7434,11 @@ class DispatchView(LazyView):
     _LANE_CYCLE = ["", "ui-simplification", "voice-lab", "twitter-integration"]
     _company_filter = ""
     _COMPANY_CYCLE = ["", "personal", "delphi", "kaa", "frank", "sage", "adinkra"]
+    # Default to "atlas" so opening Dispatch for the first time shows the
+    # project Alex is shipping. User p-cycles persist as instance attributes
+    # that shadow this class default, so manual overrides aren't reset.
+    _project_filter = "atlas"
+    _PROJECT_CYCLE = ["", "atlas", "atlas-backend", "paperclip", "kaa", "frank-pilot", "token-watch", "battlestation", "openclaw"]
 
     BINDINGS = [
         Binding("r", "refresh_dispatch", "Refresh"),
@@ -6939,7 +7446,8 @@ class DispatchView(LazyView):
         Binding("x", "claim_selected", "Claim"),
         Binding("a", "archive_selected", "Archive"),
         Binding("l", "cycle_lane", "Lane"),
-        Binding("p", "cycle_company", "Company"),
+        Binding("p", "cycle_project", "Project"),
+        Binding("o", "cycle_company", "Company"),
         Binding("s", "cycle_bug_status", "Bug Status"),
         Binding("f", "fix_bug", "Fix Bug"),
     ]
@@ -6973,13 +7481,16 @@ class DispatchView(LazyView):
         company_info = ""
         if self._company_filter:
             company_info = f"  [bold green]co:{self._company_filter}[/bold green]"
+        project_info = ""
+        if self._project_filter:
+            project_info = f"  [bold cyan]project:{self._project_filter}[/bold cyan]"
 
         self.query_one("#dispatch-header", Static).update(
             f"[bold]Dispatch[/bold]  "
             f"[green]{stats['total_ready']} ready[/green]  ·  "
             f"[yellow]{stats['total_active']} active[/yellow]  ·  "
-            f"[dim]~{stats['total_tokens_k']}kT total[/dim]{lane_info}{company_info}  "
-            f"[dim italic]enter=view  c=copy  x=claim  a=archive  l=lane  p=company  r=refresh[/dim italic]"
+            f"[dim]~{stats['total_tokens_k']}kT total[/dim]{project_info}{lane_info}{company_info}  "
+            f"[dim italic]enter=view  c=copy  x=claim  a=archive  l=lane  p=project  o=company  r=refresh[/dim italic]"
         )
 
         # Lane progress bars for swarm monitoring
@@ -7039,52 +7550,91 @@ class DispatchView(LazyView):
 
         lane_colors = {"ui-simplification": "green", "voice-lab": "magenta", "twitter-integration": "cyan"}
 
+        def _safe_str(val, default="?"):
+            """Coerce Supabase values (possibly None) to a safe string."""
+            if val is None:
+                return default
+            return str(val)
+
+        def _safe_trunc(val, keep=38, limit=40, default="?"):
+            """Truncate a possibly-None string safely, escaping Rich markup."""
+            s = _safe_str(val, default)
+            if len(s) > limit:
+                s = s[:keep] + ".."
+            return _rich_escape(s)
+
         def _lane_cell(item):
             lane = item.get("lane") or ""
             if not lane:
                 return "[dim]—[/dim]"
             lc = lane_colors.get(lane, "dim")
-            return f"[{lc}]{lane}[/{lc}]"
+            # lane comes from DB — escape to prevent markup injection
+            return f"[{lc}]{_rich_escape(lane)}[/{lc}]"
+
+        def _pri_cell(item):
+            pri = item.get("priority") or "medium"
+            return pri_styles.get(pri, "[dim]?[/dim]")
+
+        def _tier_cell(item):
+            tier = item.get("tier") or ""
+            return tier_styles.get(tier, "[dim]?[/dim]")
+
+        def _project_cell(item):
+            proj = _safe_str(item.get("project"), "?")
+            return f"[cyan]{_rich_escape(proj)}[/cyan]"
 
         self._items = []
 
+        def _row_matches_filters(item):
+            if self._lane_filter and (item.get("lane") or "") != self._lane_filter:
+                return False
+            if self._company_filter and (item.get("company") or "").lower() != self._company_filter:
+                return False
+            if self._project_filter and (item.get("project") or "").lower() != self._project_filter:
+                return False
+            return True
+
         # Active items first (in-progress)
         for item in data["active"]:
-            if self._lane_filter and (item.get("lane") or "") != self._lane_filter:
+            if not _row_matches_filters(item):
                 continue
-            if self._company_filter and (item.get("company") or "").lower() != self._company_filter:
+            try:
+                age = self._format_age(item.get("created_at", ""))
+                table.add_row(
+                    _safe_str(item.get("id"), ""),
+                    "[magenta]RUN[/magenta]",
+                    _tier_cell(item),
+                    _project_cell(item),
+                    _lane_cell(item),
+                    _safe_trunc(item.get("task_name"), keep=38, limit=40),
+                    _rich_escape(_safe_str(item.get("source"), "?")),
+                    age,
+                )
+                self._items.append(item)
+            except Exception:
+                # Drop the bad row rather than abort the whole render.
                 continue
-            self._items.append(item)
-            age = self._format_age(item.get("created_at", ""))
-            table.add_row(
-                str(item.get("id", "")),
-                "[magenta]RUN[/magenta]",
-                tier_styles.get(item.get("tier", ""), "?"),
-                f"[cyan]{item.get('project', '?')}[/cyan]",
-                _lane_cell(item),
-                (item.get("task_name", "?")[:38] + "..") if len(item.get("task_name", "")) > 40 else item.get("task_name", "?"),
-                item.get("source", "?"),
-                age,
-            )
 
         # Queue items (ready)
         for item in data["queue"]:
-            if self._lane_filter and (item.get("lane") or "") != self._lane_filter:
+            if not _row_matches_filters(item):
                 continue
-            if self._company_filter and (item.get("company") or "").lower() != self._company_filter:
+            try:
+                age = self._format_age(item.get("created_at", ""))
+                table.add_row(
+                    _safe_str(item.get("id"), ""),
+                    _pri_cell(item),
+                    _tier_cell(item),
+                    _project_cell(item),
+                    _lane_cell(item),
+                    _safe_trunc(item.get("task_name"), keep=38, limit=40),
+                    _rich_escape(_safe_str(item.get("source"), "?")),
+                    age,
+                )
+                self._items.append(item)
+            except Exception:
+                # Drop the bad row rather than abort the whole render.
                 continue
-            self._items.append(item)
-            age = self._format_age(item.get("created_at", ""))
-            table.add_row(
-                str(item.get("id", "")),
-                pri_styles.get(item.get("priority", "medium"), "?"),
-                tier_styles.get(item.get("tier", ""), "?"),
-                f"[cyan]{item.get('project', '?')}[/cyan]",
-                _lane_cell(item),
-                (item.get("task_name", "?")[:38] + "..") if len(item.get("task_name", "")) > 40 else item.get("task_name", "?"),
-                item.get("source", "?"),
-                age,
-            )
 
         # ── Bugs section ──
         from token_watch_data import _get_bugs
@@ -7171,6 +7721,17 @@ class DispatchView(LazyView):
         self.notify(f"Lane filter: {label}")
         self.action_refresh_dispatch()
 
+    def action_cycle_project(self):
+        """Cycle project filter: all → atlas → atlas-backend → paperclip → … → all."""
+        try:
+            idx = self._PROJECT_CYCLE.index(self._project_filter)
+        except ValueError:
+            idx = -1
+        self._project_filter = self._PROJECT_CYCLE[(idx + 1) % len(self._PROJECT_CYCLE)]
+        label = self._project_filter or "all"
+        self.notify(f"Project: {label}")
+        self.action_refresh_dispatch()
+
     def action_cycle_company(self):
         """Cycle company filter: all → personal → delphi → kaa → frank → sage → adinkra → all."""
         try:
@@ -7186,10 +7747,13 @@ class DispatchView(LazyView):
         try:
             self.query_one("#dispatch-table", DataTable).clear(columns=True)
             self.query_one("#bugs-table", DataTable).clear(columns=True)
-            self.load_content()
         except Exception:
             pass
-        self.notify("Dispatch refreshed")
+        try:
+            self.load_content()
+            self.notify("Dispatch refreshed")
+        except Exception as e:
+            self.notify(f"Dispatch error: {e}", severity="error")
 
     def on_data_table_row_selected(self, event):
         """Enter pressed on a row — open detail view."""

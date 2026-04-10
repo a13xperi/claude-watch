@@ -472,3 +472,18 @@ DataTable > .datatable--header {
 #dd-header { height: auto; max-height: 3; padding: 0 1; background: $surface; }
 #dd-scroll { height: 1fr; padding: 1 2; }
 #dd-body { height: auto; }
+
+/* -- Mission Control layout -- */
+#mission-table {
+    height: 1fr;
+}
+
+/* -- Advisor layout -- */
+#advisor-table {
+    height: 1fr;
+}
+
+/* -- Advisor detail screen layout -- */
+#adetail-table {
+    height: 1fr;
+}
