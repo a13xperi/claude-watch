@@ -495,3 +495,12 @@ DataTable > .datatable--header {
 }
 #projects-header { height: auto; padding: 0 1; }
 #projects-recs { height: auto; padding: 1 2; background: $surface; margin-top: 1; }
+
+/* ── Plans Tab ── */
+#plans-header { height: auto; padding: 0 1; }
+#plans-table { height: 1fr; }
+
+/* ── Plan Detail Screen ── */
+#pd-header { padding: 1 2; height: auto; }
+#pd-body   { padding: 1 2; width: 100%; }
+#pd-scroll { height: 1fr; }

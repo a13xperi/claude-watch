@@ -87,6 +87,12 @@ from token_watch_data import (
     _score_dimension,
 )
 
+try:
+    from token_watch_data import _get_claude_plans
+except ImportError:
+    def _get_claude_plans(limit=100, status=None, session_id=None, force=False):
+        return []
+
 class LazyView(ScrollableContainer):
     """Content view that lazy-loads data on first display."""
     _loaded: bool = False
@@ -1928,6 +1934,7 @@ class NavBar(Horizontal):
             ("Delphi", "nav-delphi"),
             ("Analytics", "nav-analytics"),
             ("Audit", "nav-audit"),
+            ("Plans", "nav-plans"),
         ]),
         ("Operations", [
             ("Wire", "nav-wire"),
@@ -2004,6 +2011,7 @@ class NavigationScreen(Screen):
                 "nav-dispatch": "view-dispatch",
                 "nav-capacity": "view-capacity",
                 "nav-inbox": "view-inbox",
+                "nav-plans": "view-plans",
             }
             view_id = btn_map.get(view_key)
             if view_id:
@@ -6850,6 +6858,220 @@ class ClaimConfirmScreen(Screen):
         self.app.pop_screen()
 
 
+class PlanDetailScreen(Screen):
+    """Detail view for a single Claude Code plan — shows full markdown content."""
+
+    BINDINGS = [
+        Binding("escape", "pop_screen", "Back"),
+        Binding("q", "pop_screen", "Back"),
+    ]
+
+    def __init__(self, plan: dict):
+        super().__init__()
+        self._plan = plan or {}
+
+    def compose(self) -> ComposeResult:
+        yield Static(id="pd-header")
+        with ScrollableContainer(id="pd-scroll"):
+            yield Static(id="pd-body")
+
+    def on_mount(self):
+        p = self._plan
+        title = p.get("title") or p.get("plan_slug") or "(untitled)"
+        slug = p.get("plan_slug", "")
+        session = p.get("session_id", "")
+        status = p.get("status", "draft")
+        status_style = {
+            "draft": "yellow",
+            "approved": "green",
+            "abandoned": "dim",
+        }.get(status, "white")
+
+        # Age / updated display
+        updated = p.get("updated_at", "")
+        age_str = ""
+        if updated:
+            try:
+                ts = datetime.fromisoformat(updated.replace("Z", "+00:00"))
+                delta_min = (datetime.now(timezone.utc) - ts).total_seconds() / 60
+                if delta_min < 60:
+                    age_str = f"{delta_min:.0f}m ago"
+                elif delta_min < 1440:
+                    age_str = f"{delta_min / 60:.0f}h ago"
+                else:
+                    age_str = f"{delta_min / 1440:.0f}d ago"
+            except Exception:
+                age_str = updated[:16]
+
+        header = (
+            f"[bold]{_rich_escape(title)}[/bold]\n"
+            f"[dim]{_rich_escape(slug)}[/dim]  "
+            f"[cyan]{_rich_escape(session)}[/cyan]  "
+            f"[{status_style}]{status}[/{status_style}]  "
+            f"[dim]{age_str}[/dim]"
+        )
+        self.query_one("#pd-header", Static).update(header)
+
+        body = p.get("content", "") or "(no content)"
+        # Render raw markdown — escape rich markup to avoid conflicts
+        self.query_one("#pd-body", Static).update(_rich_escape(body))
+
+    def action_pop_screen(self):
+        self.app.pop_screen()
+
+
+class PlansView(LazyView):
+    """Claude Code Plans — cross-session plan files synced from ~/.claude/plans/."""
+
+    BINDINGS = [
+        Binding("enter", "show_detail", "Detail"),
+        Binding("r", "reload", "Reload"),
+        Binding("1", "filter_all", "All"),
+        Binding("2", "filter_draft", "Drafts"),
+        Binding("3", "filter_approved", "Approved"),
+    ]
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._filter = None
+        self._plans: list = []
+        self._last_refresh = 0.0
+
+    def compose(self) -> ComposeResult:
+        yield Static(id="plans-header")
+        yield DataTable(id="plans-table")
+
+    def load_content(self):
+        plans = _get_claude_plans(limit=100, status=self._filter)
+        self._plans = plans or []
+        self._last_refresh = time.time()
+
+        # Compute counts from unfiltered fetch if filter active
+        if self._filter is None:
+            all_plans = self._plans
+        else:
+            all_plans = _get_claude_plans(limit=200, status=None)
+
+        total = len(all_plans)
+        drafts = sum(1 for p in all_plans if p.get("status") == "draft")
+        approved = sum(1 for p in all_plans if p.get("status") == "approved")
+        abandoned = sum(1 for p in all_plans if p.get("status") == "abandoned")
+
+        filter_label = self._filter or "all"
+        self.query_one("#plans-header", Static).update(
+            f"[bold]Plans[/bold]  [dim]{total} total · "
+            f"[yellow]{drafts} drafts[/yellow] · "
+            f"[green]{approved} approved[/green] · "
+            f"{abandoned} abandoned · filter: {filter_label}[/dim]\n"
+            f"[dim]1=All  2=Drafts  3=Approved  r=Reload  Enter=Detail[/dim]"
+        )
+
+        dt = self.query_one("#plans-table", DataTable)
+        dt.clear(columns=True)
+        dt.cursor_type = "row"
+        dt.zebra_stripes = True
+        dt.add_column("Plan", width=28)
+        dt.add_column("Title", width=36)
+        dt.add_column("Session", width=12)
+        dt.add_column("Status", width=10)
+        dt.add_column("Updated", width=14)
+        dt.add_column("Preview")
+
+        now_utc = datetime.now(timezone.utc)
+        for i, p in enumerate(self._plans):
+            slug = p.get("plan_slug", "") or ""
+            title = p.get("title", "") or slug
+            session = p.get("session_id", "") or ""
+            status = p.get("status", "draft")
+            preview = (p.get("preview") or "").strip()
+
+            # Age display
+            updated = p.get("updated_at", "")
+            age_str = "\u2014"
+            if updated:
+                try:
+                    ts = datetime.fromisoformat(updated.replace("Z", "+00:00"))
+                    delta_min = (now_utc - ts).total_seconds() / 60
+                    if delta_min < 60:
+                        age_str = f"{delta_min:.0f}m ago"
+                    elif delta_min < 1440:
+                        age_str = f"{delta_min / 60:.0f}h ago"
+                    else:
+                        age_str = f"{delta_min / 1440:.0f}d ago"
+                except Exception:
+                    age_str = updated[:14]
+
+            if status == "draft":
+                status_style = "yellow"
+            elif status == "approved":
+                status_style = "green"
+            elif status == "abandoned":
+                status_style = "dim"
+            else:
+                status_style = "white"
+
+            dt.add_row(
+                Text(slug[:28], style="white"),
+                Text(title[:36], style="white"),
+                Text(session[:12], style="cyan"),
+                Text(status, style=status_style),
+                Text(age_str, style="dim"),
+                Text(preview[:120], style="dim"),
+                key=f"plan-{i}",
+            )
+
+        if not self._plans:
+            dt.add_row(
+                Text("\u2014", style="dim"),
+                Text("No plans found", style="dim"),
+                Text("", style="dim"),
+                Text("", style="dim"),
+                Text("", style="dim"),
+                Text("", style="dim"),
+            )
+
+    def refresh_content(self):
+        now = time.time()
+        if (now - self._last_refresh) > 20:
+            self.load_content()
+
+    def action_show_detail(self):
+        dt = self.query_one("#plans-table", DataTable)
+        try:
+            row_key = dt.coordinate_to_cell_key(dt.cursor_coordinate).row_key
+            key_val = str(row_key.value) if hasattr(row_key, 'value') else str(row_key)
+        except Exception:
+            return
+        if not key_val.startswith("plan-"):
+            return
+        try:
+            idx = int(key_val.split("-")[1])
+            plan = self._plans[idx]
+        except (IndexError, ValueError):
+            return
+        # Fetch full content from cache/Supabase (already in _plans payload)
+        self.app.push_screen(PlanDetailScreen(plan))
+
+    def on_data_table_row_selected(self, event):
+        self.action_show_detail()
+
+    def action_reload(self):
+        _get_claude_plans(limit=100, status=self._filter, force=True)
+        self.load_content()
+
+    def action_filter_all(self):
+        self._filter = None
+        self.load_content()
+
+    def action_filter_draft(self):
+        self._filter = "draft"
+        self.load_content()
+
+    def action_filter_approved(self):
+        self._filter = "approved"
+        self.load_content()
+
+
 class AdvisorView(LazyView):
     """Token Watch Advisor Agent — actionable intelligence synthesis."""
 
@@ -8535,6 +8757,7 @@ class ClaudeWatchApp(App):
         Binding("shift+tab", "focus_previous", "Prev panel", show=False),
         Binding("R", "reload_build", "Reload", show=False),
         Binding("E", "show_expensive_turns", "Expensive"),
+        Binding("P", "show_plans", "Plans"),
     ]
 
     _filter_text = ""
@@ -8582,6 +8805,7 @@ class ClaudeWatchApp(App):
             yield AnalyticsView(id="view-analytics")
             yield DispatchView(id="view-dispatch")
             yield ExpensiveTurnsView(id="view-expensive-turns")
+            yield PlansView(id="view-plans")
         yield Footer()
 
     def switch_view(self, view_id: str) -> None:
@@ -8616,6 +8840,7 @@ class ClaudeWatchApp(App):
             "view-dispatch": "nav-dispatch",
             "view-inbox": "nav-inbox",
             "view-expensive-turns": "nav-dashboard",
+            "view-plans": "nav-plans",
         }
         active_nav = nav_map.get(view_id, "")
         for btn in self.query("#nav-bar Button"):
@@ -8972,6 +9197,9 @@ class ClaudeWatchApp(App):
     def action_show_expensive_turns(self):
         self.switch_view("view-expensive-turns")
 
+    def action_show_plans(self):
+        self.switch_view("view-plans")
+
     def _ensure_cycle_list(self):
         """Load cycle list if not loaded."""
         if not self._cycle_list:
@@ -9036,6 +9264,7 @@ class ClaudeWatchApp(App):
             "nav-advisor": "view-advisor",
             "nav-analytics": "view-analytics",
             "nav-dispatch": "view-dispatch",
+            "nav-plans": "view-plans",
         }
         btn_id = event.button.id or ""
         if not btn_id.startswith("nav-"):

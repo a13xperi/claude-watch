@@ -4077,6 +4077,47 @@ def _get_build_ledger(days=1, limit=100, cycle_id=None, source=None):
         _log.warning("__get_build_ledger: %s", e)
         return {"items": [], "by_company": {}, "stats": {"total": 0, "untested": 0, "decisions": 0, "sessions": 0, "projects": 0}}
 
+_plans_cache = (0.0, None)
+_PLANS_CACHE_TTL = 15
+
+
+def _get_claude_plans(limit=100, status=None, session_id=None, force=False):
+    """Fetch Claude Code plan files from Supabase `plans` table.
+
+    Returns a list of dicts (newest first). Empty list on error.
+    Has a 15s cache; pass force=True to bust it. Uses stale cache on timeout.
+    """
+    import urllib.request
+    global _plans_cache
+    now = time.time()
+    cache_key = (limit, status, session_id)
+    ts, payload = _plans_cache
+    if (not force) and payload is not None and payload.get("_key") == cache_key and (now - ts) < _PLANS_CACHE_TTL:
+        return payload.get("rows", [])
+    try:
+        url = f"{_SUPABASE_URL}/plans?select=*&order=updated_at.desc&limit={int(limit)}"
+        if status:
+            url += f"&status=eq.{status}"
+        if session_id:
+            url += f"&session_id=eq.{session_id}"
+        req = urllib.request.Request(url, headers={
+            "apikey": __SUPABASE_KEY,
+            "Authorization": f"Bearer {__SUPABASE_KEY}",
+        })
+        with urllib.request.urlopen(req, timeout=4) as resp:
+            rows = json.loads(resp.read())
+        if not isinstance(rows, list):
+            rows = []
+        _plans_cache = (now, {"_key": cache_key, "rows": rows})
+        return rows
+    except Exception as e:
+        _log.warning("_get_claude_plans: %s", e)
+        # Return stale cache if available
+        if payload is not None and payload.get("_key") == cache_key:
+            return payload.get("rows", [])
+        return []
+
+
 def _get_recovery_stats():
     """Return recovery item counts grouped by project and item_type."""
     import urllib.request
