@@ -6983,7 +6983,9 @@ class AdvisorDetailScreen(Screen):
         Binding("q", "pop_screen", "Back"),
         Binding("t", "mark_tested", "Tested"),
         Binding("f", "mark_failed", "Failed"),
+        Binding("a", "mark_all_tested", "Mark All"),
         Binding("o", "open_github", "GitHub"),
+        Binding("x", "copy_action", "Copy Action"),
     ]
 
     def __init__(self, insight, **kwargs):
@@ -7015,7 +7017,14 @@ class AdvisorDetailScreen(Screen):
             f"[bold]Insight:[/bold] {ins.message}",
         ]
         if ins.action:
-            summary_lines.append(f"[bold]Action:[/bold]  [dim]{ins.action}[/dim]")
+            # CONTEXT actions are shell commands or concrete fixes — render them
+            # prominently so the user can immediately copy-run them.
+            if ins.category == "CONTEXT":
+                summary_lines.append(
+                    f"[bold yellow]>> FIX:[/bold yellow] [bold]{ins.action}[/bold]"
+                )
+            else:
+                summary_lines.append(f"[bold]Action:[/bold]  [dim]{ins.action}[/dim]")
         self.query_one("#adetail-summary", Static).update("\n".join(summary_lines))
 
         table = self.query_one("#adetail-table", DataTable)
@@ -7027,8 +7036,18 @@ class AdvisorDetailScreen(Screen):
             self._render_test_debt(table)
             footer.update(
                 "[dim]t[/dim]=mark tested  [dim]f[/dim]=mark failed  "
+                "[bold yellow]a[/bold yellow]=mark ALL tested  "
                 "[dim]o[/dim]=open GitHub  [dim]q/Esc[/dim]=back"
             )
+        elif ins.category == "CONTEXT":
+            self._render_context(table)
+            if (ins.action or "").strip():
+                footer.update(
+                    "[bold yellow]x[/bold yellow]=copy action to clipboard  "
+                    "[dim]q/Esc[/dim]=back"
+                )
+            else:
+                footer.update("[dim]q/Esc=back[/dim]")
         else:
             self._render_generic(table)
             footer.update("[dim]q/Esc=back[/dim]")
@@ -7169,6 +7188,64 @@ class AdvisorDetailScreen(Screen):
     def action_mark_failed(self):
         self._mark_selected("failed")
 
+    def action_mark_all_tested(self):
+        """Bulk-mark every TEST_DEBT item in the current drill-down as tested.
+
+        Saves the user from pressing `t` 50+ times on the post-deploy sweep.
+        Reloads from Supabase at the end so the list reflects reality.
+        """
+        from token_watch_data import _update_test_item
+        if self._insight.category != "TEST_DEBT":
+            self.notify("Not a TEST_DEBT drill-down", severity="warning")
+            return
+
+        items = list(self._test_items)
+        total = len(items)
+        if not total:
+            self.notify("Nothing to mark", severity="warning")
+            return
+
+        self.notify(f"Marking {total} items tested...")
+        ok_count = 0
+        fail_count = 0
+        for item in items:
+            item_id = item.get("id", "")
+            if not item_id:
+                fail_count += 1
+                continue
+            try:
+                if _update_test_item(item_id, "pass"):
+                    ok_count += 1
+                else:
+                    fail_count += 1
+            except Exception:
+                fail_count += 1
+
+        if fail_count:
+            self.notify(
+                f"Marked {ok_count}/{total} tested · {fail_count} failed",
+                severity="warning",
+            )
+        else:
+            self.notify(f"Marked all {ok_count} items tested")
+        self._reload_test_debt()
+        if not self._test_items:
+            self.notify("All clear — press q to go back")
+
+    def action_copy_action(self):
+        """Copy the insight's action (shell command, note, etc.) to the clipboard."""
+        ins = self._insight
+        action = (ins.action or "").strip()
+        if not action:
+            self.notify("No action to copy", severity="warning")
+            return
+        import subprocess
+        try:
+            subprocess.run(["pbcopy"], input=action.encode(), check=True)
+            self.notify("Copied to clipboard")
+        except Exception:
+            self.notify("Copy failed", severity="error")
+
     def action_open_github(self):
         """Open the selected item's commit on GitHub in the browser."""
         if self._insight.category != "TEST_DEBT":
@@ -7200,6 +7277,32 @@ class AdvisorDetailScreen(Screen):
             self.notify(f"Opening {repo}@{sha}")
         else:
             self.notify("No commit SHA/project on row", severity="warning")
+
+    def _render_context(self, table: DataTable):
+        """CONTEXT insights = ~/CONTEXT.md blockers. Show the fix prominently."""
+        ins = self._insight
+        table.clear(columns=True)
+        table.add_column("Field", width=16)
+        table.add_column("Value")
+
+        action = (ins.action or "").strip()
+        if action:
+            table.add_row(
+                Text("FIX", style="bold yellow"),
+                Text(action, style="bold"),
+            )
+            table.add_row(
+                Text("", style="dim"),
+                Text("Press 'x' to copy to clipboard", style="italic dim"),
+            )
+
+        table.add_row(Text("Title", style="bold"), Text(ins.title or "—"))
+        table.add_row(Text("Message", style="bold"), Text(ins.message or "—"))
+        table.add_row(Text("Source", style="bold"), Text(ins.source or "—"))
+        data = getattr(ins, "data", {}) or {}
+        if data:
+            for k, v in data.items():
+                table.add_row(Text(f"data.{k}", style="dim"), Text(str(v)))
 
     def _render_generic(self, table: DataTable):
         ins = self._insight
