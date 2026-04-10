@@ -8063,3 +8063,110 @@ def _get_delphi_recent_builds_sync():
         if cached_data is not None:
             return cached_data
         return []
+
+
+def _get_project_stats(days=7):
+    """Return per-project token usage + build activity for the last N days.
+
+    Joins:
+      - build_ledger (commits, untested, last_commit, company) via REST
+      - local tool-usage ledger (tokens, cost) via _load_ledger() + _index_cache
+
+    Returns: dict {project: {company, commits, tokens, cost, untested,
+                             last_commit_dt, commits_recent_2d, item_types}}
+    """
+    from datetime import datetime, timedelta, timezone
+    result = {}
+
+    # --- Part 1: build_ledger via REST ---
+    try:
+        cutoff_iso = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        url = (
+            f"{_SUPABASE_URL}/build_ledger"
+            f"?select=project,company,created_at,item_type,test_status,session_id"
+            f"&created_at=gte.{cutoff_iso}"
+            f"&order=created_at.desc"
+            f"&limit=2000"
+        )
+        req = urllib.request.Request(url, headers={
+            "apikey": __SUPABASE_KEY,
+            "Authorization": f"Bearer {__SUPABASE_KEY}",
+        })
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            rows = json.loads(resp.read())
+    except Exception as e:
+        _log.warning("_get_project_stats build_ledger: %s", e)
+        rows = []
+
+    two_days_ago = datetime.now(timezone.utc) - timedelta(days=2)
+
+    for r in rows:
+        proj = (r.get("project") or "general").strip() or "general"
+        co = (r.get("company") or "").strip().lower() or "personal"
+        entry = result.setdefault(proj, {
+            "company": co,
+            "commits": 0,
+            "commits_recent_2d": 0,
+            "tokens": 0,
+            "cost": 0.0,
+            "untested": 0,
+            "last_commit_dt": None,
+            "item_types": {},
+        })
+        # Prefer a non-empty company over default
+        if co and entry["company"] == "personal":
+            entry["company"] = co
+        entry["commits"] += 1
+        if r.get("test_status") == "untested":
+            entry["untested"] += 1
+        itype = r.get("item_type") or "unknown"
+        entry["item_types"][itype] = entry["item_types"].get(itype, 0) + 1
+        ts_raw = r.get("created_at") or ""
+        try:
+            dt = datetime.fromisoformat(ts_raw.replace("Z", "+00:00"))
+            if entry["last_commit_dt"] is None or dt > entry["last_commit_dt"]:
+                entry["last_commit_dt"] = dt
+            if dt >= two_days_ago:
+                entry["commits_recent_2d"] += 1
+        except Exception:
+            pass
+
+    # --- Part 2: local ledger -> per-project tokens/cost ---
+    try:
+        with _index_lock:
+            snapshot = dict(_index_cache)
+        entries = _load_ledger()
+        cutoff_dt = datetime.now(timezone.utc) - timedelta(days=days)
+        for e in entries:
+            if e.get("type") != "tool_use":
+                continue
+            ts_raw = e.get("ts") or ""
+            try:
+                dt = datetime.fromisoformat(ts_raw.replace("Z", "+00:00"))
+            except Exception:
+                continue
+            if dt < cutoff_dt:
+                continue
+            sid = e.get("session", "")
+            idx_entry = snapshot.get(sid, {}) if sid else {}
+            proj = (idx_entry.get("project") or "").strip()
+            if not proj or proj == "—":
+                continue  # skip unattributed
+            out_tok = int(e.get("output_tokens") or 0)
+            cost = _estimate_cost(out_tok, e.get("model") or "")
+            ent = result.setdefault(proj, {
+                "company": "personal",
+                "commits": 0,
+                "commits_recent_2d": 0,
+                "tokens": 0,
+                "cost": 0.0,
+                "untested": 0,
+                "last_commit_dt": None,
+                "item_types": {},
+            })
+            ent["tokens"] += out_tok
+            ent["cost"] += cost
+    except Exception as e:
+        _log.warning("_get_project_stats ledger: %s", e)
+
+    return result

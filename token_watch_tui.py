@@ -6177,6 +6177,242 @@ class MissionControlView(LazyView):
         self.refresh_content()
 
 
+class ProjectsView(LazyView):
+    """Projects — per-project time/token spend with status and recommendations."""
+
+    def refresh_content(self):
+        now = time.time()
+        if not hasattr(self, '_last_refresh') or (now - self._last_refresh) > 30:
+            self._last_refresh = now
+            try:
+                self.query_one("#projects-table", DataTable).clear(columns=True)
+                self.load_content()
+            except Exception:
+                pass
+
+    def compose(self) -> ComposeResult:
+        yield Static(id="projects-header")
+        yield DataTable(id="projects-table")
+        yield Static(id="projects-recs")
+
+    def load_content(self):
+        from datetime import datetime, timezone
+        from token_watch_data import _get_project_stats
+
+        try:
+            stats = _get_project_stats(days=7)
+        except Exception:
+            stats = {}
+
+        now_utc = datetime.now(timezone.utc)
+
+        # Compute header totals
+        total_tokens = sum(v.get("tokens", 0) for v in stats.values())
+        total_cost = sum(v.get("cost", 0.0) for v in stats.values())
+        n_projects = len(stats)
+        self.query_one("#projects-header", Static).update(
+            f"[bold]Projects[/bold]  [dim]last 7 days  ·  "
+            f"{n_projects} projects  ·  "
+            f"{total_tokens/1000:.0f}k total tokens  ·  "
+            f"${total_cost:.2f}[/dim]"
+        )
+
+        table = self.query_one("#projects-table", DataTable)
+        table.cursor_type = "row"
+        table.zebra_stripes = True
+        table.add_column("Company", width=10)
+        table.add_column("Project", width=16)
+        table.add_column("Commits", width=8)
+        table.add_column("Tokens", width=10)
+        table.add_column("Cost", width=8)
+        table.add_column("Bar", width=22)
+        table.add_column("Untested", width=9)
+        table.add_column("Status", width=14)
+
+        self._row_data = {}  # tooltip + selection data
+
+        if not stats:
+            table.add_row(
+                Text("—", style="dim"),
+                Text("(no data)", style="dim italic"),
+                Text(""), Text(""), Text(""), Text(""), Text(""),
+                Text("NO_DATA", style="dim"),
+            )
+            self.query_one("#projects-recs", Static).update(
+                "[dim]No project activity in the last 7 days.[/dim]"
+            )
+            return
+
+        # Rank by tokens for bar chart scale (fallback to commits if no tokens)
+        max_tokens = max((v.get("tokens", 0) for v in stats.values()), default=0)
+        max_commits = max((v.get("commits", 0) for v in stats.values()), default=0)
+        use_commits_for_bar = (max_tokens == 0 and max_commits > 0)
+
+        # Sort projects by tokens desc, then commits desc
+        ordered = sorted(
+            stats.items(),
+            key=lambda kv: (kv[1].get("tokens", 0), kv[1].get("commits", 0)),
+            reverse=True,
+        )
+
+        for proj, d in ordered:
+            company_raw = d.get("company", "") or ""
+            co_label, co_style = _project_to_company(proj, company_raw)
+            commits = d.get("commits", 0)
+            commits_2d = d.get("commits_recent_2d", 0)
+            tokens = d.get("tokens", 0)
+            cost = d.get("cost", 0.0)
+            untested = d.get("untested", 0)
+            last_dt = d.get("last_commit_dt")
+
+            # Days since last commit
+            days_since = None
+            if last_dt is not None:
+                try:
+                    days_since = (now_utc - last_dt).total_seconds() / 86400.0
+                except Exception:
+                    days_since = None
+
+            # Status determination — HOT uses precise 2-day commit count per spec
+            is_hot = (commits_2d > 3)
+            is_stalled = (days_since is not None and days_since > 4 and commits > 0)
+            needs_tests = untested > 5
+
+            if commits == 0 and tokens == 0:
+                status, status_style = "NO_DATA", "dim"
+            elif needs_tests:
+                status, status_style = "NEEDS_TESTS", "red"
+            elif is_hot:
+                status, status_style = "HOT", "green"
+            elif is_stalled:
+                status, status_style = "STALLED", "yellow"
+            else:
+                status, status_style = "OK", "dim"
+
+            # ASCII bar (20 cells wide)
+            bar_scale = (tokens if not use_commits_for_bar else commits)
+            bar_max = (max_tokens if not use_commits_for_bar else max_commits) or 1
+            filled = int(round(20 * bar_scale / bar_max)) if bar_max > 0 else 0
+            bar = "\u2588" * filled + " " * (20 - filled)
+
+            tok_str = f"{tokens/1000:.1f}k" if tokens >= 1000 else str(tokens)
+            cost_str = f"${cost:.2f}" if cost > 0 else "—"
+
+            row_key = f"proj|{proj}"
+            table.add_row(
+                Text(co_label, style=co_style),
+                Text(proj[:16]),
+                Text(str(commits), style="cyan"),
+                Text(tok_str),
+                Text(cost_str, style="green" if cost > 0 else "dim"),
+                Text(bar, style=co_style),
+                Text(str(untested), style="red" if untested > 5 else "dim"),
+                Text(status, style=status_style),
+                key=row_key,
+            )
+            self._row_data[row_key] = {
+                "project": proj,
+                "company": company_raw or co_label,
+                "tokens": tokens,
+                "cost": cost,
+                "commits": commits,
+                "commits_2d": commits_2d,
+                "untested": untested,
+                "last_dt": last_dt,
+                "days_since": days_since,
+                "status": status,
+            }
+
+        # Recommendations panel
+        recs = self._build_recommendations(stats)
+        if recs:
+            self.query_one("#projects-recs", Static).update(
+                "[bold]Recommendations[/bold]\n" + "\n".join(f"• {r}" for r in recs[:4])
+            )
+        else:
+            self.query_one("#projects-recs", Static).update(
+                "[dim]No recommendations — all projects healthy.[/dim]"
+            )
+
+    def _build_recommendations(self, stats):
+        from datetime import datetime, timezone
+        recs = []
+        now_utc = datetime.now(timezone.utc)
+
+        # Most active by commits
+        if stats:
+            top = max(stats.items(), key=lambda kv: kv[1].get("commits", 0))
+            if top[1].get("commits", 0) > 0:
+                recs.append(
+                    f"[green]{top[0]}[/green] most active this week "
+                    f"({top[1]['commits']} commits)"
+                )
+
+        # Untested rollup
+        heavy_untested = sorted(
+            ((p, d) for p, d in stats.items() if d.get("untested", 0) > 5),
+            key=lambda kv: kv[1]["untested"],
+            reverse=True,
+        )
+        for p, d in heavy_untested[:2]:
+            recs.append(
+                f"[red]{p}[/red] has {d['untested']} untested items "
+                f"— run test verification before next ship"
+            )
+
+        # Stalled projects
+        for p, d in stats.items():
+            last_dt = d.get("last_commit_dt")
+            if last_dt is None or d.get("commits", 0) == 0:
+                continue
+            try:
+                days_since = (now_utc - last_dt).total_seconds() / 86400.0
+            except Exception:
+                continue
+            if days_since > 4:
+                recs.append(
+                    f"[yellow]{p}[/yellow] stalled {int(days_since)} days — needs a session"
+                )
+                if len(recs) >= 4:
+                    break
+
+        # Biggest token spender
+        token_sorted = sorted(
+            stats.items(), key=lambda kv: kv[1].get("tokens", 0), reverse=True
+        )
+        if token_sorted and token_sorted[0][1].get("tokens", 0) > 0:
+            p, d = token_sorted[0]
+            recs.append(
+                f"{p} burned {d['tokens']/1000:.0f}k tokens (${d['cost']:.2f})"
+            )
+
+        return recs
+
+    def on_data_table_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
+        try:
+            table = self.query_one("#projects-table", DataTable)
+        except Exception:
+            return
+        key = str(event.row_key.value or "")
+        if not key:
+            table.tooltip = None
+            return
+        d = getattr(self, "_row_data", {}).get(key)
+        if not d:
+            table.tooltip = None
+            return
+        parts = [d["project"]]
+        last_dt = d.get("last_dt")
+        if last_dt is not None:
+            parts.append(f"last commit: {last_dt.strftime('%Y-%m-%d %H:%M UTC')}")
+        parts.append(f"tokens: {d['tokens']:,}  ·  ${d['cost']:.2f}")
+        parts.append(
+            f"commits: {d['commits']} (2d: {d['commits_2d']})  ·  "
+            f"untested: {d['untested']}  ·  {d['status']}"
+        )
+        table.tooltip = "\n".join(parts)
+
+
 class DelphiView(LazyView):
     """Delphi — token/activity usage scoped to Atlas + Paperclip."""
 
@@ -7995,6 +8231,7 @@ class ClaudeWatchApp(App):
         Binding("A", "toggle_accounts", "Accounts"),
         Binding("w", "show_wire", "Wire"),
         Binding("M", "show_mission", "Mission"),
+        Binding("j", "show_projects_stats", "Projects"),
         Binding("shift+d", "show_delphi", "Delphi"),
         Binding("v", "show_advisor", "TW Advisor"),
         Binding("i", "show_inbox", "Inbox"),
@@ -8048,6 +8285,7 @@ class ClaudeWatchApp(App):
             yield TestQueueView(id="view-test")
             yield AuditView(id="view-audit")
             yield MissionControlView(id="view-mission")
+            yield ProjectsView(id="view-proj-stats")
             yield DelphiView(id="view-delphi")
             yield WireView(id="view-wire")
             yield RulesView(id="view-rules")
@@ -8083,6 +8321,7 @@ class ClaudeWatchApp(App):
             "view-audit": "nav-audit",
             "view-wire": "nav-wire",
             "view-mission": "nav-mission",
+            "view-proj-stats": "nav-mission",
             "view-delphi": "nav-delphi",
             "view-advisor": "nav-advisor",
             "view-analytics": "nav-analytics",
@@ -8423,6 +8662,9 @@ class ClaudeWatchApp(App):
 
     def action_show_mission(self):
         self.switch_view("view-mission")
+
+    def action_show_projects_stats(self):
+        self.switch_view("view-proj-stats")
 
     def action_show_delphi(self):
         self.switch_view("view-delphi")

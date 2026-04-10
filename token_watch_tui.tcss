@@ -487,3 +487,10 @@ DataTable > .datatable--header {
 #adetail-table {
     height: 1fr;
 }
+
+/* -- Projects tab layout -- */
+#projects-table {
+    height: 1fr;
+}
+#projects-header { height: auto; padding: 0 1; }
+#projects-recs { height: auto; padding: 1 2; background: $surface; margin-top: 1; }
