@@ -6860,7 +6860,7 @@ class AdvisorView(LazyView):
 
     # Category → view_id map for smart "jump to the relevant view" navigation.
     _NAV_MAP = {
-        "CYCLE": "view-sessions",
+        "CYCLE": "view-cycles",
         "CAPACITY": "view-capacity",
         "EFFICIENCY": "view-sessions",
         "PIPELINE": "view-dispatch",
