@@ -6761,6 +6761,95 @@ class AuditView(LazyView):
         self.notify(f"Imported {count} items from sessions across all cycles")
 
 
+class ClaimConfirmScreen(Screen):
+    """Quick confirm dialog for auto-claiming the next ready task for a project.
+
+    Lives one keystroke from an Advisor PIPELINE row: Enter to claim,
+    Esc to cancel. Keeps the user out of the Dispatch → cursor → x dance.
+    """
+
+    BINDINGS = [
+        Binding("enter", "confirm", "Claim"),
+        Binding("escape", "cancel", "Cancel"),
+        Binding("q", "cancel", "Cancel"),
+    ]
+
+    def __init__(self, project: str, reason: str = "", **kwargs):
+        super().__init__(**kwargs)
+        self._project = project or ""
+        self._reason = reason or ""
+
+    def compose(self) -> ComposeResult:
+        proj = self._project or "(unknown)"
+        reason = self._reason or ""
+        body = (
+            "[bold]Claim next ready task[/bold]\n\n"
+            f"[cyan]Project:[/cyan]  [bold]{proj}[/bold]\n"
+        )
+        if reason:
+            body += f"[dim]{reason}[/dim]\n"
+        body += (
+            "\n"
+            "[green]Enter[/green] = claim the first ready task\n"
+            "[dim]Esc[/dim]   = cancel"
+        )
+        yield Static(body, id="claim-confirm-body")
+
+    def action_confirm(self):
+        from token_watch_data import _get_dispatch_queue_sync, _dispatch_claim_task
+        self.app.pop_screen()
+        project = (self._project or "").strip().lower()
+        try:
+            queue_data = _get_dispatch_queue_sync() or {}
+        except Exception as e:
+            self.app.notify(f"Fetch failed: {e}", severity="error")
+            return
+
+        queue = queue_data.get("queue", []) or []
+        # Prefer exact-project matches, fall back to any ready task if project unknown.
+        candidates = []
+        if project:
+            candidates = [
+                t for t in queue
+                if (t.get("project") or "").strip().lower() == project
+            ]
+            if not candidates:
+                # Loose match on substring (e.g. "atlas" matches "atlas-portal")
+                candidates = [
+                    t for t in queue
+                    if project in (t.get("project") or "").strip().lower()
+                    or (t.get("project") or "").strip().lower() in project
+                ]
+        if not candidates:
+            candidates = queue
+
+        if not candidates:
+            self.app.notify("No ready tasks to claim", severity="warning")
+            return
+
+        task = candidates[0]
+        task_id = task.get("id")
+        task_name = (task.get("task_name") or "")[:40]
+        if task_id is None:
+            self.app.notify("Task has no id", severity="error")
+            return
+
+        try:
+            ok = _dispatch_claim_task(task_id)
+        except Exception as e:
+            self.app.notify(f"Claim failed: {e}", severity="error")
+            return
+
+        if ok:
+            self.app.notify(f"Claimed #{task_id} — {task_name}")
+        else:
+            self.app.notify("Claim failed — task may already be taken",
+                            severity="warning")
+
+    def action_cancel(self):
+        self.app.pop_screen()
+
+
 class AdvisorView(LazyView):
     """Token Watch Advisor Agent — actionable intelligence synthesis."""
 
@@ -6933,10 +7022,39 @@ class AdvisorView(LazyView):
         "PIPELINE": "view-dispatch",
     }
 
+    def _resolve_pipeline_project(self, ins):
+        """Best-effort extraction of a project name from a PIPELINE insight."""
+        data = getattr(ins, "data", {}) or {}
+        # cross_session_work_gap → data.gap = {"atlas-backend": 3, ...}
+        gap = data.get("gap") or {}
+        if isinstance(gap, dict) and gap:
+            # Pick the project with the most ready work.
+            return sorted(gap.items(), key=lambda kv: -kv[1])[0][0]
+        # blocked_tasks, unclaimed_continuations, etc. rarely carry a project;
+        # fall back to scanning the message.
+        import re
+        msg = (ins.message or "") + " " + (ins.title or "")
+        m = re.search(r"\b(atlas[-\w]*|token-watch|paperclip|frank-pilot|openclaw|kaa|battlestation)\b", msg, re.I)
+        if m:
+            return m.group(1).lower()
+        return ""
+
     def _handle_drill_down(self, ins):
         """Route an insight to the right view, or fall back to the generic screen."""
         if ins is None:
             return
+
+        # PIPELINE → one-keystroke auto-claim confirm instead of jumping to
+        # Dispatch and making the user hunt for a row to press `x` on.
+        if ins.category == "PIPELINE":
+            project = self._resolve_pipeline_project(ins)
+            reason = (ins.message or ins.title or "")[:100]
+            try:
+                self.app.push_screen(ClaimConfirmScreen(project, reason))
+                return
+            except Exception:
+                pass  # fall through to legacy nav
+
         view_id = self._NAV_MAP.get(ins.category)
         if view_id:
             try:
