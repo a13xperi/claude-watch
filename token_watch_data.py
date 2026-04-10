@@ -2898,15 +2898,18 @@ def _get_engine_status():
     for hs in health.get("claude_sessions", []):
         health_by_pid[hs["pid"]] = hs
 
-    # Collect local SIDs for peer dedup; build repo lookup from session_locks
+    # Collect local SIDs for peer dedup; build repo + account lookup from session_locks
     local_sids = set()  # type: set
     repo_by_sid = {}  # type: Dict[str, str]
+    account_by_sid = {}  # type: Dict[str, str]
     for item in sessions_raw:
         local_sids.add("cc-{}".format(item[0]))
     for p in peers:
         psid = p.get("session_id", "")
         if psid and p.get("repo"):
             repo_by_sid[psid] = p["repo"]
+        if psid and p.get("account"):
+            account_by_sid[psid] = p["account"]
     remote_peers = [p for p in peers if p.get("session_id", "") not in local_sids]
 
     # Parse delta string to numeric percentage
@@ -2979,6 +2982,7 @@ def _get_engine_status():
             "health": health_score,
             "health_reason": health_reason,
             "repo": repo_by_sid.get(sid, ""),
+            "account": account_by_sid.get(sid, ""),
         })
 
     # System pressure detection

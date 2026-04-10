@@ -695,10 +695,14 @@ class EngineTable(DataTable):
             except Exception:
                 used_text = Text(delta, style=color)
 
+            # Per-session account from session_locks (falls back to active account)
+            sess_acct = session.get("account") or active_label
+            sess_acct_color = acct_color_map.get(sess_acct, "dim") if sess_acct else acct_color_local
+
             self.add_row(
                 Text(start_str, style="dim"),
                 Text.from_markup(f"[{dot_color}]● [/{dot_color}][cyan]{sid}[/cyan]"),
-                Text(active_label, style=acct_color_local),
+                Text(sess_acct, style=sess_acct_color),
                 Text(source, style=src_color),
                 Text(co_name, style=co_style),
                 Text(project, style="dim"),
