@@ -7514,10 +7514,11 @@ class DispatchView(LazyView):
                 agents = [t for t in info["tasks"] if t.get("status") == "in_progress"]
                 agent_str = ""
                 if agents:
-                    parts = [f"{t.get('claimed_by', '?')}: #{t['id']}" for t in agents[:2]]
+                    parts = [f"{_rich_escape(str(t.get('claimed_by', '?')))}: #{_rich_escape(str(t.get('id', '?')))}" for t in agents[:2]]
                     agent_str = f"  [{color}]{', '.join(parts)}[/{color}]"
                 blk_str = f"  [dim]{blocked} blocked[/dim]" if blocked else ""
-                lines.append(f"  [{color}]{lane_name:<22}[/{color}] {bar} {built}/{total} built{agent_str}{blk_str}")
+                safe_lane = _rich_escape(lane_name)
+                lines.append(f"  [{color}]{safe_lane:<22}[/{color}] {bar} {built}/{total} built{agent_str}{blk_str}")
             lane_widget.update("\n".join(lines))
             lane_widget.display = True
         else:
@@ -7671,27 +7672,30 @@ class DispatchView(LazyView):
 
         self._bug_items = []
         for bug in bug_data["bugs"]:
-            self._bug_items.append(bug)
-            age = self._format_age(bug.get("created_at", ""))
-            found = bug.get("found_by", "?")
-            if found and len(found) > 12:
-                found = found[:10] + ".."
-            status = bug.get("status", "open")
-            status_styles = {
-                "open": "[red]OPEN[/red]",
-                "in_progress": "[yellow]WIP[/yellow]",
-                "fixed": "[green]FIXED[/green]",
-                "verified": "[bold green]DONE[/bold green]",
-            }
-            bug_table.add_row(
-                f"BUG-{bug.get('bug_number', '?')}",
-                sev_styles.get(bug.get("severity", "medium"), "?"),
-                status_styles.get(status, status),
-                f"[cyan]{bug.get('project', '?')}[/cyan]",
-                (bug.get("title", "?")[:36] + "..") if len(bug.get("title", "")) > 38 else bug.get("title", "?"),
-                found,
-                age,
-            )
+            try:
+                self._bug_items.append(bug)
+                age = self._format_age(bug.get("created_at", ""))
+                found_raw = _safe_str(bug.get("found_by"), "?")
+                found = (found_raw[:10] + "..") if len(found_raw) > 12 else found_raw
+                status = bug.get("status", "open") or "open"
+                status_styles = {
+                    "open": "[red]OPEN[/red]",
+                    "in_progress": "[yellow]WIP[/yellow]",
+                    "fixed": "[green]FIXED[/green]",
+                    "verified": "[bold green]DONE[/bold green]",
+                }
+                bug_table.add_row(
+                    f"BUG-{_safe_str(bug.get('bug_number'), '?')}",
+                    sev_styles.get(bug.get("severity", "medium"), "?"),
+                    status_styles.get(status, status),
+                    f"[cyan]{_rich_escape(_safe_str(bug.get('project'), '?'))}[/cyan]",
+                    _safe_trunc(bug.get("title"), keep=36, limit=38),
+                    _rich_escape(found),
+                    age,
+                )
+            except Exception:
+                # Drop the bad row rather than abort the whole render.
+                continue
 
     def _format_age(self, created_at: str) -> str:
         if not created_at:
