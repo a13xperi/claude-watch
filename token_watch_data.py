@@ -2667,6 +2667,7 @@ def _get_burndown_data():
 
 _attribution_cache = None  # type: Optional[Dict]
 _attribution_cache_time = 0.0
+_attribution_cache_account = None  # type: Optional[str]
 
 _ATTR_COLORS = ["red", "dodgerblue", "green", "yellow", "magenta", "cyan", "dark_orange", "deep_pink"]
 
@@ -2674,11 +2675,20 @@ _ATTR_COLORS = ["red", "dodgerblue", "green", "yellow", "magenta", "cyan", "dark
 def _get_token_attribution():
     # type: () -> Dict[str, Any]
     """Compute per-session token consumption breakdown for current 5h window."""
-    global _attribution_cache, _attribution_cache_time
+    global _attribution_cache, _attribution_cache_time, _attribution_cache_account
     with _index_lock:
         snapshot = _index_cache
     now = time.time()
-    if _attribution_cache and now - _attribution_cache_time < 30:
+    # Invalidate cache if active account changed. Previously the cache
+    # persisted across a /switch-account, which combined with bug #112951
+    # (no account filter on _load_ledger) to freeze the Engine Used% column
+    # at the OLD account's attribution for up to 30 seconds after a switch.
+    current_account = _get_active_account()[0]
+    if (
+        _attribution_cache
+        and now - _attribution_cache_time < 30
+        and _attribution_cache_account == current_account
+    ):
         return _attribution_cache
 
     five, _, five_reset_ts, _ = _current_pct()
@@ -2694,8 +2704,15 @@ def _get_token_attribution():
         _log.debug("__get_token_attribution: %s", e)
         return {}
 
-    # Load ledger entries in window, filter to tool_use
-    entries = _load_ledger()
+    # Load ledger entries in window, filter to tool_use.
+    # Bug #112951: passing no account filter here mixed ledger entries across
+    # all accounts, so a session tagged with account B inherited five_pct
+    # jumps from account A's window (or vice versa) via the consecutive-delta
+    # computation. OpenClaw sessions were observed as +64-65% Used while the
+    # active account's own 5h window was only at 32%. Filtering to the active
+    # account aligns attribution with _current_pct (same denominator, same
+    # window), collapsing the impossible numbers.
+    entries = _load_ledger(account=current_account)
     window_entries = []  # type: List[Dict]
     for e in entries:
         if e.get("type") != "tool_use":
@@ -2866,6 +2883,7 @@ def _get_token_attribution():
 
     _attribution_cache = result
     _attribution_cache_time = now
+    _attribution_cache_account = current_account
     return result
 
 
