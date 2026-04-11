@@ -1,5 +1,5 @@
 """
-Token Watch data layer — shared by Rich and Textual versions.
+Token Window data layer — shared by Rich and Textual versions.
 All data fetching, caching, and computation lives here.
 """
 
@@ -77,23 +77,135 @@ def _safe_float(val, default=0.0):
         return default
 
 
+def _pid_alive(pid):
+    """Return True if pid is a live process.
+
+    Uses signal 0 (null probe). EPERM means the process exists but we
+    can't signal it (different uid) — still alive. ESRCH means no such
+    process — dead. Any other OSError or bad input → dead.
+    """
+    import errno
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except (ValueError, TypeError):
+        return False
+    except OSError as e:
+        # EPERM = exists but not signalable by us → alive
+        # ESRCH = no such process → dead
+        return e.errno == errno.EPERM
+
+
+def _read_active_statusline_debug():
+    """Return the statusline-debug payload for the currently-active account.
+
+    Each Claude Code session writes to /tmp/statusline-debug-{PID}.json (see
+    scripts/statusline-command.sh). This helper:
+      1. Resolves the active account label from ~/.claude/accounts.json.
+      2. Globs all /tmp/statusline-debug-*.json files.
+      3. Filters to files whose PID is still alive.
+      4. Filters to files whose injected ``account`` field matches the
+         active label (rejects stale writes from other-account sessions).
+      5. Returns the newest-by-mtime payload as a dict, or ``None``.
+
+    The legacy shared /tmp/statusline-debug.json path is consulted as a
+    last-resort fallback when no per-session file matches.
+    """
+    import glob
+    try:
+        active_label, _, _ = _get_active_account()
+    except Exception:
+        active_label = None
+
+    candidates = []  # list[(mtime, path, payload)]
+    try:
+        for path_str in glob.glob("/tmp/statusline-debug-*.json"):
+            p = Path(path_str)
+            # Extract PID from filename suffix, e.g. statusline-debug-12345.json
+            m = re.match(r"statusline-debug-(\d+)\.json$", p.name)
+            if not m:
+                continue
+            pid = int(m.group(1))
+            if not _pid_alive(pid):
+                continue
+            try:
+                mtime = p.stat().st_mtime
+                payload = json.loads(p.read_text())
+            except Exception:
+                continue
+            # Only trust writes from the currently-active account. Reject
+            # writes from sessions bound to a now-stale account token.
+            if active_label and active_label != "?":
+                if payload.get("account") != active_label:
+                    continue
+            # Require freshness — 5 minute cutoff (same as legacy logic)
+            if time.time() - mtime > 300:
+                continue
+            candidates.append((mtime, str(p), payload))
+    except Exception as e:
+        _log.debug("_read_active_statusline_debug glob: %s", e)
+
+    if candidates:
+        candidates.sort(key=lambda c: c[0], reverse=True)
+        return candidates[0][2]
+
+    # Last-resort: legacy shared path (predates per-session files, still written
+    # by statusline-command.sh when the session's bound account matches active).
+    try:
+        legacy = Path("/tmp/statusline-debug.json")
+        if legacy.exists() and time.time() - legacy.stat().st_mtime < 300:
+            payload = json.loads(legacy.read_text())
+            if active_label and active_label != "?":
+                # If legacy file has an injected account field, enforce it.
+                legacy_acct = payload.get("account")
+                if legacy_acct and legacy_acct != active_label:
+                    return None
+            return payload
+    except Exception as e:
+        _log.debug("_read_active_statusline_debug legacy: %s", e)
+
+    return None
+
+
 def _current_pct():
     """Returns (five, seven, five_reset_ts, seven_reset_ts).
 
-    Primary source: /tmp/statusline-debug.json (written by active session).
-    Fallback: Supabase account_capacity table (works without a session running).
+    Primary source: per-session /tmp/statusline-debug-{PID}.json files,
+    filtered by live PID + active account, newest-mtime wins. See
+    ``_read_active_statusline_debug`` for details.
+
+    Fallback: Supabase ``account_capacity`` table (works without a live session).
     """
     def _ts(raw):
         if isinstance(raw, (int, float)):
             return datetime.fromtimestamp(raw, tz=timezone.utc).isoformat()
         return raw or ""
 
-    # Primary: live statusline data (fresh = written within last 5 minutes)
+    # DEPRECATED safety net: account-switch override file. Predates the
+    # per-session statusline-debug-{PID}.json fix (2026-04-11). The new
+    # account-aware reader handles stale sessions correctly on its own, but
+    # we keep this check so manual overrides during rollout still work.
+    _switched_account = None
+    _switched_at = 0.0
     try:
-        debug_path = Path("/tmp/statusline-debug.json")
-        if debug_path.exists() and time.time() - debug_path.stat().st_mtime < 300:
-            d = json.loads(debug_path.read_text())
-            rl = d.get("rate_limits", {})
+        override_path = Path("/tmp/token-watch-account-override.json")
+        if override_path.exists():
+            _ov = json.loads(override_path.read_text())
+            _switched_account = _ov.get("account")
+            _switched_at = float(_ov.get("switched_at", 0))
+    except Exception:
+        pass
+
+    # Primary: active statusline debug payload (per-session + account-filtered)
+    try:
+        payload = _read_active_statusline_debug()
+        if payload:
+            # Enforce DEPRECATED switch-override guard on the chosen payload.
+            payload_acct = payload.get("account")
+            if _switched_account and payload_acct and payload_acct != _switched_account:
+                payload = None
+        if payload:
+            rl = payload.get("rate_limits", {}) or {}
             five = rl.get("five_hour", {}).get("used_percentage", "?")
             seven = rl.get("seven_day", {}).get("used_percentage", "?")
             five_reset = _ts(rl.get("five_hour", {}).get("resets_at", ""))
@@ -546,8 +658,14 @@ _ledger_cache_time = 0.0
 _ledger_cache = []
 
 
-def _load_ledger(last_n=None):
-    """Load ledger entries. Always loads all entries, caches by mtime."""
+def _load_ledger(last_n=None, account=None):
+    """Load ledger entries. Always loads all entries, caches by mtime.
+
+    If ``account`` is provided, filter entries to only those tagged with that
+    account label. Entries without an ``account`` field are passed through for
+    backward compatibility (old untagged entries age out naturally via the 5h
+    window).
+    """
     global _ledger_cache_time, _ledger_cache
     if not LEDGER.exists():
         return []
@@ -571,6 +689,14 @@ def _load_ledger(last_n=None):
             entries = entries[-_MAX_LEDGER_CACHE:]
         _ledger_cache = entries
         _ledger_cache_time = mtime
+    if account is not None:
+        # Only include entries explicitly tagged with this account.
+        # Untagged entries (old/pre-fix) are excluded — we don't know which account
+        # they belong to, so don't attribute them to the current account.
+        entries = [
+            e for e in entries
+            if e.get("account") == account
+        ]
     if last_n is not None:
         return entries[-last_n:]
     return entries
@@ -945,7 +1071,7 @@ def _derive_project(source, project_dir, accomplishments=None):
     for name in ("atlas-backend", "atlas-portal", "atlas"):
         if name in dir_name:
             return "atlas"
-    for name in ("openclaw", "frank-pilot", "paperclip", "Token Watch"):
+    for name in ("openclaw", "frank-pilot", "paperclip", "Token Window"):
         if name in dir_name:
             return name
 
@@ -954,7 +1080,7 @@ def _derive_project(source, project_dir, accomplishments=None):
         all_files = accomplishments.get("files_edited", []) + accomplishments.get("files_created", [])
         for fp in all_files:
             fp_lower = fp.lower()
-            for proj in ("Token Watch", "atlas-portal", "atlas-backend", "openclaw",
+            for proj in ("Token Window", "atlas-portal", "atlas-backend", "openclaw",
                          "frank-pilot", "paperclip", "adinkra"):
                 if proj in fp_lower:
                     if "atlas" in proj:
@@ -1598,7 +1724,7 @@ def export_session_history_csv(filepath):
                 company = "KAA"
             elif p_lower in ("frank",):
                 company = "Frank"
-            elif p_lower in ("openclaw", "paperclip", "Token Watch"):
+            elif p_lower in ("openclaw", "paperclip", "Token Window"):
                 company = "Personal"
             else:
                 company = ""
@@ -1658,19 +1784,19 @@ def check_and_notify(five_pct, seven_pct, burn_rate=None):
     if five_pct > 80:
         key = "five_pct_high"
         if now - _last_notified.get(key, 0) >= NOTIFICATION_COOLDOWN:
-            send_system_notification("Token Watch", "5h window at {:.0f}%".format(five_pct))
+            send_system_notification("Token Window", "5h window at {:.0f}%".format(five_pct))
             _last_notified[key] = now
 
     if seven_pct > 90:
         key = "seven_pct_high"
         if now - _last_notified.get(key, 0) >= NOTIFICATION_COOLDOWN:
-            send_system_notification("Token Watch", "7d window at {:.0f}%".format(seven_pct))
+            send_system_notification("Token Window", "7d window at {:.0f}%".format(seven_pct))
             _last_notified[key] = now
 
     if burn_rate is not None and burn_rate > 2.0:
         key = "burn_rate_high"
         if now - _last_notified.get(key, 0) >= NOTIFICATION_COOLDOWN:
-            send_system_notification("Token Watch", "High burn rate: {:.1f}%/min".format(burn_rate))
+            send_system_notification("Token Window", "High burn rate: {:.1f}%/min".format(burn_rate))
             _last_notified[key] = now
 
 
@@ -2385,14 +2511,17 @@ def _drain_status(drain_events):
 
 _burndown_cache = None  # type: Optional[Dict]
 _burndown_cache_time = 0.0
+_burndown_cache_account = None  # type: Optional[str]
 
 
 def _get_burndown_data():
     # type: () -> Dict[str, Any]
     """Compute burndown chart data for current 5h window."""
-    global _burndown_cache, _burndown_cache_time
+    global _burndown_cache, _burndown_cache_time, _burndown_cache_account
     now = time.time()
-    if _burndown_cache and now - _burndown_cache_time < 30:
+    # Invalidate cache if active account changed
+    current_account = _get_active_account()[0]
+    if _burndown_cache and now - _burndown_cache_time < 30 and _burndown_cache_account == current_account:
         return _burndown_cache
 
     five, _, five_reset_ts, _ = _current_pct()
@@ -2402,6 +2531,9 @@ def _get_burndown_data():
     try:
         reset = datetime.fromisoformat(five_reset_ts.replace("Z", "+00:00"))
         now_utc = datetime.now(timezone.utc)
+        # Advance stale reset time by 5h windows until it's in the future
+        while reset <= now_utc:
+            reset = reset + timedelta(hours=5)
         window_start = reset - timedelta(hours=5)
         mins_total = 300.0  # 5 hours
         mins_elapsed = max(0, (now_utc - window_start).total_seconds() / 60)
@@ -2412,7 +2544,7 @@ def _get_burndown_data():
         return {}
 
     # Load ledger and bucket actual data at 2-min intervals
-    entries = _load_ledger()
+    entries = _load_ledger(account=current_account)
     raw_points = []  # type: List[Tuple[float, float]]  # (mins_elapsed, remaining_pct)
     for e in entries:
         if e.get("type") != "tool_use":
@@ -2496,6 +2628,7 @@ def _get_burndown_data():
     }  # type: Dict[str, Any]
     _burndown_cache = result
     _burndown_cache_time = now
+    _burndown_cache_account = current_account
     return result
 
 
@@ -3407,17 +3540,25 @@ _urgent_cached_panel = None
 def make_urgent_panel():
     """Return urgent alerts panel, or None if nothing urgent."""
     five, seven, five_reset_ts, seven_reset_ts = _current_pct()
-    
+    current_account = _get_active_account()[0]
+
     alerts = []
     
     # Check 5h window — unallocated tokens expiring soon
     try:
         reset = datetime.fromisoformat(five_reset_ts.replace("Z", "+00:00"))
-        mins_left = int((reset - datetime.now(timezone.utc)).total_seconds() / 60)
+        now_utc = datetime.now(timezone.utc)
+        # Advance stale reset time by 5h windows until it's in the future
+        while reset <= now_utc:
+            reset = reset + timedelta(hours=5)
+        mins_left = int((reset - now_utc).total_seconds() / 60)
         pct_used = float(five)
         pct_remaining = 100 - pct_used
-        
-        if mins_left <= 30 and pct_remaining >= 1:
+
+        # Skip alert if reset is in the past (stale timestamp from account switch)
+        if mins_left < 0:
+            pass
+        elif mins_left <= 30 and pct_remaining >= 1:
             if mins_left <= 5:
                 urgency = "[bold red blink]CRITICAL[/bold red blink]"
                 color = "red"
@@ -3441,7 +3582,7 @@ def make_urgent_panel():
 
     # Check for runaway burn rate from drain events — with actionable detail
     try:
-        entries = _load_ledger(last_n=200)
+        entries = _load_ledger(last_n=200, account=current_account)
         drain_events = [e for e in entries if e.get("type") == "tool_drain" and e.get("delta_5h", 0) > 0][-5:]
         if drain_events:
             last = drain_events[-1]
@@ -3675,7 +3816,7 @@ def make_sessions_panel():
         else:
             # Try to infer from directive text
             d_lower = directive.lower() if directive else ""
-            for p in ("Token Watch", "atlas", "paperclip", "openclaw", "frank"):
+            for p in ("Token Window", "atlas", "paperclip", "openclaw", "frank"):
                 if p in d_lower:
                     project = p
                     break
@@ -3943,7 +4084,7 @@ def _score_window(window_start_ts, window_reset_ts):
     for e in window_entries:
         if e.get("type") == "tool_use":
             d = (e.get("directive") or "").lower()
-            for p in ("atlas", "Token Watch", "paperclip", "openclaw", "frank", "kaa"):
+            for p in ("atlas", "Token Window", "paperclip", "openclaw", "frank", "kaa"):
                 if p in d:
                     window_projects.add(p)
 
@@ -4011,17 +4152,18 @@ def _get_current_cycle_id():
     except Exception as e:
         _log.debug("__get_current_cycle_id: %s", e)
         pass
-    # Fallback: read from statusline debug
+    # Fallback: read from per-session statusline debug (via helper that
+    # filters by live PID + active account). Legacy shared path is only used
+    # as a last resort inside the helper.
     try:
-        import json
-        with open("/tmp/statusline-debug.json") as f:
-            d = json.load(f)
-        ts = d["rate_limits"]["five_hour"]["resets_at"]
-        reset = datetime.fromtimestamp(int(ts), tz=timezone.utc)
-        return (reset - timedelta(hours=5)).isoformat()
+        payload = _read_active_statusline_debug()
+        if payload:
+            ts = payload["rate_limits"]["five_hour"]["resets_at"]
+            reset = datetime.fromtimestamp(int(ts), tz=timezone.utc)
+            return (reset - timedelta(hours=5)).isoformat()
     except Exception as e:
         _log.debug("__get_current_cycle_id: %s", e)
-        return None
+    return None
 
 def _get_build_ledger(days=1, limit=100, cycle_id=None, source=None):
     """Fetch build ledger items grouped by company/project."""
@@ -6833,7 +6975,7 @@ def _check_auto_gate(five_pct):
         _log.info("AUTO-GATE: off at %.0f%% (threshold: %d%%)", five_pct, _AUTO_GATE_THRESHOLD)
         try:
             send_system_notification(
-                "Token Watch",
+                "Token Window",
                 "Auto-gated agents OFF at {:.0f}% (threshold: {}%)".format(
                     five_pct, _AUTO_GATE_THRESHOLD
                 ),
@@ -6848,7 +6990,7 @@ def _check_auto_gate(five_pct):
         _log.info("AUTO-GATE: on — window reset (%.0f%%)", five_pct)
         try:
             send_system_notification(
-                "Token Watch",
+                "Token Window",
                 "Auto-gated agents ON — window reset ({:.0f}%)".format(five_pct),
             )
         except Exception as e:
@@ -8215,3 +8357,314 @@ def _get_project_stats(days=7):
         _log.warning("_get_project_stats ledger: %s", e)
 
     return result
+
+
+# ── Weekly (7-day) cycle narratives ───────────────────────────────────────
+
+_weekly_cache = None  # type: Optional[Tuple[float, int, List[Dict[str, Any]]]]
+_WEEKLY_CACHE_TTL = 120  # seconds
+
+
+def _fetch_session_locks_since(since_iso):
+    # type: (str) -> List[Dict[str, Any]]
+    """Fetch all session_locks rows (any status) with claimed_at >= since.
+
+    Returns list of dicts; empty list on error. Pulls up to 2000 rows.
+    """
+    import urllib.request
+    url = (
+        "{base}/session_locks"
+        "?claimed_at=gte.{since}"
+        "&order=claimed_at.desc"
+        "&limit=2000"
+        "&select=session_id,account,status,claimed_at,heartbeat_at,released_at,"
+        "repo,task_name,output_tokens,model,five_pct"
+    ).format(base=_SUPABASE_URL, since=since_iso)
+    req = urllib.request.Request(url, headers={
+        "apikey": __SUPABASE_KEY,
+        "Authorization": "Bearer " + __SUPABASE_KEY,
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=6) as resp:
+            return json.loads(resp.read())
+    except Exception as e:
+        _log.warning("_fetch_session_locks_since: %s", e)
+        return []
+
+
+def _fetch_build_ledger_since(since_iso, limit=2000):
+    # type: (str, int) -> List[Dict[str, Any]]
+    """Fetch build_ledger rows with created_at >= since."""
+    import urllib.request
+    url = (
+        "{base}/build_ledger"
+        "?created_at=gte.{since}"
+        "&order=created_at.desc"
+        "&limit={limit}"
+        "&select=session_id,project,company,item_type,title,test_status,created_at"
+    ).format(base=_SUPABASE_URL, since=since_iso, limit=limit)
+    req = urllib.request.Request(url, headers={
+        "apikey": __SUPABASE_KEY,
+        "Authorization": f"Bearer {__SUPABASE_KEY}",
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=6) as resp:
+            return json.loads(resp.read())
+    except Exception as e:
+        _log.warning("_fetch_build_ledger_since: %s", e)
+        return []
+
+
+def _parse_iso(ts):
+    # type: (Any) -> Optional[datetime]
+    """Best-effort ISO string → aware UTC datetime."""
+    if not ts:
+        return None
+    if isinstance(ts, datetime):
+        return ts if ts.tzinfo else ts.replace(tzinfo=timezone.utc)
+    try:
+        dt = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    except Exception:
+        return None
+
+
+def _weekly_narrative(total_sessions, by_account, project_counts, build_count):
+    # type: (int, Dict[str, Dict[str, Any]], Dict[str, int], int) -> str
+    """Template-generated 1-2 sentence summary for a week."""
+    if total_sessions == 0 and build_count == 0:
+        return "Quiet week — no sessions or shipped work recorded."
+
+    # Top projects
+    top_projects = sorted(
+        project_counts.items(), key=lambda x: x[1], reverse=True
+    )[:3]
+    top_names = [p[0] for p in top_projects if p[0] and p[0] != "—"]
+
+    # Dominant account — by session count
+    dom_label = None
+    dom_sessions = 0
+    for label, info in by_account.items():
+        s = info.get("sessions", 0)
+        if s > dom_sessions:
+            dom_sessions = s
+            dom_label = label
+
+    parts = []
+    if top_names and build_count:
+        parts.append(
+            f"{build_count} items shipped across {', '.join(top_names)}."
+        )
+    elif build_count:
+        parts.append(f"{build_count} items shipped.")
+    elif top_names:
+        parts.append(
+            f"{total_sessions} sessions on {', '.join(top_names)}."
+        )
+    else:
+        parts.append(f"{total_sessions} sessions logged.")
+
+    if dom_label and total_sessions > 0:
+        pct = int(dom_sessions * 100 / total_sessions)
+        # Find dominant account peak 5h
+        peak = by_account.get(dom_label, {}).get("five_hour_peak", 0) or 0
+        if peak:
+            parts.append(
+                f"Account {dom_label} dominant ({pct}% of sessions, peak {peak:.0f}% 5h)."
+            )
+        else:
+            parts.append(f"Account {dom_label} dominant ({pct}% of sessions).")
+
+    return " ".join(parts)
+
+
+def get_weekly_cycles(limit=12):
+    # type: (int) -> List[Dict[str, Any]]
+    """Return a list of 7-day window summaries, newest first.
+
+    Each window is a rolling 7d block ending on Monday 00:00 UTC (or "now"
+    for the current in-progress window). Aggregates sessions across A/B/C
+    accounts from session_locks, peak capacity from account_capacity_history,
+    and build items from build_ledger. Results cached for 2 minutes.
+    """
+    global _weekly_cache
+    now = time.time()
+    if _weekly_cache is not None:
+        cached_at, cached_limit, cached_data = _weekly_cache
+        if cached_limit >= limit and (now - cached_at) < _WEEKLY_CACHE_TTL:
+            return cached_data[:limit]
+
+    now_utc = datetime.now(timezone.utc)
+    # Current window ends "now"; previous windows are rolling 7d blocks
+    # ending 7d, 14d, ... before now.
+    windows = []  # type: List[Tuple[datetime, datetime]]
+    for i in range(limit):
+        w_end = now_utc - timedelta(days=7 * i)
+        w_start = w_end - timedelta(days=7)
+        windows.append((w_start, w_end))
+
+    # Earliest cutoff for one bulk fetch
+    earliest = windows[-1][0].strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    # Bulk fetches
+    locks = _fetch_session_locks_since(earliest)
+    builds = _fetch_build_ledger_since(earliest, limit=2000)
+    try:
+        cap_history = _get_capacity_history(limit=2000)
+    except Exception as e:
+        _log.warning("get_weekly_cycles: capacity history: %s", e)
+        cap_history = []
+
+    # Parse timestamps once
+    locks_parsed = []
+    for lk in locks:
+        claimed = _parse_iso(lk.get("claimed_at"))
+        if not claimed:
+            continue
+        released = _parse_iso(lk.get("released_at")) or _parse_iso(
+            lk.get("heartbeat_at")
+        )
+        locks_parsed.append((claimed, released, lk))
+
+    builds_parsed = []
+    for b in builds:
+        ts = _parse_iso(b.get("created_at"))
+        if ts:
+            builds_parsed.append((ts, b))
+
+    caps_parsed = []
+    for c in cap_history:
+        ts = _parse_iso(c.get("snapshot_at"))
+        if ts:
+            caps_parsed.append((ts, c))
+
+    result = []
+    for w_start, w_end in windows:
+        # Filter sessions whose claimed_at falls inside window
+        w_locks = [
+            (c, r, lk) for (c, r, lk) in locks_parsed
+            if w_start <= c < w_end
+        ]
+        w_builds = [b for (ts, b) in builds_parsed if w_start <= ts < w_end]
+        w_caps = [c for (ts, c) in caps_parsed if w_start <= ts < w_end]
+
+        # Per-account aggregation
+        by_account = {
+            "A": {"sessions": 0, "hours": 0.0, "five_hour_peak": 0.0,
+                  "seven_day_peak": 0.0},
+            "B": {"sessions": 0, "hours": 0.0, "five_hour_peak": 0.0,
+                  "seven_day_peak": 0.0},
+            "C": {"sessions": 0, "hours": 0.0, "five_hour_peak": 0.0,
+                  "seven_day_peak": 0.0},
+        }
+
+        total_sessions = 0
+        active_hours = 0.0
+        total_cost = 0.0
+        project_counts = {}  # type: Dict[str, int]
+
+        for claimed, released, lk in w_locks:
+            acct = lk.get("account") or "?"
+            if acct not in by_account:
+                continue
+            total_sessions += 1
+            by_account[acct]["sessions"] += 1
+
+            # Duration: released_at - claimed_at, or clamp to window end
+            end_dt = released or w_end
+            if end_dt > w_end:
+                end_dt = w_end
+            if end_dt < claimed:
+                end_dt = claimed
+            dur_h = max(0.0, (end_dt - claimed).total_seconds() / 3600.0)
+            # Clamp unreasonably long sessions to 5h (rate-limit cycle)
+            if dur_h > 5.0:
+                dur_h = 5.0
+            by_account[acct]["hours"] += dur_h
+            active_hours += dur_h
+
+            # Cost estimation from output_tokens
+            try:
+                tok = int(lk.get("output_tokens") or 0)
+            except Exception:
+                tok = 0
+            total_cost += _estimate_cost(tok, lk.get("model") or "")
+
+            proj = (lk.get("repo") or "").strip()
+            if proj:
+                # Normalize repo path → basename
+                if "/" in proj:
+                    proj = proj.rstrip("/").split("/")[-1]
+                project_counts[proj] = project_counts.get(proj, 0) + 1
+
+        # Peak capacity per account from account_capacity_history
+        for row in w_caps:
+            label = row.get("account") or "?"
+            if label not in by_account:
+                continue
+            try:
+                five_pct = float(row.get("five_hour_used_pct") or 0)
+            except (ValueError, TypeError):
+                five_pct = 0.0
+            try:
+                seven_pct = float(row.get("seven_day_used_pct") or 0)
+            except (ValueError, TypeError):
+                seven_pct = 0.0
+            if five_pct > by_account[label]["five_hour_peak"]:
+                by_account[label]["five_hour_peak"] = five_pct
+            if seven_pct > by_account[label]["seven_day_peak"]:
+                by_account[label]["seven_day_peak"] = seven_pct
+
+        # Build ledger aggregation
+        build_count = len(w_builds)
+        for b in w_builds:
+            proj = (b.get("project") or "").strip()
+            if proj:
+                project_counts[proj] = project_counts.get(proj, 0) + 1
+
+        # Label: "Apr 5–11"
+        try:
+            label_start = w_start.astimezone().strftime("%b %-d")
+            label_end = (w_end - timedelta(seconds=1)).astimezone().strftime("%-d")
+            label = f"{label_start}\u2013{label_end}"
+        except Exception:
+            label = w_start.strftime("%Y-%m-%d")
+
+        # Available hours: 3 accounts * 7 days * 24h (full wall-time)
+        # Keep the spec's simpler "3 * 168" wall-clock ceiling
+        available_hours = 3 * 7 * 24.0  # 504h
+        util_pct = (active_hours / available_hours * 100.0) if available_hours else 0.0
+
+        # Top projects list
+        projects = sorted(
+            project_counts.keys(),
+            key=lambda p: project_counts[p],
+            reverse=True,
+        )
+
+        narrative = _weekly_narrative(
+            total_sessions, by_account, project_counts, build_count
+        )
+
+        result.append({
+            "week_start": w_start.isoformat(),
+            "week_end": w_end.isoformat(),
+            "label": label,
+            "total_sessions": total_sessions,
+            "active_hours": round(active_hours, 1),
+            "available_hours": available_hours,
+            "utilization_pct": round(util_pct, 1),
+            "by_account": by_account,
+            "projects": projects[:10],
+            "build_count": build_count,
+            "total_cost": round(total_cost, 2),
+            "cost_str": _format_cost(total_cost),
+            "narrative": narrative,
+            "build_items": w_builds[:20],  # for detail view
+            "is_current": (w_end >= now_utc - timedelta(minutes=1)),
+        })
+
+    _weekly_cache = (now, limit, result)
+    return result[:limit]

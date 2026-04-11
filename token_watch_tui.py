@@ -1950,6 +1950,7 @@ class NavBar(Horizontal):
         ]),
         ("History", [
             ("Cycles", "nav-cycles"),
+            ("Weekly", "nav-weekly"),
             ("Usage", "nav-usage"),
             ("Leaderboard", "nav-leaderboard"),
         ]),
@@ -2006,6 +2007,7 @@ class NavigationScreen(Screen):
                 "nav-usage": "view-usage",
                 "nav-mcp": "view-mcp",
                 "nav-cycles": "view-cycles",
+                "nav-weekly": "view-weekly",
                 "nav-test": "view-test",
                 "nav-rules": "view-rules",
                 "nav-audit": "view-audit",
@@ -5040,6 +5042,277 @@ class CycleDetailScreen(Screen):
                 directive=s.get("directive", ""),
                 project=s.get("project", "\u2014"),
             ))
+
+    def action_pop_screen(self):
+        self.app.pop_screen()
+
+
+class WeeklyCyclesView(LazyView):
+    """7-day rolling cycle narratives — aggregates sessions across A/B/C."""
+
+    def compose(self) -> ComposeResult:
+        yield Static(id="weekly-current")
+        yield DataTable(id="weekly-list")
+
+    def refresh_content(self):
+        """Refresh the current-week banner every 30s."""
+        now = time.time()
+        if hasattr(self, "_last_refresh") and (now - self._last_refresh) < 30:
+            return
+        self._last_refresh = now
+        try:
+            self._render_banner()
+        except Exception:
+            pass
+
+    def _render_banner(self):
+        from token_watch_data import get_weekly_cycles
+        panel = self.query_one("#weekly-current", Static)
+        weeks = get_weekly_cycles(limit=1)
+        if not weeks:
+            panel.update("[dim]No weekly data[/dim]")
+            return
+        w = weeks[0]
+        util = w.get("utilization_pct", 0.0)
+        bar_len = 20
+        filled = min(bar_len, int(util / 100 * bar_len))
+        bar = "\u2588" * filled + "\u2591" * (bar_len - filled)
+        bar_color = "green" if util < 60 else ("yellow" if util < 85 else "red")
+        by = w.get("by_account", {})
+
+        def _acct_chunk(label):
+            info = by.get(label, {})
+            peak5 = info.get("five_hour_peak", 0) or 0
+            peak7 = info.get("seven_day_peak", 0) or 0
+            sess = info.get("sessions", 0)
+            col = "green" if peak7 < 60 else ("yellow" if peak7 < 85 else "red")
+            return (
+                f"[bold]{label}[/bold] {sess}s "
+                f"[{col}]{peak5:.0f}/{peak7:.0f}[/{col}]"
+            )
+
+        acct_str = "  ".join(_acct_chunk(x) for x in ("A", "B", "C"))
+        proj_str = ", ".join(w.get("projects", [])[:4]) or "\u2014"
+        panel.update(
+            f"[bold]CURRENT WEEK[/bold]  {w['label']}\n"
+            f"  [{bar_color}]{bar}[/{bar_color}] {util:.0f}% util  "
+            f"[bold]{w['total_sessions']}[/bold] sessions  "
+            f"[bold]{w['active_hours']:.1f}h[/bold] active  "
+            f"[bold]{w['build_count']}[/bold] built  "
+            f"Cost: [bold]{w.get('cost_str', '')}[/bold]\n"
+            f"  {acct_str}  [dim]\u2014 {proj_str}[/dim]\n"
+            f"  [cyan]{w.get('narrative', '')}[/cyan]"
+        )
+
+    def load_content(self):
+        from token_watch_data import get_weekly_cycles
+
+        weeks = get_weekly_cycles(limit=12)
+
+        # ── Banner ──
+        try:
+            self._render_banner()
+        except Exception:
+            pass
+
+        # ── Weekly table ──
+        dt = self.query_one("#weekly-list", DataTable)
+        dt.cursor_type = "row"
+        dt.zebra_stripes = True
+        dt.add_column("#", width=4)
+        dt.add_column("Week", width=14)
+        dt.add_column("Sess", width=6)
+        dt.add_column("Hours", width=8)
+        dt.add_column("Util%", width=7)
+        dt.add_column("A burn", width=10)
+        dt.add_column("B burn", width=10)
+        dt.add_column("C burn", width=10)
+        dt.add_column("Built", width=7)
+        dt.add_column("Cost", width=8)
+        dt.add_column("Top Projects", width=28)
+
+        self._week_map = {}  # type: dict
+
+        # Newest first, number oldest = 1
+        ordered = list(reversed(weeks))
+        display_order = []
+        for rank, w in enumerate(ordered, 1):
+            display_order.append((rank, w))
+        display_order.reverse()
+
+        for rank, w in display_order:
+            by = w.get("by_account", {})
+
+            def _burn_cell(label):
+                info = by.get(label, {})
+                peak5 = info.get("five_hour_peak", 0) or 0
+                peak7 = info.get("seven_day_peak", 0) or 0
+                col = (
+                    "green" if peak7 < 60
+                    else ("yellow" if peak7 < 85 else "red")
+                )
+                return Text(f"{peak5:.0f}/{peak7:.0f}", style=col, justify="right")
+
+            util = w.get("utilization_pct", 0.0)
+            util_col = "green" if util < 60 else ("yellow" if util < 85 else "red")
+
+            proj_str = ", ".join(w.get("projects", [])[:3]) or "\u2014"
+
+            row_key = f"wk-{rank}"
+            self._week_map[row_key] = w
+
+            is_cur_mark = "*" if w.get("is_current") else str(rank)
+            dt.add_row(
+                Text(is_cur_mark, justify="right",
+                     style="bold cyan" if w.get("is_current") else ""),
+                Text(w.get("label", "")),
+                Text(str(w.get("total_sessions", 0)), justify="right"),
+                Text(f"{w.get('active_hours', 0):.1f}h", justify="right"),
+                Text(f"{util:.0f}%", style=util_col, justify="right"),
+                _burn_cell("A"),
+                _burn_cell("B"),
+                _burn_cell("C"),
+                Text(str(w.get("build_count", 0)), justify="right"),
+                Text(w.get("cost_str", "")),
+                Text(proj_str),
+                key=row_key,
+            )
+
+        if not weeks:
+            dt.add_row(
+                "", Text("No weekly data", style="dim"),
+                "", "", "", "", "", "", "", "", "",
+            )
+
+    def on_data_table_row_selected(self, event):
+        row_key = (
+            str(event.row_key.value)
+            if hasattr(event.row_key, "value")
+            else str(event.row_key)
+        )
+        week = getattr(self, "_week_map", {}).get(row_key)
+        if week:
+            self.app.push_screen(WeeklyDetailScreen(week))
+
+
+class WeeklyDetailScreen(Screen):
+    """Detailed view of a single 7-day cycle."""
+
+    BINDINGS = [
+        Binding("escape", "pop_screen", "Back"),
+        Binding("q", "pop_screen", "Back"),
+    ]
+
+    def __init__(self, week):
+        super().__init__()
+        self.week = week
+
+    def compose(self) -> ComposeResult:
+        yield NavBar(active="nav-weekly")
+        yield Static(id="wdetail-header")
+        yield Static(id="wdetail-accounts-title")
+        yield DataTable(id="wdetail-accounts")
+        yield Static(id="wdetail-builds-title")
+        yield DataTable(id="wdetail-builds")
+        yield Static(id="wdetail-narrative")
+
+    def on_mount(self):
+        w = self.week
+
+        # Header
+        try:
+            start_dt = datetime.fromisoformat(w["week_start"])
+            end_dt = datetime.fromisoformat(w["week_end"])
+            start_str = start_dt.astimezone().strftime("%b %-d, %Y")
+            end_str = end_dt.astimezone().strftime("%b %-d, %Y")
+        except Exception:
+            start_str = w.get("week_start", "")[:10]
+            end_str = w.get("week_end", "")[:10]
+
+        util = w.get("utilization_pct", 0.0)
+        bar_len = 30
+        filled = min(bar_len, int(util / 100 * bar_len))
+        bar = "\u2588" * filled + "\u2591" * (bar_len - filled)
+        bar_color = "green" if util < 60 else ("yellow" if util < 85 else "red")
+
+        self.query_one("#wdetail-header", Static).update(
+            f"[bold]WEEK:[/bold] {w.get('label', '')}   "
+            f"[dim]{start_str} \u2014 {end_str}[/dim]\n"
+            f"  [{bar_color}]{bar}[/{bar_color}] {util:.0f}% utilization\n"
+            f"  Sessions: [bold]{w.get('total_sessions', 0)}[/bold]   "
+            f"Active: [bold]{w.get('active_hours', 0):.1f}h[/bold] "
+            f"/ {w.get('available_hours', 0):.0f}h   "
+            f"Built: [bold]{w.get('build_count', 0)}[/bold]   "
+            f"Cost: [bold]{w.get('cost_str', '')}[/bold]"
+        )
+
+        # Per-account breakdown
+        self.query_one("#wdetail-accounts-title", Static).update(
+            "[bold]Per-Account Breakdown[/bold]"
+        )
+        at = self.query_one("#wdetail-accounts", DataTable)
+        at.cursor_type = "none"
+        at.zebra_stripes = True
+        at.add_column("Account", width=10)
+        at.add_column("Sessions", width=10)
+        at.add_column("Hours", width=10)
+        at.add_column("Peak 5h%", width=10)
+        at.add_column("Peak 7d%", width=10)
+
+        by = w.get("by_account", {})
+        for label in ("A", "B", "C"):
+            info = by.get(label, {})
+            peak5 = info.get("five_hour_peak", 0) or 0
+            peak7 = info.get("seven_day_peak", 0) or 0
+            col7 = (
+                "green" if peak7 < 60
+                else ("yellow" if peak7 < 85 else "red")
+            )
+            col5 = (
+                "green" if peak5 < 60
+                else ("yellow" if peak5 < 85 else "red")
+            )
+            at.add_row(
+                Text(label, style="bold cyan"),
+                Text(str(info.get("sessions", 0)), justify="right"),
+                Text(f"{info.get('hours', 0):.1f}h", justify="right"),
+                Text(f"{peak5:.0f}%", style=col5, justify="right"),
+                Text(f"{peak7:.0f}%", style=col7, justify="right"),
+            )
+
+        # Top built items
+        self.query_one("#wdetail-builds-title", Static).update(
+            "[bold]Top Built Items[/bold]"
+        )
+        bt = self.query_one("#wdetail-builds", DataTable)
+        bt.cursor_type = "none"
+        bt.zebra_stripes = True
+        bt.add_column("Type", width=12)
+        bt.add_column("Project", width=18)
+        bt.add_column("Title", width=60)
+
+        build_items = w.get("build_items", [])[:10]
+        if build_items:
+            for b in build_items:
+                itype = b.get("item_type") or "?"
+                proj = b.get("project") or "\u2014"
+                title = (b.get("title") or "")[:60]
+                bt.add_row(
+                    Text(itype, style="dim"),
+                    Text(proj, style="cyan"),
+                    Text(title),
+                )
+        else:
+            bt.add_row(
+                Text("\u2014", style="dim"),
+                Text("", style="dim"),
+                Text("No build items in this window", style="dim"),
+            )
+
+        # Narrative
+        self.query_one("#wdetail-narrative", Static).update(
+            f"[bold]Narrative[/bold]\n  [cyan]{w.get('narrative', '')}[/cyan]"
+        )
 
     def action_pop_screen(self):
         self.app.pop_screen()
@@ -8780,6 +9053,7 @@ class ClaudeWatchApp(App):
         Binding("c", "show_capacity", "Capacity"),
         Binding("h", "toggle_health", "Health"),
         Binding("y", "show_cycles", "Cycles"),
+        Binding("W", "show_weekly", "Weekly"),
         Binding("x", "show_test", "Test"),
         Binding("A", "toggle_accounts", "Accounts"),
         Binding("w", "show_wire", "Wire"),
@@ -8836,6 +9110,7 @@ class ClaudeWatchApp(App):
             yield AccountCapacityView(id="view-capacity")
             yield LeaderboardView(id="view-leaderboard")
             yield CyclesView(id="view-cycles")
+            yield WeeklyCyclesView(id="view-weekly")
             yield TestQueueView(id="view-test")
             yield AuditView(id="view-audit")
             yield MissionControlView(id="view-mission")
@@ -8871,6 +9146,7 @@ class ClaudeWatchApp(App):
             "view-capacity": "nav-capacity",
             "view-leaderboard": "nav-leaderboard",
             "view-cycles": "nav-cycles",
+            "view-weekly": "nav-weekly",
             "view-test": "nav-test",
             "view-rules": "nav-rules",
             "view-audit": "nav-audit",
@@ -9204,6 +9480,9 @@ class ClaudeWatchApp(App):
     def action_show_cycles(self):
         self.switch_view("view-cycles")
 
+    def action_show_weekly(self):
+        self.switch_view("view-weekly")
+
     def action_show_test(self):
         self.switch_view("view-test")
 
@@ -9298,6 +9577,7 @@ class ClaudeWatchApp(App):
             "nav-usage": "view-usage",
             "nav-mcp": "view-mcp",
             "nav-cycles": "view-cycles",
+            "nav-weekly": "view-weekly",
             "nav-test": "view-test",
             "nav-rules": "view-rules",
             "nav-audit": "view-audit",
