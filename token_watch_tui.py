@@ -6403,16 +6403,23 @@ class MissionControlView(LazyView):
         hint = item.get("test_hint", "") or ""
         sha = (item.get("commit_sha") or "")[:7]
         project = item.get("project", "") or ""
+        session = (item.get("session_id") or "")
         ts = item.get("created_at", "")
         if "T" in ts:
             ts = ts.split("T")[1][:5]
+        files = item.get("files") or []
         parts = []
         if title:
             parts.append(title)
+        if files:
+            names = [f.split("/")[-1] for f in files[:3]]
+            suffix = f" +{len(files)-3} more" if len(files) > 3 else ""
+            parts.append(f"files: {', '.join(names)}{suffix}")
         if hint:
             parts.append(f"verify: {hint}")
-        if project or sha:
-            parts.append(f"{project}  {sha}  {ts}".strip())
+        meta = "  ".join(x for x in [session[:16], project, sha, ts] if x)
+        if meta:
+            parts.append(meta)
         table.tooltip = "\n".join(parts) if parts else None
 
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
