@@ -3103,6 +3103,170 @@ def _get_engine_breakdown():
     return result
 
 
+# ── wire reliability health ────────────────────────────────────────────────
+# Born from the cc-18721 dead-advisor bug: T10 sent ~45 minutes of
+# lane_drained + task_complete wires to an advisor session that had been
+# dead for 20+ minutes. Every message landed in session_messages with
+# read=false, and the worker had no signal that its acks were being
+# ignored. This helper surfaces that failure mode as a numeric score so a
+# future health panel / statusline cell can light up when recipients are
+# almost certainly dead.
+
+_WIRE_HEALTH_CACHE = None  # type: Optional[Dict]
+_WIRE_HEALTH_CACHE_TIME = 0.0
+_WIRE_HEALTH_CACHE_KEY = None  # type: Optional[Tuple[str, int]]
+_WIRE_HEALTH_CACHE_TTL = 10.0
+
+
+def _get_wire_reliability(sender_sid=None, lookback_minutes=15):
+    # type: (Optional[str], int) -> Dict[str, Any]
+    """Return read/unread stats for wire messages sent BY ``sender_sid``.
+
+    Output shape::
+
+        {
+            "sender": "cc-9930",
+            "window_minutes": 15,
+            "total_sent": 12,
+            "read": 9,
+            "unread": 3,
+            "reliability_pct": 75.0,
+            "by_recipient": [
+                {
+                    "to": "cc-18721",
+                    "sent": 5,
+                    "read": 0,
+                    "unread": 5,
+                    "reliability_pct": 0.0,
+                    "likely_dead": True,
+                },
+                ...
+            ],
+        }
+
+    Recipients with ``>= 3`` messages sent and 0% read are flagged
+    ``likely_dead`` so callers can surface a "stop wiring this session"
+    warning. Defaults to ``cc-${PPID}`` as the sender when not specified
+    so session code can call it without knowing its own PID.
+    """
+    global _WIRE_HEALTH_CACHE, _WIRE_HEALTH_CACHE_TIME, _WIRE_HEALTH_CACHE_KEY
+
+    if sender_sid is None:
+        sender_sid = "cc-{0}".format(os.getppid())
+
+    cache_key = (sender_sid, int(lookback_minutes))
+    now = time.time()
+    if (
+        _WIRE_HEALTH_CACHE is not None
+        and _WIRE_HEALTH_CACHE_KEY == cache_key
+        and now - _WIRE_HEALTH_CACHE_TIME < _WIRE_HEALTH_CACHE_TTL
+    ):
+        return _WIRE_HEALTH_CACHE
+
+    empty = {
+        "sender": sender_sid,
+        "window_minutes": int(lookback_minutes),
+        "total_sent": 0,
+        "read": 0,
+        "unread": 0,
+        "reliability_pct": 0.0,
+        "by_recipient": [],
+    }
+
+    try:
+        cutoff = (
+            datetime.now(timezone.utc) - timedelta(minutes=int(lookback_minutes))
+        ).strftime("%Y-%m-%dT%H:%M:%SZ")
+    except Exception as exc:
+        _log.debug("_get_wire_reliability cutoff: %s", exc)
+        return empty
+
+    import urllib.request as _ur
+
+    url = (
+        "{base}/session_messages?from_session=eq.{sid}"
+        "&created_at=gt.{cutoff}"
+        "&select=id,to_session,msg_type,read,created_at"
+        "&order=created_at.asc&limit=500"
+    ).format(base=_SUPABASE_URL, sid=sender_sid, cutoff=cutoff)
+
+    try:
+        req = _ur.Request(
+            url,
+            headers={
+                "apikey": __SUPABASE_KEY,
+                "Authorization": "Bearer " + __SUPABASE_KEY,
+            },
+        )
+        with _ur.urlopen(req, timeout=5) as resp:
+            rows = json.loads(resp.read().decode("utf-8"))
+    except Exception as exc:
+        _log.warning("_get_wire_reliability fetch: %s", exc)
+        return empty
+
+    if not isinstance(rows, list) or not rows:
+        _WIRE_HEALTH_CACHE = empty
+        _WIRE_HEALTH_CACHE_TIME = now
+        _WIRE_HEALTH_CACHE_KEY = cache_key
+        return empty
+
+    total_sent = 0
+    total_read = 0
+    by_recipient = {}  # type: Dict[str, Dict[str, Any]]
+    for row in rows:
+        to_sid = row.get("to_session") or ""
+        if not to_sid or to_sid == sender_sid:
+            continue
+        is_read = bool(row.get("read"))
+        total_sent += 1
+        if is_read:
+            total_read += 1
+        entry = by_recipient.setdefault(
+            to_sid, {"to": to_sid, "sent": 0, "read": 0, "unread": 0}
+        )
+        entry["sent"] += 1
+        if is_read:
+            entry["read"] += 1
+        else:
+            entry["unread"] += 1
+
+    recipients = []
+    for entry in by_recipient.values():
+        sent = entry["sent"]
+        read = entry["read"]
+        rel = round(100.0 * read / sent, 1) if sent else 0.0
+        entry["reliability_pct"] = rel
+        entry["likely_dead"] = sent >= 3 and read == 0
+        recipients.append(entry)
+
+    # Sort: likely-dead first, then by sent desc, then by recipient label
+    recipients.sort(
+        key=lambda r: (
+            0 if r["likely_dead"] else 1,
+            -r["sent"],
+            r["to"],
+        )
+    )
+
+    unread = total_sent - total_read
+    reliability_pct = round(100.0 * total_read / total_sent, 1) if total_sent else 0.0
+
+    result = {
+        "sender": sender_sid,
+        "window_minutes": int(lookback_minutes),
+        "total_sent": total_sent,
+        "read": total_read,
+        "unread": unread,
+        "reliability_pct": reliability_pct,
+        "by_recipient": recipients,
+    }
+
+    _WIRE_HEALTH_CACHE = result
+    _WIRE_HEALTH_CACHE_TIME = now
+    _WIRE_HEALTH_CACHE_KEY = cache_key
+    return result
+
+
 # ── system health ───────────────────────────────────────────────────────────
 
 _SYSTEM_MEM_MB = 16384  # default, updated on first call
