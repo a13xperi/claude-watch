@@ -2669,6 +2669,101 @@ _attribution_cache = None  # type: Optional[Dict]
 _attribution_cache_time = 0.0
 _attribution_cache_account = None  # type: Optional[str]
 
+
+# ── burn-rate sparkline ───────────────────────────────────────────────────
+# Compact unicode-block chart of %/min consumption over the last N minutes.
+# Rendered in CompactStatusBar so the header shows *trend*, not just totals.
+
+_SPARK_BLOCKS = " ▁▂▃▄▅▆▇█"
+
+
+def _burn_rate_sparkline(window_mins=10, slots=10):
+    # type: (int, int) -> str
+    """Return a unicode-block sparkline string showing %/min burn over
+    ``window_mins`` minutes, split into ``slots`` columns.
+
+    Uses the same ledger account filter as ``_get_token_attribution`` so
+    cross-account entries (post-switch staleness) cannot inflate the chart.
+    Returns an empty string when there is not enough data — the caller
+    should fall back to a "—" placeholder.
+    """
+    try:
+        current_account = _get_active_account()[0]
+    except Exception:
+        current_account = None
+
+    if not current_account or current_account == "?":
+        return ""
+
+    try:
+        entries = _load_ledger(account=current_account)
+    except Exception:
+        return ""
+
+    if not entries:
+        return ""
+
+    now_utc = datetime.now(timezone.utc)
+    window_start = now_utc - timedelta(minutes=window_mins)
+    slot_mins = window_mins / float(slots)
+
+    # Collect (ts, five_pct) pairs within the window, chronologically.
+    pairs = []
+    for e in entries:
+        if e.get("type") != "tool_use":
+            continue
+        pct = e.get("five_pct")
+        if pct is None:
+            continue
+        try:
+            ts = datetime.fromisoformat(e["ts"].replace("Z", "+00:00"))
+        except Exception:
+            continue
+        if ts < window_start:
+            continue
+        try:
+            pairs.append((ts, float(pct)))
+        except (TypeError, ValueError):
+            continue
+
+    if len(pairs) < 2:
+        return ""
+
+    pairs.sort(key=lambda p: p[0])
+
+    # Bucket into slots by minute offset. Each slot's value is the
+    # %/min consumed during that slot: (max_pct - min_pct) / slot_mins,
+    # with negative rates clamped to 0 (window resets).
+    buckets = [[] for _ in range(slots)]
+    for ts, pct in pairs:
+        offset = (ts - window_start).total_seconds() / 60.0
+        idx = int(offset / slot_mins)
+        if 0 <= idx < slots:
+            buckets[idx].append(pct)
+
+    rates = []
+    for b in buckets:
+        if len(b) < 2:
+            rates.append(0.0)
+            continue
+        hi = max(b)
+        lo = min(b)
+        rate = max(0.0, (hi - lo) / slot_mins)
+        rates.append(rate)
+
+    peak = max(rates)
+    if peak <= 0:
+        return ""
+
+    # Map each rate to a block char. Peak → fullest block (index 8).
+    chars = []
+    levels = len(_SPARK_BLOCKS) - 1  # 8 blocks above the empty space
+    for r in rates:
+        idx = int(round(r / peak * levels))
+        idx = max(0, min(levels, idx))
+        chars.append(_SPARK_BLOCKS[idx])
+    return "".join(chars)
+
 _ATTR_COLORS = ["red", "dodgerblue", "green", "yellow", "magenta", "cyan", "dark_orange", "deep_pink"]
 
 

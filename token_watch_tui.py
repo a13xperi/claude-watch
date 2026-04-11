@@ -257,11 +257,12 @@ class CompactStatusBar(Static):
             from token_watch_data import (
                 _current_pct, _countdown, _get_active_account,
                 _active_pids, _get_peer_sessions, _get_dispatch_queue,
+                _burn_rate_sparkline,
             )
         except ImportError:
             from token_watch_data import (
                 _current_pct, _countdown, _get_active_account,
-                _active_pids, _get_peer_sessions,
+                _active_pids, _get_peer_sessions, _burn_rate_sparkline,
             )
             _get_dispatch_queue = None
 
@@ -281,6 +282,27 @@ class CompactStatusBar(Static):
             countdown_short = countdown.split(" (")[0] if countdown else "?"
         except Exception:
             five, seven, countdown_short = "?", "?", "?"
+
+        # Burn-rate sparkline: 10 unicode blocks, one per minute of the last
+        # 10 minutes. Shows TREND instead of just totals. Non-blocking: the
+        # helper reuses the ledger cache and caps work at O(entries_in_10min).
+        try:
+            spark = _burn_rate_sparkline(window_mins=10, slots=10)
+        except Exception:
+            spark = ""
+        if not spark:
+            spark_cell = "[dim]" + "·" * 10 + "[/dim]"
+        else:
+            # Colour the whole strip by the peak intensity class so the
+            # header glances red when the session is accelerating. We have
+            # no per-char colour here (the spark is a single string) —
+            # colour selection mirrors the 5h bar palette.
+            try:
+                _f = float(five) if five != "?" else 0.0
+            except (TypeError, ValueError):
+                _f = 0.0
+            spark_color = "green" if _f < 50 else ("yellow" if _f < 75 else "red")
+            spark_cell = f"[{spark_color}]{spark}[/{spark_color}]"
 
         # Task counts from dispatch queue
         p1_str = "—"
@@ -321,6 +343,7 @@ class CompactStatusBar(Static):
             f"[cyan]{countdown_short}[/cyan]  "
             f"[dim]{p1_str}[/dim]  "
             f"5h {bar5} {five_str}  "
+            f"[dim]burn[/dim] {spark_cell}  "
             f"7d {bar7} {seven_str}  "
             f"[{acct_color}]Acct {label}[/{acct_color}]  "
             f"[dim]{session_str}[/dim]"
