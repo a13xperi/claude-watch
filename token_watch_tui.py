@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Token Watch TUI — Textual-based interactive dashboard for Claude Code token monitoring.
+Token Window TUI — Textual-based interactive dashboard for Claude Code token monitoring.
 Scrollable panels, keyboard navigation, no dead space.
 """
 
@@ -158,7 +158,7 @@ def _start_hot_reload_watcher(app):
             app.call_from_thread(app._signal_files_changed)
 
 
-_BACKUP_DIR = Path(f"/tmp/Token Watch-backup-{os.getpid()}")
+_BACKUP_DIR = Path(f"/tmp/Token Window-backup-{os.getpid()}")
 _SOURCE_DIR = Path(__file__).resolve().parent
 _BACKUP_FILES = ["token_watch_tui.py", "token_watch_data.py", "token_watch.py", "token_watch_tui.tcss", "token_watch_advisor.py"]
 
@@ -620,7 +620,7 @@ class EngineTable(DataTable):
             if repo in ("atlas-portal", "atlas-backend"):
                 project = "atlas"
             elif repo == "token-watch":
-                project = "Token Watch"
+                project = "Token Window"
             elif repo in ("paperclip", "openclaw", "frank-pilot", "battlestation"):
                 project = repo
             elif repo and repo not in ("a13xperi", "unknown", "—", ""):
@@ -638,7 +638,7 @@ class EngineTable(DataTable):
             # Fallback: check directive text
             if project == "—":
                 d_lower = directive.lower() if directive else ""
-                for kw, pname in [("token watch", "Token Watch"), ("tw ", "Token Watch"),
+                for kw, pname in [("token watch", "Token Window"), ("tw ", "Token Window"),
                                    ("atlas", "atlas"), ("paperclip", "paperclip"),
                                    ("openclaw", "openclaw"), ("frank", "frank"),
                                    ("kaa", "kaa"), ("sage", "sage")]:
@@ -1130,7 +1130,7 @@ class SessionNarrativePanel(Static):
         # Color map for known projects
         color_map = {
             "atlas": "blue",
-            "Token Watch": "cyan",
+            "Token Window": "cyan",
             "paperclip": "green",
             "openclaw": "magenta",
             "frank": "magenta",
@@ -1545,9 +1545,11 @@ class BurndownChart(Static):
             verdict = f"[bold red]⚡ WALL in {wall_str}[/bold red]"
         elif status == "burning_fast":
             verdict = "[bold yellow]⚡ FAST[/bold yellow]"
-        elif status == "wasting" or rate < needed_rate * 0.5:
+        elif (status == "wasting" or rate < needed_rate * 0.5) and rate > 0:
             wasted = proj_remaining if proj_remaining > 0 else 0
             verdict = f"[bold red]⚠ WASTING ~{wasted:.0f}%[/bold red]"
+        elif rate == 0 and remaining > 3:
+            verdict = "[dim]~ Calibrating...[/dim]"
         else:
             verdict = "[yellow]~ SLOW[/yellow]"
 
@@ -1740,7 +1742,7 @@ class SystemHealthPanel(Static):
                 project = source.split("/")[0].lower()
             else:
                 d_lower = directive.lower() if directive else ""
-                for p in ("Token Watch", "atlas", "paperclip", "openclaw", "frank"):
+                for p in ("Token Window", "atlas", "paperclip", "openclaw", "frank"):
                     if p in d_lower:
                         project = p
                         break
@@ -6017,7 +6019,7 @@ class MissionControlView(LazyView):
         table.cursor_type = "row"
         table.zebra_stripes = True
         table.add_column("", width=2)       # status icon
-        table.add_column("Time", width=6)
+        table.add_column("Time", width=11)
         table.add_column("SHA", width=8)
         table.add_column("Session", width=7)
         table.add_column("File", width=4)
@@ -6067,9 +6069,16 @@ class MissionControlView(LazyView):
                 self._row_keys_ordered.append(None)  # separator row
 
                 for _row_idx, item in enumerate(items):
-                    ts = item.get("created_at", "")
-                    if "T" in ts:
-                        ts = ts.split("T")[1][:5]
+                    ts_raw = item.get("created_at", "")
+                    if "T" in ts_raw:
+                        try:
+                            from datetime import datetime as _dt
+                            _d = _dt.fromisoformat(ts_raw.replace("Z", "+00:00")).astimezone()
+                            ts = _d.strftime("%-m/%-d %H:%M")
+                        except Exception:
+                            ts = ts_raw.split("T")[1][:5]
+                    else:
+                        ts = ts_raw[:10] if ts_raw else ""
 
                     test = item.get("test_status", "untested")
                     icon, icon_style = status_icons.get(test, ("?", "white"))
@@ -7077,7 +7086,7 @@ class PlansView(LazyView):
 
 
 class AdvisorView(LazyView):
-    """Token Watch Advisor Agent — actionable intelligence synthesis."""
+    """Token Window Advisor Agent — actionable intelligence synthesis."""
 
     BINDINGS = [
         Binding("R", "run_advisor", "Run Now"),
@@ -7987,7 +7996,7 @@ class AnalyticsView(LazyView):
 
 
 class InboxView(LazyView):
-    """Token Watch Inbox — unified view of everything waiting on you."""
+    """Token Window Inbox — unified view of everything waiting on you."""
 
     BINDINGS = [
         Binding("R", "refresh_inbox", "Refresh"),
@@ -8756,7 +8765,7 @@ class ExpensiveTurnsView(LazyView):
 
 class ClaudeWatchApp(App):
     CSS_PATH = "token_watch_tui.tcss"
-    TITLE = "Token Watch"
+    TITLE = "Token Window"
 
     BINDINGS = [
         Binding("q", "quit", "Quit"),
@@ -8970,7 +8979,7 @@ class ClaudeWatchApp(App):
         try:
             log_dir = Path.home() / ".claude" / "logs"
             log_dir.mkdir(parents=True, exist_ok=True)
-            log_file = log_dir / "Token Watch-build-errors.log"
+            log_file = log_dir / "Token Window-build-errors.log"
             from datetime import datetime
             timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             with open(log_file, "a") as f:
@@ -9153,7 +9162,7 @@ class ClaudeWatchApp(App):
 
     def action_export_csv(self):
         filename = os.path.expanduser(
-            "~/Downloads/Token Watch-{}.csv".format(
+            "~/Downloads/Token Window-{}.csv".format(
                 datetime.now().strftime("%Y%m%d-%H%M%S")
             )
         )
@@ -9733,7 +9742,7 @@ def _cli_advisor(args):
 def main():
     import argparse
     import sys
-    parser = argparse.ArgumentParser(description="Token Watch — Claude Code token monitor")
+    parser = argparse.ArgumentParser(description="Token Window — Claude Code token monitor")
     parser.add_argument("-s", "--session", help="Look up session by CCID or UUID prefix")
     parser.add_argument("-l", "--list", action="store_true", help="List recent sessions")
     parser.add_argument("--context", action="store_true", help="Include resume context (with --session)")
