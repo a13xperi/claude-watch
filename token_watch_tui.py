@@ -8501,6 +8501,9 @@ class DispatchView(LazyView):
                 pass
 
     def compose(self) -> ComposeResult:
+        # 5-terminal visual grid (#131369) — lazy import keeps tui.py diff narrow.
+        from dispatch_grid import DispatchGrid
+        yield DispatchGrid(id="dispatch-grid")
         yield Static(id="dispatch-header")
         yield Static(id="dispatch-lanes")
         yield DataTable(id="dispatch-table")
@@ -8510,6 +8513,12 @@ class DispatchView(LazyView):
 
     def load_content(self):
         from token_watch_data import _get_dispatch_queue
+        # Refresh the 5-terminal grid before the dispatch tables.
+        try:
+            from dispatch_grid import DispatchGrid
+            self.query_one("#dispatch-grid", DispatchGrid).update_content()
+        except Exception:
+            pass
         data = _get_dispatch_queue()
         stats = data["stats"]
 
