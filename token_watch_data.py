@@ -8811,3 +8811,89 @@ def get_employee_dashboard():
 
     _employee_cache = (now, result)
     return result
+
+
+# ── Fleet Sessions — all active sessions across accounts ────────────────────
+
+_fleet_cache = None  # type: Optional[Tuple[float, List[Dict[str, Any]]]]
+
+
+def get_fleet_sessions():
+    # type: () -> List[Dict[str, Any]]
+    """Fetch all active sessions from session_locks, enriched for fleet view.
+
+    Returns list of dicts sorted by account then heartbeat (newest first).
+    Each dict: session_id, account, role, repo, task, files, hb_age_s,
+    five_pct, output_tokens_k, is_stale.
+    """
+    global _fleet_cache
+    now = time.time()
+    if _fleet_cache is not None:
+        cached_at, cached_data = _fleet_cache
+        if now - cached_at < 15:
+            return cached_data
+
+    import urllib.request
+    import json as _json
+
+    key = __SUPABASE_KEY
+    supa = _SUPABASE_URL
+
+    now_utc = datetime.now(timezone.utc)
+
+    req = urllib.request.Request(
+        f"{supa}/session_locks?status=eq.active"
+        "&select=session_id,account,role,repo,task_name,files_touched,"
+        "heartbeat_at,five_pct,output_tokens,model&limit=100",
+        headers={"apikey": key, "Authorization": "Bearer " + key},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=5) as r:
+            rows = _json.loads(r.read())
+    except Exception as e:
+        _log.warning("get_fleet_sessions: %s", e)
+        rows = []
+
+    result = []
+    stale_cutoff = now_utc - timedelta(minutes=5)
+
+    for s in rows:
+        hb_str = s.get("heartbeat_at") or ""
+        hb_age_s = None
+        is_stale = True
+        if hb_str:
+            try:
+                hb_dt = datetime.fromisoformat(hb_str.replace("Z", "+00:00"))
+                hb_age_s = int((now_utc - hb_dt).total_seconds())
+                is_stale = hb_dt < stale_cutoff
+            except Exception:
+                pass
+
+        files = s.get("files_touched") or []
+        # Show only basenames, max 3
+        file_names = [f.split("/")[-1] for f in files[:3]]
+        if len(files) > 3:
+            file_names.append(f"+{len(files)-3}")
+        files_str = ", ".join(file_names) if file_names else "—"
+
+        output_tokens = s.get("output_tokens") or 0
+
+        result.append({
+            "session_id": s.get("session_id", "?"),
+            "account": s.get("account") or "?",
+            "role": s.get("role") or "worker",
+            "repo": s.get("repo") or "—",
+            "task": (s.get("task_name") or "—")[:55],
+            "files": files_str,
+            "hb_age_s": hb_age_s,
+            "five_pct": float(s.get("five_pct") or 0.0),
+            "output_tokens_k": round(output_tokens / 1000, 1),
+            "is_stale": is_stale,
+            "model": (s.get("model") or "?")[:15],
+        })
+
+    # Sort: account (A/B/C/?), then freshest first
+    result.sort(key=lambda x: (x["account"], x.get("hb_age_s") or 9999))
+
+    _fleet_cache = (now, result)
+    return result

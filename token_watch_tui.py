@@ -4575,26 +4575,30 @@ class LeaderboardView(LazyView):
 
 
 class EmployeeView(LazyView):
-    """Per-employee (account A/B/C) productivity dashboard — press T to open."""
+    """Team dashboard — account summary + live fleet view of all sessions (press T)."""
 
     def refresh_content(self):
         now = time.time()
-        if not hasattr(self, "_last_refresh") or (now - self._last_refresh) > 30:
+        if not hasattr(self, "_last_refresh") or (now - self._last_refresh) > 15:
             self._last_refresh = now
             self.load_content()
 
     def compose(self) -> ComposeResult:
         yield Static(id="emp-header")
         yield DataTable(id="emp-table")
+        yield Static(id="fleet-header")
+        yield DataTable(id="fleet-table")
         yield Static(id="emp-footer")
 
     def load_content(self):
-        from token_watch_data import get_employee_dashboard
+        from token_watch_data import get_employee_dashboard, get_fleet_sessions
         employees = get_employee_dashboard()
+        fleet = get_fleet_sessions()
 
+        # ── Account summary ──────────────────────────────────────────────────
         self.query_one("#emp-header", Static).update(
-            "[bold]Team Dashboard[/bold]  "
-            "[dim]account A/B/C · active sessions · capacity · builds · score[/dim]"
+            "[bold]Account Summary[/bold]  "
+            "[dim]A/B/C capacity · builds · score[/dim]"
         )
 
         dt = self.query_one("#emp-table", DataTable)
@@ -4604,8 +4608,8 @@ class EmployeeView(LazyView):
         dt.add_column("", width=3)
         dt.add_column("Acct", width=6)
         dt.add_column("Name", width=14)
-        dt.add_column("Sessions", width=10)
-        dt.add_column("Current Task", width=52)
+        dt.add_column("Sess", width=6)
+        dt.add_column("Current Task", width=46)
         dt.add_column("5h%", width=6)
         dt.add_column("7d%", width=6)
         dt.add_column("Bld/d", width=7)
@@ -4650,9 +4654,81 @@ class EmployeeView(LazyView):
             dt.add_row("", Text("No account data available", style="dim"),
                        "", "", "", "", "", "", "", "")
 
+        # ── Fleet view ───────────────────────────────────────────────────────
+        active_count = sum(1 for s in fleet if not s["is_stale"])
+        stale_count = sum(1 for s in fleet if s["is_stale"])
+        self.query_one("#fleet-header", Static).update(
+            f"[bold]Fleet View[/bold]  "
+            f"[dim]{active_count} active · {stale_count} stale · "
+            "all sessions across all accounts · Hb=heartbeat age[/dim]"
+        )
+
+        ft = self.query_one("#fleet-table", DataTable)
+        ft.clear(columns=True)
+        ft.cursor_type = "row"
+        ft.zebra_stripes = True
+        ft.add_column("Acct", width=6)
+        ft.add_column("Session", width=14)
+        ft.add_column("Role", width=8)
+        ft.add_column("Repo", width=14)
+        ft.add_column("Task / Directive", width=46)
+        ft.add_column("Files Editing", width=30)
+        ft.add_column("Hb", width=7)
+        ft.add_column("5h%", width=6)
+        ft.add_column("Tok/k", width=7)
+
+        for s in fleet:
+            label = s["account"]
+            color = acct_colors.get(label, "white")
+
+            age_s = s.get("hb_age_s")
+            if age_s is None:
+                age_str = "?"
+            elif age_s < 60:
+                age_str = f"{age_s}s"
+            elif age_s < 3600:
+                age_str = f"{age_s//60}m"
+            else:
+                age_str = f"{age_s//3600}h"
+
+            hb_color = "dim" if s["is_stale"] else (
+                "green" if (age_s or 999) < 120 else "yellow"
+            )
+            row_style = "dim" if s["is_stale"] else ""
+
+            five = s["five_pct"]
+            five_color = "dim" if s["is_stale"] else (
+                "red" if five >= 80 else ("yellow" if five >= 60 else "green")
+            )
+
+            raw_role = s["role"] or "worker"
+            role_str = raw_role[:7]  # advisor/worker/builder — truncate to fit
+            role_color = "dim" if raw_role == "advisor" else ""
+
+            acct_cell = (
+                Text.from_markup(f"[{color}]{label}[/{color}]")
+                if not row_style else Text(label, style="dim")
+            )
+
+            ft.add_row(
+                acct_cell,
+                Text(s["session_id"][:13], style=row_style or "dim"),
+                Text(role_str, style=role_color or row_style),
+                Text(s["repo"][:13], style=row_style),
+                Text(s["task"][:46], style=row_style, overflow="fold"),
+                Text(s["files"][:29], style="dim"),
+                Text(age_str, style=hb_color),
+                Text(f"{five:.0f}%", style=five_color),
+                Text(f"{s['output_tokens_k']:.1f}", style=row_style or "dim", justify="right"),
+            )
+
+        if not fleet:
+            ft.add_row("", Text("No active sessions found", style="dim"),
+                       "", "", "", "", "", "", "")
+
         self.query_one("#emp-footer", Static).update(
             f"[dim]Updated {datetime.now().strftime('%H:%M:%S')} · "
-            "score = 3×builds_today + 1×builds_week + 2×worker_sessions[/dim]"
+            "T key · score=3×bld_today+1×bld_week+2×sessions[/dim]"
         )
 
 
