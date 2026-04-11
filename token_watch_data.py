@@ -2982,6 +2982,127 @@ def _get_token_attribution():
     return result
 
 
+# ── per-engine (model) breakdown ────────────────────────────────────────
+# Deepens the #112951 attribution fix with a per-engine roll-up. The Engine
+# Management panel uses this to show "opus burned 45%, sonnet burned 15%" at
+# a glance instead of only showing per-session numbers that require mental
+# aggregation. Reuses the account-filtered attribution result so there's no
+# additional ledger scan — effectively a view on cached data.
+
+_ENGINE_CACHE = None  # type: Optional[Dict]
+_ENGINE_CACHE_TIME = 0.0
+_ENGINE_CACHE_ACCOUNT = None  # type: Optional[str]
+
+
+def _normalise_engine(model):
+    # type: (Any) -> str
+    """Collapse a model string to a canonical engine label.
+
+    ``_abbrev_model`` already folds tier suffixes (opus:1m → opus) but it
+    can still emit raw fallbacks like ``"claude"`` or first-10-chars when
+    the upstream value is unexpected. This helper adds a final normalisation
+    step so the breakdown never splits ``opus`` from ``opus:1m``.
+    """
+    if not model:
+        return "unknown"
+    s = str(model).lower()
+    if "opus" in s:
+        return "opus"
+    if "sonnet" in s:
+        return "sonnet"
+    if "haiku" in s:
+        return "haiku"
+    if "gpt" in s or "openai" in s or "codex" in s:
+        return "gpt"
+    if "gemini" in s:
+        return "gemini"
+    if "grok" in s:
+        return "grok"
+    return s.split()[0][:10] or "unknown"
+
+
+def _get_engine_breakdown():
+    # type: () -> Dict[str, Any]
+    """Return per-engine (model) attribution for the current 5h window.
+
+    Output shape::
+
+        {
+            "total_pct": 45.3,           # sum of pct_used across engines
+            "account": "B",              # active account used for the calc
+            "engines": [
+                {"engine": "opus", "pct": 30.1, "sessions": 3, "tools": 42},
+                {"engine": "sonnet", "pct": 12.2, "sessions": 2, "tools": 8},
+                {"engine": "unknown", "pct": 3.0, "sessions": 1, "tools": 2},
+            ]
+        }
+
+    Sorted by ``pct`` descending. Empty ``engines`` list + total 0 when
+    there's no attribution data (e.g. right after a /switch-account).
+    Account-filtered via ``_get_token_attribution`` — does not introduce a
+    second ledger scan. Cached for 30 seconds with account-change
+    invalidation, same pattern as attribution + burndown.
+    """
+    global _ENGINE_CACHE, _ENGINE_CACHE_TIME, _ENGINE_CACHE_ACCOUNT
+    try:
+        current_account = _get_active_account()[0]
+    except Exception:
+        current_account = None
+
+    now = time.time()
+    if (
+        _ENGINE_CACHE
+        and now - _ENGINE_CACHE_TIME < 30
+        and _ENGINE_CACHE_ACCOUNT == current_account
+    ):
+        return _ENGINE_CACHE
+
+    empty = {"total_pct": 0.0, "account": current_account, "engines": []}
+
+    try:
+        attribution = _get_token_attribution()
+    except Exception as exc:
+        _log.warning("_get_engine_breakdown: attribution failed: %s", exc)
+        return empty
+
+    if not attribution:
+        return empty
+
+    engine_data = {}  # type: Dict[str, Dict[str, Any]]
+    for sess in attribution.get("sessions", []) or []:
+        engine = _normalise_engine(sess.get("model"))
+        bucket = engine_data.setdefault(
+            engine,
+            {"engine": engine, "pct": 0.0, "sessions": 0, "tools": 0},
+        )
+        try:
+            bucket["pct"] += float(sess.get("pct_used") or 0)
+        except (TypeError, ValueError):
+            pass
+        bucket["sessions"] += 1
+        try:
+            bucket["tools"] += int(sess.get("tool_count") or 0)
+        except (TypeError, ValueError):
+            pass
+
+    engines = sorted(engine_data.values(), key=lambda e: (-e["pct"], e["engine"]))
+    # Round after sort so ties don't reorder oddly
+    for e in engines:
+        e["pct"] = round(e["pct"], 1)
+
+    total_pct = round(sum(e["pct"] for e in engines), 1)
+
+    result = {
+        "total_pct": total_pct,
+        "account": current_account,
+        "engines": engines,
+    }
+    _ENGINE_CACHE = result
+    _ENGINE_CACHE_TIME = now
+    _ENGINE_CACHE_ACCOUNT = current_account
+    return result
+
+
 # ── system health ───────────────────────────────────────────────────────────
 
 _SYSTEM_MEM_MB = 16384  # default, updated on first call
