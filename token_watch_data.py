@@ -2538,12 +2538,24 @@ def _get_burndown_data():
         mins_total = 300.0  # 5 hours
         mins_elapsed = max(0, (now_utc - window_start).total_seconds() / 60)
         mins_to_reset = max(0, (reset - now_utc).total_seconds() / 60)
-        remaining_pct = 100.0 - _safe_float(five)
+        # Clamp remaining_pct to [0, 100]. Without this, a stale statusline
+        # payload mid-account-switch can surface `five` values outside the
+        # valid range (observed: 144% then jumping to 14% within seconds, the
+        # exact symptom in bug #127277). Upstream sources should never emit
+        # >100 or <0 but the display must be defensive — a chart axis that
+        # exceeds its own range is always a worse UX than a capped one.
+        remaining_pct = max(0.0, min(100.0, 100.0 - _safe_float(five)))
     except Exception as e:
         _log.debug("__get_burndown_data: %s", e)
         return {}
 
-    # Load ledger and bucket actual data at 2-min intervals
+    # Load ledger and bucket actual data at 2-min intervals.
+    # Strict account filtering can leave raw_points empty right after a
+    # /switch-account (the new account has no tagged ledger entries yet). In
+    # that case we fall back to the current remaining_pct as a single
+    # synthetic point rather than emitting a flat 100% chart that then flips
+    # to the real value on the next refresh — the flip is the source of the
+    # "144% → 14%" symptom users reported.
     entries = _load_ledger(account=current_account)
     raw_points = []  # type: List[Tuple[float, float]]  # (mins_elapsed, remaining_pct)
     for e in entries:
@@ -2557,10 +2569,19 @@ def _get_burndown_data():
             if ts < window_start:
                 continue
             elapsed = (ts - window_start).total_seconds() / 60
-            raw_points.append((elapsed, 100.0 - _safe_float(pct)))
+            # Same clamp as the top-level remaining_pct — protects the chart
+            # and the current_rate calc against out-of-range ledger values.
+            point_remaining = max(0.0, min(100.0, 100.0 - _safe_float(pct)))
+            raw_points.append((elapsed, point_remaining))
         except Exception as e:
             _log.debug("__get_burndown_data: %s", e)
             continue
+
+    if not raw_points:
+        # Account switch just happened OR ledger filter cleared everything.
+        # Seed one point at "now" so the chart anchors to live remaining_pct
+        # instead of a hard-coded 100%.
+        raw_points.append((mins_elapsed, remaining_pct))
 
     # Bucket into 2-minute intervals
     bucket_size = 2.0
@@ -2586,21 +2607,31 @@ def _get_burndown_data():
         ideal_remaining = max(0, 100.0 * (1.0 - m / mins_total))
         ideal.append((m, ideal_remaining))
 
-    # Current rate: average over last 10 minutes
+    # Current rate: average over last 10 minutes.
+    # Clamp to non-negative — if a window reset happens mid-interval, newer
+    # samples can have HIGHER remaining_pct than older ones, which would
+    # produce a negative "consumption rate". Downstream projection code
+    # (projected_remaining_at_reset = remaining - rate*mins) would then
+    # compute remaining + |rate|*mins, breaking the 100% cap. Clamping here
+    # means a window reset just reads as "0%/min burn" until the next tick
+    # — undercounts briefly, but never renders nonsense.
     current_rate = 0.0
     recent = [(m, r) for m, r in raw_points if m > mins_elapsed - 10]
     if len(recent) >= 2:
         delta_pct = recent[0][1] - recent[-1][1]  # remaining dropped by this much
         delta_mins = recent[-1][0] - recent[0][0]
         if delta_mins > 0:
-            current_rate = delta_pct / delta_mins  # %/min consumed
+            current_rate = max(0.0, delta_pct / delta_mins)  # %/min consumed
 
-    # Projection
+    # Projection. Both derived values are clamped to [0, 100] so a spiky
+    # current_rate can't produce nonsense at the edges of the window.
     projected_wall_mins = None  # type: Optional[float]
     projected_remaining_at_reset = remaining_pct
     if current_rate > 0:
         projected_wall_mins = remaining_pct / current_rate
-        projected_remaining_at_reset = max(0, remaining_pct - current_rate * mins_to_reset)
+        projected_remaining_at_reset = max(
+            0.0, min(100.0, remaining_pct - current_rate * mins_to_reset)
+        )
 
     # Status
     if projected_wall_mins is not None and projected_wall_mins < 15:
