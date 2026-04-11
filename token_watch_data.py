@@ -3405,6 +3405,167 @@ def _get_session_activity_history(session_id, limit=10, lookback_hours=24):
     return enriched
 
 
+# ── recent decisions digest ────────────────────────────────────────────────
+# Alex's convention: commits prefixed with `[DECISION]` or `decision:` are
+# captured into build_ledger with item_type='decision' by the PostToolUse
+# hook. Those rows are the architectural trail — "why X over Y", "locked
+# the Spending Guard", "Wire uses Supabase not files". This helper surfaces
+# the recent decision stream so a Mission Control panel or the advisor
+# briefing can show "here's what the team has committed to lately".
+
+_DECISIONS_CACHE = None  # type: Optional[Dict[str, Any]]
+_DECISIONS_CACHE_TIME = 0.0
+_DECISIONS_CACHE_KEY = None  # type: Optional[Tuple[int, int]]
+_DECISIONS_CACHE_TTL = 30.0
+
+
+def _get_recent_decisions(lookback_hours=72, limit=30):
+    # type: (int, int) -> Dict[str, Any]
+    """Return the recent decision stream from build_ledger.
+
+    Output shape::
+
+        {
+            "lookback_hours": 72,
+            "total": 18,
+            "by_project": {
+                "atlas": 9,
+                "token-watch": 4,
+                "battlestation": 3,
+                "openclaw": 2,
+            },
+            "by_session": {
+                "cc-81043": 5,
+                "cc-9930": 3,
+                ...
+            },
+            "decisions": [
+                {
+                    "id": "uuid",
+                    "title": "Wire uses Supabase not files",
+                    "project": "token-watch",
+                    "company": "personal",
+                    "session_id": "cc-9930",
+                    "commit_sha": "fac7cd4",
+                    "created_at": "...",
+                    "age_minutes": 12.3,
+                },
+                ...
+            ]
+        }
+
+    Sorted newest-first. Cached for 30 seconds keyed on (lookback_hours,
+    limit). Exceptions fall through to an empty shape.
+    """
+    global _DECISIONS_CACHE, _DECISIONS_CACHE_TIME, _DECISIONS_CACHE_KEY
+
+    try:
+        lookback_hours = max(1, int(lookback_hours))
+    except (TypeError, ValueError):
+        lookback_hours = 72
+    try:
+        limit = max(1, min(int(limit), 200))
+    except (TypeError, ValueError):
+        limit = 30
+
+    cache_key = (lookback_hours, limit)
+    now = time.time()
+    if (
+        _DECISIONS_CACHE is not None
+        and _DECISIONS_CACHE_KEY == cache_key
+        and now - _DECISIONS_CACHE_TIME < _DECISIONS_CACHE_TTL
+    ):
+        return _DECISIONS_CACHE
+
+    empty = {
+        "lookback_hours": lookback_hours,
+        "total": 0,
+        "by_project": {},
+        "by_session": {},
+        "decisions": [],
+    }
+
+    cutoff = (
+        datetime.now(timezone.utc) - timedelta(hours=lookback_hours)
+    ).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    import urllib.request as _ur
+
+    url = (
+        "{base}/build_ledger?item_type=eq.decision"
+        "&created_at=gt.{cutoff}"
+        "&order=created_at.desc&limit={lim}"
+        "&select=id,session_id,project,company,title,commit_sha,created_at"
+    ).format(base=_SUPABASE_URL, cutoff=cutoff, lim=limit)
+
+    try:
+        req = _ur.Request(
+            url,
+            headers={
+                "apikey": __SUPABASE_KEY,
+                "Authorization": "Bearer " + __SUPABASE_KEY,
+            },
+        )
+        with _ur.urlopen(req, timeout=5) as resp:
+            rows = json.loads(resp.read().decode("utf-8"))
+    except Exception as exc:
+        _log.warning("_get_recent_decisions fetch: %s", exc)
+        return empty
+
+    if not isinstance(rows, list):
+        return empty
+
+    now_utc = datetime.now(timezone.utc)
+    decisions = []
+    by_project = {}  # type: Dict[str, int]
+    by_session = {}  # type: Dict[str, int]
+
+    for row in rows:
+        project = row.get("project") or "unknown"
+        session_id = row.get("session_id") or "unknown"
+        by_project[project] = by_project.get(project, 0) + 1
+        by_session[session_id] = by_session.get(session_id, 0) + 1
+
+        ts = None
+        try:
+            raw_ts = row.get("created_at") or ""
+            if raw_ts:
+                ts = datetime.fromisoformat(str(raw_ts).replace("Z", "+00:00"))
+                if ts.tzinfo is None:
+                    ts = ts.replace(tzinfo=timezone.utc)
+        except Exception:
+            ts = None
+        age_mins = None
+        if ts is not None:
+            age_mins = round((now_utc - ts).total_seconds() / 60.0, 1)
+
+        decisions.append(
+            {
+                "id": row.get("id"),
+                "title": row.get("title") or "",
+                "project": project,
+                "company": row.get("company") or "",
+                "session_id": session_id,
+                "commit_sha": row.get("commit_sha") or "",
+                "created_at": row.get("created_at") or "",
+                "age_minutes": age_mins,
+            }
+        )
+
+    result = {
+        "lookback_hours": lookback_hours,
+        "total": len(decisions),
+        "by_project": dict(sorted(by_project.items(), key=lambda kv: (-kv[1], kv[0]))),
+        "by_session": dict(sorted(by_session.items(), key=lambda kv: (-kv[1], kv[0]))),
+        "decisions": decisions,
+    }
+
+    _DECISIONS_CACHE = result
+    _DECISIONS_CACHE_TIME = now
+    _DECISIONS_CACHE_KEY = cache_key
+    return result
+
+
 # ── system health ───────────────────────────────────────────────────────────
 
 _SYSTEM_MEM_MB = 16384  # default, updated on first call
