@@ -3566,6 +3566,268 @@ def _get_recent_decisions(lookback_hours=72, limit=30):
     return result
 
 
+# ── test status roll-up ────────────────────────────────────────────────────
+# build_ledger rows carry a ``test_status`` column (``untested`` | ``tested``
+# | ``verified`` | ``skipped``). Untested items pile up fast during burn
+# sessions. This helper surfaces the pile-up as a numeric health score + a
+# list of the oldest untested items, so a Mission Control panel or the
+# advisor briefing can say "atlas has 43 untested builds, oldest is 6 hours
+# old — recommend a /verify pass".
+#
+# Real data contains more status variants than the nominal four — we've
+# observed ``passed``, ``passing``, ``ci_green``, ``ci_pending``, ``failed``,
+# ``pushed_to_queue``, ``pending``. The classifier below normalises each
+# raw value into one of three buckets so the tested_pct ratio is stable
+# across producers.
+
+_TEST_ROLLUP_CACHE = None  # type: Optional[Dict[str, Any]]
+_TEST_ROLLUP_CACHE_TIME = 0.0
+_TEST_ROLLUP_CACHE_KEY = None  # type: Optional[Tuple[int, int]]
+_TEST_ROLLUP_CACHE_TTL = 30.0
+
+
+def _classify_test_status(status):
+    # type: (Any) -> str
+    """Return one of ``"tested"``, ``"untested"``, ``"skipped"`` for any
+    raw ``test_status`` value.
+
+    ``failed`` / ``ci_pending`` / ``pending`` / ``pushed_to_queue`` all
+    roll up into ``"untested"`` — they aren't green yet. Substring match
+    is intentional so future producer variants (``ci_passed``, ``all_ok``,
+    etc.) land in the right bucket, but we check the untested markers
+    FIRST to avoid the ``"tested" in "untested"`` trap.
+    """
+    if status is None:
+        return "untested"
+    s = str(status).strip().lower()
+    if not s:
+        return "untested"
+
+    # Skipped first — rare but unambiguous.
+    if "skip" in s or s == "n/a":
+        return "skipped"
+
+    # Untested markers next — these have to win over "tested" because
+    # ``"untested"`` literally contains ``"tested"``.
+    untested_markers = (
+        "untested",
+        "failed",
+        "fail",
+        "pending",
+        "ci_pending",
+        "queue",
+        "blocked",
+    )
+    if any(m in s for m in untested_markers):
+        return "untested"
+
+    # Finally the tested markers. Kept as substrings so ``ci_green``,
+    # ``all_pass``, ``tests_passed``, etc. all classify correctly.
+    tested_markers = (
+        "tested",
+        "verif",
+        "pass",
+        "green",
+        "succe",
+    )
+    if any(m in s for m in tested_markers):
+        return "tested"
+
+    return "untested"
+
+
+def _get_test_status_rollup(lookback_hours=48, oldest_limit=10):
+    # type: (int, int) -> Dict[str, Any]
+    """Summarise ``test_status`` across build_ledger for the last N hours.
+
+    Output shape::
+
+        {
+            "lookback_hours": 48,
+            "total": 312,
+            "by_status": {
+                "untested": 187,
+                "tested": 98,
+                "verified": 20,
+                "skipped": 7,
+            },
+            "tested_pct": 37.8,      # (tested + verified) / total * 100
+            "by_project": {
+                "atlas": {"total": 205, "untested": 140, "tested_pct": 31.7},
+                "token-watch": {"total": 55, "untested": 8, "tested_pct": 85.5},
+                ...
+            },
+            "oldest_untested": [
+                {"title": "...", "project": "...", "age_hours": 12.3, ...},
+                ...
+            ],
+        }
+
+    ``tested_pct`` counts both ``tested`` and ``verified`` statuses as
+    tested. ``skipped`` is excluded from the ratio so a heavily-skipped
+    project doesn't inflate its health. Cached for 30 seconds keyed on
+    ``(lookback_hours, oldest_limit)``.
+    """
+    global _TEST_ROLLUP_CACHE, _TEST_ROLLUP_CACHE_TIME, _TEST_ROLLUP_CACHE_KEY
+
+    try:
+        lookback_hours = max(1, int(lookback_hours))
+    except (TypeError, ValueError):
+        lookback_hours = 48
+    try:
+        oldest_limit = max(1, min(int(oldest_limit), 100))
+    except (TypeError, ValueError):
+        oldest_limit = 10
+
+    cache_key = (lookback_hours, oldest_limit)
+    now = time.time()
+    if (
+        _TEST_ROLLUP_CACHE is not None
+        and _TEST_ROLLUP_CACHE_KEY == cache_key
+        and now - _TEST_ROLLUP_CACHE_TIME < _TEST_ROLLUP_CACHE_TTL
+    ):
+        return _TEST_ROLLUP_CACHE
+
+    empty = {
+        "lookback_hours": lookback_hours,
+        "total": 0,
+        "by_status": {},
+        "tested_pct": 0.0,
+        "by_project": {},
+        "oldest_untested": [],
+    }
+
+    cutoff = (
+        datetime.now(timezone.utc) - timedelta(hours=lookback_hours)
+    ).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    import urllib.request as _ur
+
+    url = (
+        "{base}/build_ledger?created_at=gt.{cutoff}"
+        "&order=created_at.desc&limit=2000"
+        "&select=id,project,title,test_status,created_at"
+    ).format(base=_SUPABASE_URL, cutoff=cutoff)
+
+    try:
+        req = _ur.Request(
+            url,
+            headers={
+                "apikey": __SUPABASE_KEY,
+                "Authorization": "Bearer " + __SUPABASE_KEY,
+            },
+        )
+        with _ur.urlopen(req, timeout=5) as resp:
+            rows = json.loads(resp.read().decode("utf-8"))
+    except Exception as exc:
+        _log.warning("_get_test_status_rollup fetch: %s", exc)
+        return empty
+
+    if not isinstance(rows, list):
+        return empty
+
+    by_status_raw = {}  # type: Dict[str, int]   # raw values, for debugging
+    by_bucket = {"tested": 0, "untested": 0, "skipped": 0}
+    by_project = {}  # type: Dict[str, Dict[str, int]]
+    untested_entries = []  # type: List[Dict[str, Any]]
+    now_utc = datetime.now(timezone.utc)
+
+    for row in rows:
+        raw_status = (row.get("test_status") or "").strip().lower() or "untested"
+        bucket = _classify_test_status(raw_status)
+        project = row.get("project") or "unknown"
+        title = row.get("title") or ""
+
+        by_status_raw[raw_status] = by_status_raw.get(raw_status, 0) + 1
+        by_bucket[bucket] += 1
+        proj_entry = by_project.setdefault(
+            project,
+            {"total": 0, "tested": 0, "untested": 0, "skipped": 0},
+        )
+        proj_entry["total"] += 1
+        proj_entry[bucket] += 1
+
+        if bucket == "untested":
+            ts = None
+            try:
+                raw_ts = row.get("created_at") or ""
+                if raw_ts:
+                    ts = datetime.fromisoformat(str(raw_ts).replace("Z", "+00:00"))
+                    if ts.tzinfo is None:
+                        ts = ts.replace(tzinfo=timezone.utc)
+            except Exception:
+                ts = None
+            age_hours = None
+            if ts is not None:
+                age_hours = round((now_utc - ts).total_seconds() / 3600.0, 1)
+            untested_entries.append(
+                {
+                    "id": row.get("id"),
+                    "title": title,
+                    "project": project,
+                    "created_at": row.get("created_at") or "",
+                    "age_hours": age_hours,
+                }
+            )
+
+    total = sum(by_bucket.values())
+
+    def _ratio(tested, total_for_ratio):
+        if total_for_ratio <= 0:
+            return 0.0
+        return round(100.0 * tested / total_for_ratio, 1)
+
+    total_for_ratio = total - by_bucket["skipped"]
+    tested_pct = _ratio(by_bucket["tested"], total_for_ratio)
+
+    # Per-project tested_pct with the same rules
+    project_summary = {}
+    for proj, counts in by_project.items():
+        proj_total = counts["total"]
+        proj_tested = counts["tested"]
+        proj_skipped = counts["skipped"]
+        proj_ratio = _ratio(proj_tested, proj_total - proj_skipped)
+        project_summary[proj] = {
+            "total": proj_total,
+            "untested": counts["untested"],
+            "tested": proj_tested,
+            "skipped": proj_skipped,
+            "tested_pct": proj_ratio,
+        }
+
+    project_summary = dict(
+        sorted(
+            project_summary.items(),
+            key=lambda kv: (-kv[1]["untested"], kv[0]),
+        )
+    )
+
+    # Oldest untested first — sort by age_hours desc, None last
+    def _age_sort_key(item):
+        ah = item.get("age_hours")
+        return (1 if ah is None else 0, -(ah or 0.0))
+
+    untested_entries.sort(key=_age_sort_key)
+    oldest_untested = untested_entries[:oldest_limit]
+
+    result = {
+        "lookback_hours": lookback_hours,
+        "total": total,
+        "by_bucket": by_bucket,
+        "by_status_raw": dict(
+            sorted(by_status_raw.items(), key=lambda kv: (-kv[1], kv[0]))
+        ),
+        "tested_pct": tested_pct,
+        "by_project": project_summary,
+        "oldest_untested": oldest_untested,
+    }
+
+    _TEST_ROLLUP_CACHE = result
+    _TEST_ROLLUP_CACHE_TIME = now
+    _TEST_ROLLUP_CACHE_KEY = cache_key
+    return result
+
+
 # ── system health ───────────────────────────────────────────────────────────
 
 _SYSTEM_MEM_MB = 16384  # default, updated on first call
