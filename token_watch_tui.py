@@ -1943,6 +1943,7 @@ class NavBar(Horizontal):
         ]),
         ("Intelligence", [
             ("Mission", "nav-mission"),
+            ("Proj Stats", "nav-proj-stats"),
             ("Delphi", "nav-delphi"),
             ("Analytics", "nav-analytics"),
             ("Audit", "nav-audit"),
@@ -2018,6 +2019,7 @@ class NavigationScreen(Screen):
                 "nav-rules": "view-rules",
                 "nav-audit": "view-audit",
                 "nav-mission": "view-mission",
+                "nav-proj-stats": "view-proj-stats",
                 "nav-delphi": "view-delphi",
                 "nav-wire": "view-wire",
                 "nav-advisor": "view-advisor",
