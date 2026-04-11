@@ -471,7 +471,7 @@ class EngineTable(DataTable):
     def on_mount(self):
         self.cursor_type = "row"
         self.zebra_stripes = False
-        self.add_column("When", width=9, key="when")
+        self.add_column("When", width=11, key="when")
         self.add_column("Session", width=10, key="session")
         self.add_column("Acct", width=4, key="acct")
         self.add_column("Src", width=10, key="src")
@@ -588,7 +588,7 @@ class EngineTable(DataTable):
             # Header row
             elapsed_s = _etime_to_secs(age)
             start_str = (
-                (now_local - timedelta(seconds=elapsed_s)).strftime("%H:%M:%S")
+                (now_local - timedelta(seconds=elapsed_s)).strftime("%m/%d %H:%M")
                 if elapsed_s else "?"
             )
 
@@ -729,6 +729,11 @@ class EngineTable(DataTable):
             cpu_str = f"{cpu:.0f}%"
             cpu_style = "bold yellow" if cpu > 50 else ("dim" if cpu < 5 else "")
 
+            # Directive second line: show continuation if directive is long
+            directive_line2 = ""
+            if directive and len(directive) > 40:
+                directive_line2 = directive[40:]
+
             self.add_row(
                 Text(""),
                 Text(""),
@@ -738,9 +743,9 @@ class EngineTable(DataTable):
                 Text(""),
                 state_txt,
                 Text(""),
-                Text(f"ago: {elapsed_str}", style="dim"),
+                Text(f"ago: {elapsed_str}  cpu: {cpu_str}", style="dim"),
                 Text(f"tok: {tok_str}", style="dim"),
-                Text(f"cpu: {cpu_str}", style=cpu_style or ""),
+                Text(directive_line2, style="dim") if directive_line2 else Text(""),
                 key=f"sub-{pid}",
             )
 
@@ -789,7 +794,7 @@ class EngineTable(DataTable):
                     claimed_dt = datetime.fromisoformat(
                         claimed_raw.replace("Z", "+00:00")
                     ).astimezone()
-                    claimed_str = claimed_dt.strftime("%H:%M:%S")
+                    claimed_str = claimed_dt.strftime("%m/%d %H:%M")
                 except Exception:
                     claimed_str = "?"
 
