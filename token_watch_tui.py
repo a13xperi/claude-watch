@@ -1939,6 +1939,7 @@ class NavBar(Horizontal):
             ("Projects", "nav-projects"),
             ("Dispatch", "nav-dispatch"),
             ("Inbox", "nav-inbox"),
+            ("Team", "nav-team"),
         ]),
         ("Intelligence", [
             ("Mission", "nav-mission"),
@@ -2025,6 +2026,7 @@ class NavigationScreen(Screen):
                 "nav-capacity": "view-capacity",
                 "nav-inbox": "view-inbox",
                 "nav-plans": "view-plans",
+                "nav-team": "view-team",
             }
             view_id = btn_map.get(view_key)
             if view_id:
@@ -4568,6 +4570,90 @@ class LeaderboardView(LazyView):
                 "", "", "", "", "", "", "", "",
             )
 
+
+# ── Employee / Team Dashboard ────────────────────────────────────────────────
+
+
+class EmployeeView(LazyView):
+    """Per-employee (account A/B/C) productivity dashboard — press T to open."""
+
+    def refresh_content(self):
+        now = time.time()
+        if not hasattr(self, "_last_refresh") or (now - self._last_refresh) > 30:
+            self._last_refresh = now
+            self.load_content()
+
+    def compose(self) -> ComposeResult:
+        yield Static(id="emp-header")
+        yield DataTable(id="emp-table")
+        yield Static(id="emp-footer")
+
+    def load_content(self):
+        from token_watch_data import get_employee_dashboard
+        employees = get_employee_dashboard()
+
+        self.query_one("#emp-header", Static).update(
+            "[bold]Team Dashboard[/bold]  "
+            "[dim]account A/B/C · active sessions · capacity · builds · score[/dim]"
+        )
+
+        dt = self.query_one("#emp-table", DataTable)
+        dt.clear(columns=True)
+        dt.cursor_type = "row"
+        dt.zebra_stripes = True
+        dt.add_column("", width=3)
+        dt.add_column("Acct", width=6)
+        dt.add_column("Name", width=14)
+        dt.add_column("Sessions", width=10)
+        dt.add_column("Current Task", width=52)
+        dt.add_column("5h%", width=6)
+        dt.add_column("7d%", width=6)
+        dt.add_column("Bld/d", width=7)
+        dt.add_column("Bld/w", width=7)
+        dt.add_column("Score", width=7)
+
+        acct_colors = {"A": "cyan", "B": "magenta", "C": "yellow"}
+
+        for emp in employees:
+            label = emp["label"]
+            color = acct_colors.get(label, "white")
+            indicator = "[green]●[/green]" if emp["is_active"] else "[dim]○[/dim]"
+
+            five = emp["five_pct"]
+            seven = emp["seven_pct"]
+            five_color = "red" if five >= 80 else ("yellow" if five >= 60 else "green")
+            seven_color = "red" if seven >= 80 else ("yellow" if seven >= 60 else "green")
+
+            score = emp["score"]
+            score_color = "green" if score >= 10 else ("yellow" if score >= 4 else "dim")
+
+            sess_str = (
+                f"{emp['sessions_worker']}w/{emp['sessions_total']}t"
+                if emp["sessions_total"] > emp["sessions_worker"]
+                else str(emp["sessions_worker"])
+            )
+
+            dt.add_row(
+                Text.from_markup(indicator),
+                Text.from_markup(f"[{color}]{label}[/{color}]"),
+                Text(emp["name"]),
+                Text(sess_str, justify="center"),
+                Text(emp["task"], overflow="fold"),
+                Text(f"{five:.0f}%", style=five_color),
+                Text(f"{seven:.0f}%", style=seven_color),
+                Text(str(emp["builds_today"]), justify="right"),
+                Text(str(emp["builds_week"]), justify="right"),
+                Text(f"{score:.0f}", style=score_color, justify="right"),
+            )
+
+        if not employees:
+            dt.add_row("", Text("No account data available", style="dim"),
+                       "", "", "", "", "", "", "", "")
+
+        self.query_one("#emp-footer", Static).update(
+            f"[dim]Updated {datetime.now().strftime('%H:%M:%S')} · "
+            "score = 3×builds_today + 1×builds_week + 2×worker_sessions[/dim]"
+        )
 
 
 # ── Cycles screens ──────────────────────────────────────────────────────────
@@ -9096,6 +9182,7 @@ class ClaudeWatchApp(App):
         Binding("R", "reload_build", "Reload", show=False),
         Binding("E", "show_expensive_turns", "Expensive"),
         Binding("P", "show_plans", "Plans"),
+        Binding("T", "show_team", "Team"),
     ]
 
     _filter_text = ""
@@ -9145,6 +9232,7 @@ class ClaudeWatchApp(App):
             yield DispatchView(id="view-dispatch")
             yield ExpensiveTurnsView(id="view-expensive-turns")
             yield PlansView(id="view-plans")
+            yield EmployeeView(id="view-team")
         yield Footer()
 
     def switch_view(self, view_id: str) -> None:
@@ -9181,6 +9269,7 @@ class ClaudeWatchApp(App):
             "view-inbox": "nav-inbox",
             "view-expensive-turns": "nav-dashboard",
             "view-plans": "nav-plans",
+            "view-team": "nav-team",
         }
         active_nav = nav_map.get(view_id, "")
         for btn in self.query("#nav-bar Button"):
@@ -9542,6 +9631,9 @@ class ClaudeWatchApp(App):
 
     def action_show_plans(self):
         self.switch_view("view-plans")
+
+    def action_show_team(self):
+        self.switch_view("view-team")
 
     def _ensure_cycle_list(self):
         """Load cycle list if not loaded."""

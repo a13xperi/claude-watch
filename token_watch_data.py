@@ -8681,3 +8681,133 @@ def get_weekly_cycles(limit=12):
 
     _weekly_cache = (now, limit, result)
     return result[:limit]
+
+
+# ── Employee / Team Dashboard ────────────────────────────────────────────────
+
+_employee_cache = None  # type: Optional[Tuple[float, List[Dict[str, Any]]]]
+
+
+def get_employee_dashboard():
+    # type: () -> List[Dict[str, Any]]
+    """Per-employee (account A/B/C) productivity snapshot.
+
+    Joins account_capacity + session_locks + build_ledger.
+    Returns list of dicts, one per account label A/B/C.
+    """
+    global _employee_cache
+    now = time.time()
+    if _employee_cache is not None:
+        cached_at, cached_data = _employee_cache
+        if now - cached_at < 30:
+            return cached_data
+
+    import urllib.request
+    import json as _json
+
+    key = __SUPABASE_KEY
+    supa = _SUPABASE_URL
+
+    def _fetch(path):
+        req = urllib.request.Request(
+            f"{supa}{path}",
+            headers={"apikey": key, "Authorization": "Bearer " + key},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=5) as r:
+                return _json.loads(r.read())
+        except Exception as e:
+            _log.warning("get_employee_dashboard fetch %s: %s", path, e)
+            return []
+
+    now_utc = datetime.now(timezone.utc)
+
+    # 1. Account capacity snapshots
+    caps = _get_supabase_account_capacity()
+    cap_map = {r.get("account"): r for r in caps}
+
+    # 2. Active session_locks grouped by account
+    active_locks = _fetch(
+        "/session_locks?status=eq.active"
+        "&select=session_id,account,task_name,repo,heartbeat_at,five_pct,output_tokens,role"
+        "&limit=50"
+    )
+    active_by_acct = {}  # type: Dict[str, List[Dict]]
+    for s in active_locks:
+        acct = s.get("account") or "?"
+        active_by_acct.setdefault(acct, []).append(s)
+
+    # 3. session_id→account map for build attribution (active + done last 48h)
+    since_48h = (now_utc - timedelta(hours=48)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    recent_locks = _fetch(
+        f"/session_locks?select=session_id,account"
+        f"&or=(status.eq.active,and(status.eq.done,released_at.gt.{since_48h}))"
+        f"&limit=500"
+    )
+    sid_to_acct = {
+        s.get("session_id"): s.get("account")
+        for s in recent_locks
+        if s.get("session_id")
+    }
+
+    # 4. Build ledger counts per account (today = last 24h, week = last 7d)
+    week_since = (now_utc - timedelta(days=7)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    today_since = (now_utc - timedelta(hours=24)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    builds = _fetch(
+        f"/build_ledger?created_at=gt.{week_since}"
+        f"&select=session_id,created_at&limit=1000"
+    )
+    builds_today = {}  # type: Dict[str, int]
+    builds_week = {}   # type: Dict[str, int]
+    for b in builds:
+        sid = b.get("session_id", "")
+        acct = sid_to_acct.get(sid, "?")
+        builds_week[acct] = builds_week.get(acct, 0) + 1
+        if (b.get("created_at") or "") >= today_since:
+            builds_today[acct] = builds_today.get(acct, 0) + 1
+
+    # 5. Compose result per account
+    result = []
+    for label in ("A", "B", "C"):
+        cap = cap_map.get(label, {})
+        sessions = active_by_acct.get(label, [])
+        worker_sessions = [s for s in sessions if s.get("role") != "advisor"]
+
+        # Current task from most-recent worker session
+        task_name = "—"
+        if worker_sessions:
+            ws_sorted = sorted(
+                worker_sessions,
+                key=lambda s: s.get("heartbeat_at") or "",
+                reverse=True,
+            )
+            task_name = (ws_sorted[0].get("task_name") or "—")[:50]
+
+        # Use capacity snapshot; fall back to live avg from active sessions
+        five_pct = cap.get("five_hour_used_pct")
+        if five_pct is None:
+            five_pcts = [s.get("five_pct") or 0.0 for s in sessions]
+            five_pct = sum(five_pcts) / len(five_pcts) if five_pcts else 0.0
+        seven_pct = cap.get("seven_day_used_pct") or 0.0
+
+        bd = builds_today.get(label, 0)
+        bw = builds_week.get(label, 0)
+        # Score: 3pts per build today, 1pt per build this week, 2pts per active session
+        score = bd * 3 + bw * 1 + len(worker_sessions) * 2
+
+        result.append({
+            "label": label,
+            "name": cap.get("account_name", label),
+            "is_active": cap.get("is_active", False),
+            "sessions_total": len(sessions),
+            "sessions_worker": len(worker_sessions),
+            "task": task_name,
+            "five_pct": float(five_pct),
+            "seven_pct": float(seven_pct),
+            "builds_today": bd,
+            "builds_week": bw,
+            "score": round(score, 1),
+        })
+
+    _employee_cache = (now, result)
+    return result
