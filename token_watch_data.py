@@ -3267,6 +3267,144 @@ def _get_wire_reliability(sender_sid=None, lookback_minutes=15):
     return result
 
 
+# ── per-session activity history ───────────────────────────────────────────
+# Support layer for the "click a session in the Dispatch tab → see its
+# recent claims" fallback. ``project_tasks.claimed_by`` clears on /done,
+# so a simple claim-lookup returns empty for recent completions. The
+# truthful source is ``build_ledger`` which records every completion
+# (feature / fix / decision / test) with session_id, title, and commit_sha.
+# This helper reads that table and returns a compact activity log suitable
+# for an inline drill-down panel.
+
+_ACTIVITY_HISTORY_CACHE = {}  # type: Dict[Tuple[str, int, int], Tuple[float, List[Dict[str, Any]]]]
+_ACTIVITY_HISTORY_TTL = 15.0
+
+
+def _get_session_activity_history(session_id, limit=10, lookback_hours=24):
+    # type: (str, int, int) -> List[Dict[str, Any]]
+    """Return the last ``limit`` build_ledger entries for ``session_id``.
+
+    Each entry::
+
+        {
+            "id": "...",
+            "session_id": "cc-9930",
+            "item_type": "feature",
+            "title": "Burn-rate sparkline",
+            "project": "token-watch",
+            "company": "personal",
+            "commit_sha": "6c5faeb",
+            "test_status": "tested",
+            "created_at": "2026-04-11T03:45:56Z",
+            "age_minutes": 8.3,
+            "status_color": "green",
+            "files": [...],
+        }
+
+    Sorted newest-first. Cached for 15 seconds keyed on
+    ``(session_id, limit, lookback_hours)``. Exceptions return ``[]`` so
+    the TUI refresh path cannot raise.
+    """
+    if not session_id:
+        return []
+    try:
+        limit = max(1, min(int(limit), 50))
+    except (TypeError, ValueError):
+        limit = 10
+    try:
+        lookback_hours = max(1, int(lookback_hours))
+    except (TypeError, ValueError):
+        lookback_hours = 24
+
+    cache_key = (str(session_id), limit, lookback_hours)
+    now = time.time()
+    cached = _ACTIVITY_HISTORY_CACHE.get(cache_key)
+    if cached and now - cached[0] < _ACTIVITY_HISTORY_TTL:
+        return cached[1]
+
+    import urllib.request as _ur
+    from urllib.parse import quote as _q
+
+    cutoff = (
+        datetime.now(timezone.utc) - timedelta(hours=lookback_hours)
+    ).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    url = (
+        "{base}/build_ledger?session_id=eq.{sid}"
+        "&created_at=gt.{cutoff}"
+        "&order=created_at.desc&limit={lim}"
+        "&select=id,session_id,item_type,title,project,company,commit_sha,"
+        "test_status,files,created_at"
+    ).format(base=_SUPABASE_URL, sid=_q(str(session_id)), cutoff=cutoff, lim=limit)
+
+    try:
+        req = _ur.Request(
+            url,
+            headers={
+                "apikey": __SUPABASE_KEY,
+                "Authorization": "Bearer " + __SUPABASE_KEY,
+            },
+        )
+        with _ur.urlopen(req, timeout=5) as resp:
+            rows = json.loads(resp.read().decode("utf-8"))
+    except Exception as exc:
+        _log.warning("_get_session_activity_history fetch: %s", exc)
+        return []
+
+    if not isinstance(rows, list):
+        return []
+
+    _ITEM_TYPE_COLORS = {
+        "feature": "green",
+        "fix": "yellow",
+        "test": "cyan",
+        "decision": "magenta",
+        "idea": "blue",
+        "refactor": "grey66",
+    }
+
+    now_utc = datetime.now(timezone.utc)
+    enriched = []  # type: List[Dict[str, Any]]
+    for row in rows:
+        ts = None
+        try:
+            raw_ts = row.get("created_at") or ""
+            if raw_ts:
+                ts = datetime.fromisoformat(str(raw_ts).replace("Z", "+00:00"))
+                if ts.tzinfo is None:
+                    ts = ts.replace(tzinfo=timezone.utc)
+        except Exception:
+            ts = None
+        age_mins = None
+        if ts is not None:
+            age_mins = round((now_utc - ts).total_seconds() / 60.0, 1)
+
+        item_type = (row.get("item_type") or "").lower() or "item"
+        files = row.get("files") or []
+        if not isinstance(files, list):
+            files = []
+
+        enriched.append(
+            {
+                "id": row.get("id"),
+                "session_id": row.get("session_id") or session_id,
+                "item_type": item_type,
+                "title": row.get("title") or "",
+                "project": row.get("project") or "",
+                "company": row.get("company") or "",
+                "commit_sha": row.get("commit_sha") or "",
+                "test_status": row.get("test_status") or "untested",
+                "files": files,
+                "created_at": row.get("created_at") or "",
+                "age_minutes": age_mins,
+                "status_color": _ITEM_TYPE_COLORS.get(item_type, "grey66"),
+            }
+        )
+
+    _ACTIVITY_HISTORY_CACHE[cache_key] = (now, enriched)
+    return enriched
+
+
 # ── system health ───────────────────────────────────────────────────────────
 
 _SYSTEM_MEM_MB = 16384  # default, updated on first call
