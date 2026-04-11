@@ -3509,21 +3509,34 @@ def make_header(five, seven, five_reset_ts, seven_reset_ts):
         f"[cyan]{datetime.now().strftime('%H:%M:%S')}[/cyan]  [dim]Last updated[/dim]",
         f"[{acct_color}]Account {label}[/{acct_color}]: {name} [dim]({lane})[/dim]",
     )
-    # Token pacing prediction
+    # Token pacing — current rate vs target rate to max out at reset
     pacing = _token_pacing()
     if pacing:
         if pacing["status"] == "at_limit":
             pace_str = f"[red]AT LIMIT[/red] — reset in {_countdown(five_reset_ts)}"
+            t.add_row(pace_str, "")
         else:
-            m100 = pacing["mins_to_100"]
-            mr = pacing["mins_to_reset"]
             burn = pacing["avg_burn"]
-            if m100 < mr:
-                pace_str = f"[yellow]100% in ~{m100:.0f}m[/yellow] at {burn:.1f}%/min"
+            remaining = pacing["remaining_pct"]
+            mr = pacing["mins_to_reset"]
+            target = remaining / mr if mr > 0 else 0.0
+            # Verdict: on pace to max out, underburning, or burning too fast
+            if remaining < 3:
+                verdict = "[bold green]✓ USED UP[/bold green]"
+            elif burn >= target * 0.9:
+                verdict = "[bold green]✓ ON PACE[/bold green]"
+            elif burn < target * 0.5:
+                wasted = max(0.0, remaining - burn * mr)
+                verdict = f"[bold red]⚠ UNDER  ~{wasted:.0f}% wasted[/bold red]"
             else:
-                headroom = mr - m100
-                pace_str = f"[green]~{pacing['remaining_pct']:.0f}% left[/green] at {burn:.1f}%/min — resets first"
-        t.add_row(pace_str, "")
+                verdict = "[yellow]~ SLOW[/yellow]"
+            burn_color = "red" if burn > target * 1.5 else ("yellow" if burn >= target * 0.9 else "dim")
+            target_color = "cyan"
+            pace_str = (
+                f"[{burn_color}]{burn:.2f}%/m cur[/{burn_color}]"
+                f"  [{target_color}]{target:.2f}%/m tgt[/{target_color}]"
+            )
+            t.add_row(pace_str, verdict)
 
     burn_active, burn_secs = _burn_mode()
     title = "[bold white]Token Monitor[/bold white]"
