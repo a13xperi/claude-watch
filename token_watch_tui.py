@@ -1385,18 +1385,35 @@ class BurndownChart(Static):
         now_col = int(mins_elapsed / mins_total * chart_width)
         now_col = max(1, min(now_col, chart_width - 1))
 
-        # Build data for every column across the full window
+        # Build data for every column across the full window.
+        # Past columns use linear interpolation between actual data points
+        # (not closest-point lookup) so the chart shows a smooth decline
+        # instead of a flat/stepped line when data is sparse.
         full_data = []  # type: list  # (remaining_pct, zone) per column
         for col in range(chart_width):
             col_min = col * mins_total / chart_width
 
             if col <= now_col:
-                # PAST — use actual data (find closest point)
-                closest = None
-                for m, r in actual:
-                    if closest is None or abs(m - col_min) < abs(closest[0] - col_min):
-                        closest = (m, r)
-                val = closest[1] if closest else 100.0
+                # PAST — interpolate between actual data points
+                if not actual:
+                    val = 100.0
+                elif col_min <= actual[0][0]:
+                    val = actual[0][1]
+                elif col_min >= actual[-1][0]:
+                    val = actual[-1][1]
+                else:
+                    # Find bracketing points and interpolate
+                    val = actual[-1][1]
+                    for i in range(len(actual) - 1):
+                        m0, r0 = actual[i]
+                        m1, r1 = actual[i + 1]
+                        if m0 <= col_min <= m1:
+                            if m1 > m0:
+                                t = (col_min - m0) / (m1 - m0)
+                                val = r0 + t * (r1 - r0)
+                            else:
+                                val = r0
+                            break
                 full_data.append((val, "past"))
             else:
                 # FUTURE — project from current remaining at current rate
@@ -1608,7 +1625,12 @@ class BurndownChart(Static):
         def mini_bar(pct, width=12):
             try:
                 pct_f = float(pct)
-                filled = int(pct_f * width / 100)
+                filled = round(pct_f * width / 100)
+                # Ensure at least 1 block when pct > 0 (avoids empty bar for small values)
+                if pct_f > 0 and filled == 0:
+                    filled = 1
+                # Cap at width (100% should fill completely)
+                filled = min(filled, width)
                 color = "green" if pct_f < 50 else ("yellow" if pct_f < 75 else "red")
                 return f"[{color}]{'█' * filled}{'░' * (width - filled)}[/{color}]"
             except Exception:
@@ -1721,6 +1743,105 @@ class BurndownChart(Static):
             Panel(content, title=f"[bold]Token Burndown[/bold]  [dim](5h window)[/dim]{burn_title}",
                   border_style="bright_blue")
         )
+
+
+    def on_click(self, event):
+        """Show detailed burndown stats on click."""
+        try:
+            self.app.push_screen(BurndownDetailScreen())
+        except Exception:
+            pass
+
+
+class BurndownDetailScreen(Screen):
+    """Detail view for Token Burndown — exact %, time to reset, burn rate."""
+
+    BINDINGS = [
+        Binding("escape", "pop_screen", "Back"),
+        Binding("q", "pop_screen", "Back"),
+    ]
+
+    def compose(self) -> ComposeResult:
+        yield Static(id="burndown-detail-content")
+
+    def on_mount(self):
+        data = _get_burndown_data()
+        if not data:
+            self.query_one("#burndown-detail-content").update("[dim]No burndown data available[/dim]")
+            return
+
+        remaining = data["remaining_pct"]
+        used = 100.0 - remaining
+        rate = data["current_rate"]
+        mins_to_reset = data["mins_to_reset"]
+        mins_elapsed = data["mins_elapsed"]
+        mins_total = data["mins_total"]
+        status = data["status"]
+        wall_mins = data.get("projected_wall_mins")
+        proj_remaining = data.get("projected_remaining_at_reset", remaining)
+
+        from token_watch_data import (
+            _current_pct, _countdown, _reset_day,
+            _get_active_account, _token_pacing,
+        )
+        five, seven, fr, sr = _current_pct()
+        label, name, lane = _get_active_account()
+        pacing = _token_pacing()
+
+        # Colors
+        used_color = "red" if used > 80 else ("yellow" if used > 60 else "green")
+        rem_color = "red" if remaining < 20 else ("yellow" if remaining < 40 else "green")
+        rate_color = "red" if rate > 3 else ("yellow" if rate > 1 else "green")
+
+        h_reset = int(mins_to_reset // 60)
+        m_reset = int(mins_to_reset % 60)
+
+        # Needed rate to use all remaining by reset
+        needed_rate = remaining / mins_to_reset if mins_to_reset > 0 else 0.0
+
+        lines = []
+        lines.append(f"[bold]Token Burndown Detail[/bold]")
+        lines.append("")
+        lines.append(f"  Account:     [bold]{label}[/bold] — {name} ({lane})")
+        lines.append("")
+        lines.append(f"  [bold]5h Usage[/bold]")
+        lines.append(f"    Used:      [{used_color}][bold]{used:.1f}%[/bold][/{used_color}]")
+        lines.append(f"    Remaining: [{rem_color}][bold]{remaining:.1f}%[/bold][/{rem_color}]")
+        lines.append(f"    Resets in: [bold]{h_reset}h{m_reset:02d}m[/bold]  ({_countdown(fr)})")
+        lines.append("")
+        lines.append(f"  [bold]7d Usage[/bold]")
+        lines.append(f"    Used:      [bold]{_safe_float(seven):.1f}%[/bold]")
+        lines.append(f"    Resets:    {_reset_day(sr)}")
+        lines.append("")
+        lines.append(f"  [bold]Burn Rate[/bold]")
+        lines.append(f"    Current:   [{rate_color}]{rate:.2f}%/min[/{rate_color}]  ({rate * 60:.1f}%/hr)")
+        lines.append(f"    Needed:    {needed_rate:.2f}%/min to use all by reset")
+        if pacing:
+            avg_burn = pacing.get("avg_burn", 0)
+            lines.append(f"    Avg (10m): {avg_burn:.2f}%/min")
+
+        lines.append("")
+        lines.append(f"  [bold]Window[/bold]")
+        lines.append(f"    Elapsed:   {int(mins_elapsed)}m / {int(mins_total)}m")
+        lines.append(f"    Status:    [bold]{status.upper()}[/bold]")
+
+        if wall_mins is not None:
+            wh = int(wall_mins // 60)
+            wm = int(wall_mins % 60)
+            wall_str = f"{wh}h{wm:02d}m" if wh else f"{wm}m"
+            lines.append(f"    Wall in:   {wall_str}")
+
+        lines.append(f"    At reset:  ~{proj_remaining:.0f}% remaining")
+        lines.append("")
+        lines.append("[dim]Press Escape or q to close[/dim]")
+
+        content = "\n".join(lines)
+        self.query_one("#burndown-detail-content").update(
+            Panel(content, title="[bold]Burndown Detail[/bold]", border_style="bright_blue")
+        )
+
+    def action_pop_screen(self):
+        self.app.pop_screen()
 
 
 class SystemHealthPanel(Static):

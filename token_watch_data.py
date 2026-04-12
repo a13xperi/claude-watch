@@ -2583,6 +2583,13 @@ def _get_burndown_data():
         # instead of a hard-coded 100%.
         raw_points.append((mins_elapsed, remaining_pct))
 
+    # Always seed a 100% point at window start (minute 0) — the 5h rate
+    # limit resets at the start of every window. Without this, charts with
+    # sparse early data render a flat horizontal bar at the current
+    # remaining instead of showing the actual decline from 100%.
+    if raw_points and raw_points[0][0] > 0:
+        raw_points.insert(0, (0.0, 100.0))
+
     # Bucket into 2-minute intervals
     bucket_size = 2.0
     num_buckets = int(mins_elapsed / bucket_size) + 1
