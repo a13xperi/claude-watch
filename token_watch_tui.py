@@ -12,6 +12,7 @@ import time
 import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Any, Dict, Optional
 
 from rich.text import Text
 from rich.markup import escape as _rich_escape
@@ -2098,6 +2099,7 @@ class NavBar(Horizontal):
             ("Test", "nav-test"),
             ("Rules", "nav-rules"),
             ("MCP", "nav-mcp"),
+            ("Fleet", "nav-fleet"),
         ]),
         ("History", [
             ("Cycles", "nav-cycles"),
@@ -2120,6 +2122,7 @@ class NavBar(Horizontal):
             ("Dispatch", "nav-dispatch"),
             ("Cycle", "nav-sessions"),
             ("Mission", "nav-mission"),
+            ("Fleet", "nav-fleet"),
             ("Nav", "nav-open-nav"),
         ]
         for label, btn_id in buttons:
@@ -2173,6 +2176,7 @@ class NavigationScreen(Screen):
                 "nav-inbox": "view-inbox",
                 "nav-plans": "view-plans",
                 "nav-team": "view-team",
+                "nav-fleet": "view-fleet",
             }
             view_id = btn_map.get(view_key)
             if view_id:
@@ -2181,6 +2185,9 @@ class NavigationScreen(Screen):
             elif view_key == "nav-health":
                 self.app.pop_screen()
                 self.app.action_toggle_health()
+            elif view_key == "nav-fleet":
+                self.app.pop_screen()
+                self.app.action_show_fleet()
 
     def action_pop_screen(self):
         self.app.pop_screen()
@@ -2207,6 +2214,160 @@ class HealthScreen(Screen):
 
     def action_pop_screen(self):
         self.app.pop_screen()
+
+
+def _status_from_age(age_s):
+    # type: (Optional[float]) -> str
+    if age_s is None:
+        return "idle"
+    if age_s < 60:
+        return "active"
+    if age_s < 300:
+        return "recent"
+    return "idle"
+
+
+class FleetScreen(Screen):
+    """Fleet view — Forge Matrix + Token Matrix (Thinking + Working sandwiches)."""
+
+    BINDINGS = [
+        Binding("escape", "pop_screen", "Back"),
+        Binding("q", "pop_screen", "Back"),
+        Binding("r", "refresh_fleet", "Refresh"),
+    ]
+
+    def compose(self) -> ComposeResult:
+        yield NavBar(active="nav-fleet")
+        yield Static("[bold]Fleet Monitor[/bold]  [dim]r=refresh[/dim]", id="fleet-header")
+        yield Static("[bold]FORGE MATRIX[/bold]", id="forge-header")
+        yield DataTable(id="forge-table")
+        with Horizontal(id="token-matrix-row"):
+            with Vertical(id="thinking-sandwich"):
+                yield Static("[bold]Thinking Sandwich[/bold]", id="thinking-header")
+                yield DataTable(id="thinking-table")
+            with Vertical(id="working-sandwich"):
+                yield Static("[bold]Working Sandwich[/bold]", id="working-header")
+                yield DataTable(id="working-table")
+
+    def on_mount(self):
+        self._refresh_fleet()
+        self.set_interval(3, self._refresh_fleet)
+
+    def action_pop_screen(self):
+        self.app.pop_screen()
+
+    def action_refresh_fleet(self):
+        self._refresh_fleet()
+
+    def _refresh_fleet(self):
+        import threading
+        threading.Thread(target=self._load_fleet_data, daemon=True).start()
+
+    def _load_fleet_data(self):
+        try:
+            from fleet_monitor import collect_forge_matrix, collect_token_matrix
+            forge_rows = collect_forge_matrix()
+            token = collect_token_matrix()
+            self.app.call_from_thread(self._render_fleet, forge_rows, token)
+        except Exception as e:
+            self.app.call_from_thread(self._render_error, str(e))
+
+    def _render_error(self, msg: str):
+        self.query_one("#fleet-header", Static).update(
+            f"[bold red]Fleet Error:[/bold red] {msg}"
+        )
+
+    def _render_fleet(self, forge_rows, token):
+        # Forge Matrix
+        ft = self.query_one("#forge-table", DataTable)
+        ft.cursor_type = "row"
+        ft.zebra_stripes = True
+        ft.clear(columns=True)
+        ft.add_column("Role", width=16)
+        ft.add_column("Session", width=10)
+        ft.add_column("Task", width=36)
+        ft.add_column("Heartbeat", width=10)
+        ft.add_column("Pane Tail", width=40)
+
+        for row in forge_rows:
+            status = _status_from_age(row.get("heartbeat_age_s"))
+            dot = {
+                "active": "[bold green]●[/bold green]",
+                "recent": "[bold yellow]●[/bold yellow]",
+                "idle": "[dim]●[/dim]",
+            }.get(status, "[dim]●[/dim]")
+            lines = row.get("last_lines", [])
+            tail = " ".join(lines) if isinstance(lines, list) else str(lines)
+            tail = tail[:38]
+            ft.add_row(
+                f"{dot} {row['role']}",
+                row.get("session_id", "—"),
+                _rich_escape(str(row.get("task_name", "—"))[:34]),
+                row.get("heartbeat_age", "—"),
+                _rich_escape(tail),
+            )
+
+        # Thinking Sandwich
+        tt = self.query_one("#thinking-table", DataTable)
+        tt.cursor_type = "row"
+        tt.zebra_stripes = True
+        tt.clear(columns=True)
+        tt.add_column("Slice", width=10)
+        tt.add_column("Engine", width=10)
+        tt.add_column("Task", width=30)
+        tt.add_column("Age", width=10)
+        tt.add_column("Status", width=8)
+
+        thinking = token.get("thinking", {})
+        self._add_sandwich_rows(tt, thinking)
+
+        # Working Sandwich
+        wt = self.query_one("#working-table", DataTable)
+        wt.cursor_type = "row"
+        wt.zebra_stripes = True
+        wt.clear(columns=True)
+        wt.add_column("Slice", width=10)
+        wt.add_column("Engine", width=10)
+        wt.add_column("Task", width=30)
+        wt.add_column("Age", width=10)
+        wt.add_column("Status", width=8)
+
+        working = token.get("working", {})
+        self._add_sandwich_rows(wt, working)
+
+    def _add_sandwich_rows(self, table: DataTable, sandwich: Dict[str, Any]):
+        def _dot(status: str) -> str:
+            return {
+                "active": "[bold green]●[/bold green]",
+                "recent": "[bold yellow]●[/bold yellow]",
+                "idle": "[dim]●[/dim]",
+                "done": "[bold blue]●[/bold blue]",
+            }.get(status, "[dim]●[/dim]")
+
+        top = sandwich.get("top", {})
+        table.add_row(
+            "top",
+            f"{_dot(top.get('status', 'idle'))} {top.get('engine', '—')}",
+            _rich_escape(str(top.get('task', '—'))[:28]),
+            top.get('age', '—'),
+            top.get('status', 'idle'),
+        )
+        for meat in sandwich.get("meat", []):
+            table.add_row(
+                "meat",
+                f"{_dot(meat.get('status', 'idle'))} {meat.get('engine', '—')}",
+                _rich_escape(str(meat.get('task', '—'))[:28]),
+                meat.get('age', '—'),
+                meat.get('status', 'idle'),
+            )
+        bottom = sandwich.get("bottom", {})
+        table.add_row(
+            "bottom",
+            f"{_dot(bottom.get('status', 'idle'))} {bottom.get('engine', '—')}",
+            _rich_escape(str(bottom.get('task', '—'))[:28]),
+            bottom.get('age', '—'),
+            bottom.get('status', 'idle'),
+        )
 
 
 # ── Drill-down screen ────────────────────────────────────────────────────────
@@ -9405,6 +9566,7 @@ class ClaudeWatchApp(App):
         Binding("E", "show_expensive_turns", "Expensive"),
         Binding("P", "show_plans", "Plans"),
         Binding("T", "show_team", "Team"),
+        Binding("f", "show_fleet", "Fleet"),
     ]
 
     _filter_text = ""
@@ -9948,6 +10110,9 @@ class ClaudeWatchApp(App):
 
     def action_toggle_health(self):
         self.push_screen(HealthScreen())
+
+    def action_show_fleet(self):
+        self.push_screen(FleetScreen())
 
     def action_start_search(self):
         from textual.widgets import Input
