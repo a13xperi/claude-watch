@@ -504,3 +504,15 @@ DataTable > .datatable--header {
 #pd-header { padding: 1 2; height: auto; }
 #pd-body   { padding: 1 2; width: 100%; }
 #pd-scroll { height: 1fr; }
+
+/* ── Fleet Screen ── */
+#fleet-header { height: auto; max-height: 2; padding: 0 1; }
+#forge-header { height: auto; max-height: 1; padding: 0 1; margin: 1 0 0 0; }
+#forge-table { height: auto; max-height: 8; border: solid cyan; border-title-color: white; }
+#token-matrix-row { layout: horizontal; height: 1fr; }
+#thinking-sandwich { width: 1fr; height: 1fr; }
+#working-sandwich { width: 1fr; height: 1fr; }
+#thinking-header { height: auto; max-height: 1; padding: 0 1; margin: 1 0 0 0; }
+#working-header { height: auto; max-height: 1; padding: 0 1; margin: 1 0 0 0; }
+#thinking-table { height: 1fr; border: solid magenta; border-title-color: white; }
+#working-table { height: 1fr; border: solid green; border-title-color: white; }
